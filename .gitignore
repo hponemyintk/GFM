@@ -1,0 +1,111 @@
+# -----------------------------------------------------------------------------
+#  PYTHON
+# -----------------------------------------------------------------------------
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environment directories
+venv/
+.venv/
+env/
+ENV/
+.ENV/
+pip-wheel-metadata/
+
+# -----------------------------------------------------------------------------
+#  DATA, MODELS, CHECKPOINTS
+# -----------------------------------------------------------------------------
+data/
+datasets/
+models/
+checkpoints/
+saved_models/
+results/
+*.ckpt
+*.pth
+*.pt
+
+# -----------------------------------------------------------------------------
+#  LOGS AND DEBUG
+# -----------------------------------------------------------------------------
+# Logs
+logs/
+*.log
+
+# TensorBoard / PyTorch Lightning logs
+lightning_logs/
+tensorboard/
+*.tensorboard
+
+# W&B (Weights & Biases) logging
+wandb/
+wandb_debug.log
+wandb-summary.json
+
+# -----------------------------------------------------------------------------
+#  JUPYTER NOTEBOOKS
+# -----------------------------------------------------------------------------
+# Notebook checkpoints
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*.html
+
+# -----------------------------------------------------------------------------
+#  EDITOR / IDE SPECIFIC
+# -----------------------------------------------------------------------------
+# VSCode
+.vscode/
+
+# PyCharm
+.idea/
+*.iml
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# -----------------------------------------------------------------------------
+#  TEST, COVERAGE, AND TYPE CHECKING
+# -----------------------------------------------------------------------------
+# pytest
+.pytest_cache/
+
+# Coverage
+.coverage
+.coverage.*
+
+# mypy
+.mypy_cache/
+
+# -----------------------------------------------------------------------------
+#  ENV & MISC
+# -----------------------------------------------------------------------------
+.env
+.env.*
+*.env
+
+# Mac / Windows
+.DS_Store
+Thumbs.db
+
