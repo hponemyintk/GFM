@@ -43,7 +43,7 @@ micromamba install pyg -c pyg
 
 # Install other dependencies
 micromamba install -c conda-forge wandb absl-py tensorboard einops matplotlib progressbar pandas numba networkx scikit-network ipykernel tqdm
-uv pip install kmeans-pytorch torchviz fastcluster opentsne ogb kmedoids relbench pytorch_frame[full] sentence-transformers h5py
+uv pip install kmeans-pytorch torchviz fastcluster opentsne ogb kmedoids relbench pytorch_frame[full] sentence-transformers h5py pynvml
 ```
 
 # Experiments
