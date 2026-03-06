@@ -1,3 +1,4 @@
+import re
 from typing import Dict
 
 import torch
@@ -176,6 +177,7 @@ import torch_frame
 
 from torch import Tensor
 from torch_frame.data import TensorFrame, MultiNestedTensor
+from torch_frame.data.stats import StatType
 
 
 # ============================================================
@@ -486,6 +488,31 @@ class NeighborTfsEncoder(nn.Module):
 
         self.reset_parameters()
 
+        # Register per-table numerical mean/std as buffers for Z-score normalization
+        self._node_type_to_safe = {}
+        if col_names_dict and col_stats_dict:
+            for node_type, stype_dict in col_names_dict.items():
+                safe_name = re.sub(r'[^a-zA-Z0-9]', '_', node_type)
+                self._node_type_to_safe[node_type] = safe_name
+                num_cols = stype_dict.get(torch_frame.numerical, [])
+                if not num_cols:
+                    continue
+                table_stats = col_stats_dict.get(node_type, {})
+                means = []
+                stds = []
+                for col in num_cols:
+                    cs = table_stats.get(col, {})
+                    means.append(float(cs.get(StatType.MEAN, 0.0) or 0.0))
+                    stds.append(float(cs.get(StatType.STD, 1.0) or 1.0))
+                self.register_buffer(
+                    f'_num_mean_{safe_name}',
+                    torch.tensor(means, dtype=torch.float32),
+                )
+                self.register_buffer(
+                    f'_num_std_{safe_name}',
+                    torch.tensor(stds, dtype=torch.float32),
+                )
+
     def reset_parameters(self):
 
         nn.init.normal_(self.cls_embedding, std=0.01)
@@ -497,6 +524,20 @@ class NeighborTfsEncoder(nn.Module):
         for m in self.table_agnostic_encoder.modules():
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
+
+    def _normalize_numerical(self, big_tf, node_type: str):
+        """Z-score normalize numerical columns using precomputed per-table stats."""
+        if torch_frame.numerical not in big_tf.feat_dict:
+            return
+        safe_name = self._node_type_to_safe.get(node_type)
+        if safe_name is None or not hasattr(self, f'_num_mean_{safe_name}'):
+            return
+        mean = getattr(self, f'_num_mean_{safe_name}')
+        std = getattr(self, f'_num_std_{safe_name}')
+        feat = big_tf.feat_dict[torch_frame.numerical]
+        if hasattr(feat, "values") and not callable(feat.values):
+            feat = feat.values
+        big_tf.feat_dict[torch_frame.numerical] = (feat - mean) / (std + 1e-8)
 
     def forward(
         self,
@@ -532,6 +573,10 @@ class NeighborTfsEncoder(nn.Module):
                         posinf=1e6,
                         neginf=-1e6,
                     )
+
+            # Z-score normalize numerical features
+            node_type = self.inv_node_type_map[t_int]
+            self._normalize_numerical(big_tf, node_type)
 
             x_cols = self.table_agnostic_encoder(big_tf)
 
