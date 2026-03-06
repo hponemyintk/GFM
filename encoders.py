@@ -3,6 +3,7 @@ from typing import Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils import GloveTextEmbedding
 
 import torch_frame
 
@@ -13,32 +14,78 @@ from torch_geometric.data import Data
 
 class NeighborNodeTypeEncoder(nn.Module):
     """
-    Encoder for neighbor types.
-    Uses an embedding layer to convert integer type indices into dense vectors.
+    Encoder that applies GloVe embeddings on-the-fly to table names.
+
+    This allows processing unseen tables if their names are added
+    to the mapping at inference time.
     """
+
     def __init__(self, node_type_map, embedding_dim):
         """
         Args:
-            node_type_map (dict): A mapping from node type strings to integer indices.
-            embedding_dim (int): Dimension of the embedding vectors.
+            node_type_map (dict): Mapping from table names to integer indices
+                                  (used for global bookkeeping).
+            embedding_dim (int): Dimension of the output projected vectors.
         """
         super(NeighborNodeTypeEncoder, self).__init__()
-        # Determine the number of unique types from the mapping
-        num_types = max(node_type_map.values()) + 1
-        self.embedding = nn.Embedding(num_embeddings=num_types + 1, embedding_dim=embedding_dim)
-    
+
+        # Store reverse mapping (Index -> Name)
+        self.inv_node_type_map = {v: k for k, v in node_type_map.items()}
+
+        # Add mask token
+        self.mask_idx = len(node_type_map)
+        self.inv_node_type_map[self.mask_idx] = "mask"
+
+        # Initialize GloVe embedder
+        self.embedder = GloveTextEmbedding(device="cpu")
+
+        # Register the internal model as a submodule
+        self.st_model = self.embedder.model
+
+        # Projection layer (GloVe 300d -> embedding_dim)
+        self.proj = nn.Linear(300, embedding_dim)
+
     def reset_parameters(self):
-        self.embedding.reset_parameters() 
-    
+        self.proj.reset_parameters()
+
     def forward(self, type_indices):
         """
         Args:
-            type_indices (Tensor): Tensor of shape (...), containing integer indices for neighbor types.
-        
+            type_indices (Tensor): Integer indices of shape [Batch, K]
+
         Returns:
-            Tensor: Embedded representations of shape (..., embedding_dim).
+            Tensor: Projected GloVe embeddings of shape [Batch, K, embedding_dim]
         """
-        return self.embedding(type_indices)
+        device = type_indices.device
+
+        # Identify unique indices to avoid redundant embedding
+        unique_indices, inverse_indices = torch.unique(
+            type_indices, return_inverse=True
+        )
+
+        # Convert unique indices to list
+        unique_indices_list = unique_indices.detach().cpu().tolist()
+
+        # Map indices to table names
+        table_names = [
+            self.inv_node_type_map.get(idx, "unknown")
+            for idx in unique_indices_list
+        ]
+
+        # Apply GloVe embedding on-the-fly
+        self.embedder.model = self.st_model
+
+        # Embed unique names: shape [Num_Unique, 300]
+        with torch.no_grad():
+            unique_embeddings = self.embedder(table_names)
+
+        unique_embeddings = unique_embeddings.to(device)
+
+        # Map back to original batch structure
+        x = unique_embeddings[inverse_indices]
+
+        # Project to model dimension
+        return self.proj(x)
 
 
 class NeighborHopEncoder(nn.Module):
@@ -118,143 +165,409 @@ class NeighborTimeEncoder(nn.Module):
         return out
     
     
-from torch_frame.nn.models import ResNet  # Ensure torch_frame is installed and imported correctly
-from typing import Dict, Any
 
-    
+from typing import Dict, Any, List, Optional
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_frame
+
+from torch import Tensor
+from torch_frame.data import TensorFrame, MultiNestedTensor
+
+
+# ============================================================
+# UNIVERSAL ENCODERS (Table Agnostic)
+# ============================================================
+
+class SharedNumericalEncoder(nn.Module):
+    """
+    Projects continuous values using a shared MLP.
+    """
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+
+        self.mlp = nn.Sequential(
+            nn.Linear(1, out_channels),
+            nn.ReLU(),
+            nn.Linear(out_channels, out_channels),
+        )
+
+    def forward(self, x: Any) -> Tensor:
+        # Extract underlying tensor if wrapped by torch_frame
+        if hasattr(x, "values") and not callable(x.values):
+            x = x.values
+
+        # x: [B, Num_Cols]
+        if x.dim() > 2:
+            x = x.squeeze(-1)
+
+        B, C = x.shape
+
+        # Replace NaNs
+        x = torch.nan_to_num(x, nan=0.0)
+
+        # Flatten
+        x_flat = x.view(B * C, 1)
+
+        out = self.mlp(x_flat)
+
+        # [B, Num_Cols, Channels]
+        return out.view(B, C, -1)
+
+
+class SharedCategoricalEncoder(nn.Module):
+    """
+    Uses hashing to map any category from any table to a fixed embedding space.
+    """
+
+    def __init__(self, out_channels: int, num_hash_buckets: int = 9311):
+        super().__init__()
+
+        self.num_hash_buckets = num_hash_buckets
+        self.embedding = nn.Embedding(num_hash_buckets, out_channels)
+
+    def forward(self, x: Any) -> Tensor:
+        if hasattr(x, "values") and not callable(x.values):
+            x = x.values
+
+        if x.dim() > 2:
+            x = x.squeeze(-1)
+
+        hashed_x = x.long() % self.num_hash_buckets
+
+        return self.embedding(hashed_x)
+
+
+class SharedMultiCategoricalEncoder(nn.Module):
+    """
+    Handles cells containing lists of categories (e.g. Movie Genres).
+    Hash each element → embed → mean pool.
+    """
+
+    def __init__(self, out_channels: int, num_hash_buckets: int = 9311):
+        super().__init__()
+
+        self.num_hash_buckets = num_hash_buckets
+        self.embedding = nn.Embedding(
+            num_hash_buckets,
+            out_channels,
+            padding_idx=0,
+        )
+
+    def forward(self, x: Any) -> Tensor:
+
+        is_nested = (
+            hasattr(x, "values")
+            and not callable(x.values)
+            and hasattr(x, "offset")
+        )
+
+        if not is_nested:
+            # ------------------------------------
+            # PATH A: Dense tensors
+            # ------------------------------------
+            if x.dim() > 2 and x.size(-1) == 1:
+                x = x.squeeze(-1)
+            elif x.dim() == 2:
+                x = x.unsqueeze(-1)
+
+            B = x.size(0)
+            C = x.size(1) if x.dim() > 1 else 1
+
+            x = x.view(B, C, -1)
+            x = torch.nan_to_num(x, nan=0.0)
+            x = torch.relu(x)
+
+            hashed_x = x.long() % self.num_hash_buckets
+
+            emb = self.embedding(hashed_x)
+
+            mask = (x > 0).float().unsqueeze(-1)
+
+            sum_emb = (emb * mask).sum(dim=2)
+            counts = mask.sum(dim=2).clamp(min=1)
+
+            return sum_emb / counts
+
+        else:
+            # ------------------------------------
+            # PATH B: MultiNestedTensor
+            # ------------------------------------
+
+            hashed_values = x.values.long() % self.num_hash_buckets
+            flat_embeddings = self.embedding(hashed_values)
+
+            counts = x.offset[1:] - x.offset[:-1]
+            counts = counts.clamp(min=1).unsqueeze(-1)
+
+            B, Num_Cols = x.size(0), x.size(1)
+
+            out = torch.zeros(
+                B * Num_Cols,
+                self.embedding.embedding_dim,
+                device=x.device,
+            )
+
+            cell_indices = torch.arange(B * Num_Cols, device=x.device)
+            repeats = x.offset[1:] - x.offset[:-1]
+
+            index = torch.repeat_interleave(cell_indices, repeats)
+
+            out.index_add_(0, index, flat_embeddings)
+
+            out = out / counts
+
+            return out.view(B, Num_Cols, -1)
+
+
+class SharedTimestampEncoder(nn.Module):
+    """
+    Encodes time using periodic features (sin/cos).
+    Supports multi-component timestamps by pooling across components.
+    """
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+
+        self.out_channels = out_channels
+        self.linear = nn.Linear(out_channels, out_channels)
+
+    def forward(self, x: Any) -> Tensor:
+
+        if hasattr(x, "values") and not callable(x.values):
+            x = x.values
+
+        B = x.size(0)
+        C = x.size(1) if x.dim() > 1 else 1
+
+        x = x.view(B, C, -1)
+
+        half_dim = self.out_channels // 2
+
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(
+            torch.arange(half_dim, dtype=torch.float, device=x.device) * -emb
+        )
+
+        x_expanded = x.unsqueeze(-1) * emb.view(1, 1, 1, -1)
+
+        emb_cat = torch.cat(
+            [x_expanded.sin(), x_expanded.cos()],
+            dim=-1,
+        )
+
+        if self.out_channels % 2 == 1:
+            emb_cat = F.pad(emb_cat, (0, 1, 0, 0))
+
+        emb_pooled = emb_cat.mean(dim=2)
+
+        return self.linear(emb_pooled)
+
+
+class SharedEmbeddingEncoder(nn.Module):
+    """
+    Projects upstream embeddings (e.g. BERT/GloVe) to model dimension.
+    """
+
+    def __init__(self, out_channels: int):
+        super().__init__()
+
+        self.projector = nn.Linear(300, out_channels)
+
+    def forward(self, x: Any) -> Tensor:
+
+        if hasattr(x, "values") and not callable(x.values):
+            x = x.values
+
+        if x.dim() == 2:
+            B = x.size(0)
+            x = x.view(B, -1, 300)
+
+        return self.projector(x)
+
+
+# ============================================================
+# TABLE AGNOSTIC MASTER ENCODER
+# ============================================================
+
+class TableAgnosticStypeEncoder(nn.Module):
+
+    def __init__(self, channels: int):
+        super().__init__()
+
+        self.channels = channels
+
+        self.encoders = nn.ModuleDict({
+            str(torch_frame.numerical): SharedNumericalEncoder(channels),
+            str(torch_frame.categorical): SharedCategoricalEncoder(channels),
+            str(torch_frame.multicategorical): SharedMultiCategoricalEncoder(channels),
+            str(torch_frame.timestamp): SharedTimestampEncoder(channels),
+            str(torch_frame.embedding): SharedEmbeddingEncoder(channels),
+        })
+
+    def forward(self, tf: TensorFrame) -> Tensor:
+
+        atom_embeddings: List[Tensor] = []
+
+        for stype_name in tf.feat_dict.keys():
+
+            stype_str = str(stype_name)
+
+            if stype_str not in self.encoders:
+                continue
+
+            feat = tf.feat_dict[stype_name]
+
+            x_stype = self.encoders[stype_str](feat)
+
+            atom_embeddings.append(x_stype)
+
+        if len(atom_embeddings) == 0:
+            return torch.zeros(
+                (tf.num_rows, 0, self.channels),
+                device=tf.device,
+            )
+
+        x = torch.cat(atom_embeddings, dim=1)
+
+        return x
+
+
+# ============================================================
+# NEIGHBOR TFS ENCODER (Table Agnostic)
+# ============================================================
+
 class NeighborTfsEncoder(nn.Module):
     """
-    Encoder for neighbor TorchFrame objects.
-    
-    Processes a batch of lists of TorchFrame objects using a two-stage encoding style,
-    similar to HeteroEncoder, for a single node type context.
+    Table agnostic transformer encoder for neighbor TensorFrames.
     """
+
     def __init__(
         self,
         channels: int,
-        node_type_map,  # Mapping from node type to index (if needed externally)
-        col_names_dict,
-        col_stats_dict,
-        torch_frame_model_cls=ResNet,
-        torch_frame_model_kwargs: Dict[str, Any] = {
-            "channels": 128,
-            "num_layers": 4,
-        },
-        default_stype_encoder_cls_kwargs: Dict[torch_frame.stype, Any] = {
-            torch_frame.categorical: (torch_frame.nn.EmbeddingEncoder, {}),
-            torch_frame.numerical: (torch_frame.nn.LinearEncoder, {}),
-            torch_frame.multicategorical: (
-                torch_frame.nn.MultiCategoricalEmbeddingEncoder,
-                {},
-            ),
-            torch_frame.embedding: (torch_frame.nn.LinearEmbeddingEncoder, {}),
-            torch_frame.timestamp: (torch_frame.nn.TimestampEncoder, {}),
-        },
+        node_type_map: Dict[str, int],
+        col_names_dict: Optional[Dict] = None,
+        col_stats_dict: Optional[Dict] = None,
+        default_stype_encoder_cls_kwargs: Optional[Dict] = None,
+        torch_frame_model_cls=None,
+        torch_frame_model_kwargs=None,
+        num_layers: int = 4,
+        nhead: int = 4,
     ):
-        """
-        Args:
-            channels (int): Output channels for the encoder.
-            node_type_map: Mapping from node type to index.
-            col_names_dict (dict): Dictionary mapping column types to list of column names.
-            col_stats_dict (dict): Dictionary of statistics for columns.
-            torch_frame_model_cls: Class for the TorchFrame model (default: ResNet).
-            torch_frame_model_kwargs (dict): Keyword arguments for the model class.
-            default_stype_encoder_cls_kwargs (dict): Dictionary mapping stype to a tuple of 
-                                                      (encoder class, kwargs) for that stype.
-        """
-        super(NeighborTfsEncoder, self).__init__()
+
+        super().__init__()
 
         self.node_type_map = node_type_map
         self.inv_node_type_map = {idx: nt for nt, idx in node_type_map.items()}
-        self.encoders = nn.ModuleDict()
         self.channels = channels
 
-        # Initialize encoders for each node type using provided dictionaries
-        for node_type, stype_dict in col_names_dict.items():
-            stype_encoder_dict = {
-                stype: default_stype_encoder_cls_kwargs[stype][0](**default_stype_encoder_cls_kwargs[stype][1])
-                for stype in stype_dict.keys()
-                if stype in default_stype_encoder_cls_kwargs
-            }
-            self.encoders[node_type] = torch_frame_model_cls(
-                **torch_frame_model_kwargs,
-                out_channels=channels,
-                col_stats=col_stats_dict[node_type],
-                col_names_dict=stype_dict,
-                stype_encoder_dict=stype_encoder_dict,
-            )
+        self.table_agnostic_encoder = TableAgnosticStypeEncoder(channels)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=channels,
+            nhead=nhead,
+            dim_feedforward=channels * 2,
+            batch_first=True,
+            norm_first=True,
+        )
+
+        self.shared_transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.cls_embedding = nn.Parameter(
+            torch.randn(1, 1, channels)
+        )
+
+        self.reset_parameters()
 
     def reset_parameters(self):
-        for encoder in self.encoders.values():
-            encoder.reset_parameters()
 
-    def forward(self, batch_dict, neighbor_types):
-        """
-    Args:
-        batch_dict (dict): A dictionary containing:
-          - grouped_tfs[t_int]: A single concatenated TorchFrame of all neighbors 
-                                for node type 't_int' in the batch.
-          - grouped_indices[t_int]: The list of flat indices corresponding to 
-                                   each row in grouped_tfs[t_int].
-          - flat_batch_idx (List[int]): The batch index 'i' for each flattened neighbor.
-          - flat_nbr_idx (List[int]): The neighbor index 'j' for each flattened neighbor.
-        neighbor_types (Tensor): A [B, K] tensor specifying the node type indices
-                                 for each neighbor in the original (batch, neighbor) shape.
+        nn.init.normal_(self.cls_embedding, std=0.01)
 
-    This method performs a single-pass encoding for each node type by:
-      1) Encoding the concatenated TorchFrame (big_tf) for that type in one shot.
-      2) Scattering the resulting embeddings back to the flattened positions.
-      3) Reassembling the final [B, K, channels] tensor using 'flat_batch_idx' and 'flat_nbr_idx'.
+        for p in self.shared_transformer.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
-    Returns:
-        Tensor: A [B, K, channels] tensor of encoded neighbor features, preserving
-                the original ordering of neighbors per sample.
-    """
+        for m in self.table_agnostic_encoder.modules():
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+
+    def forward(
+        self,
+        batch_dict: Dict[str, Any],
+        neighbor_types: Tensor,
+    ) -> Tensor:
+
         grouped_tfs = batch_dict["grouped_tfs"]
         grouped_indices = batch_dict["grouped_indices"]
+
         flat_batch_idx = batch_dict["flat_batch_idx"]
-        flat_nbr_idx   = batch_dict["flat_nbr_idx"]
+        flat_nbr_idx = batch_dict["flat_nbr_idx"]
 
         B, K = neighbor_types.shape
-        N = len(flat_batch_idx)  # total flattened neighbors
+        N = len(flat_batch_idx)
+
         device = neighbor_types.device
 
-        # Pre-allocate an [N, channels] buffer 
-        # (Even if N==0, this works fine: shape is [0, channels].)
-        encoded_flat_tensor = torch.zeros((N, self.channels), device=device)
+        encoded_flat_tensor = torch.zeros(
+            (N, self.channels),
+            device=device,
+        )
 
-        # 1) Encode in one shot per node type
         for t_int, big_tf in grouped_tfs.items():
-            node_type_str = self.inv_node_type_map[t_int]
-            encoder = self.encoders[node_type_str]
 
-            big_tf = big_tf.to(device=device)
-            
+            big_tf = big_tf.to(device)
+
             for stype, tensor in big_tf.feat_dict.items():
                 if isinstance(tensor, torch.Tensor):
                     big_tf.feat_dict[stype] = torch.nan_to_num(
-                        tensor, nan=0.0, posinf=1e6, neginf=-1e6
+                        tensor,
+                        nan=0.0,
+                        posinf=1e6,
+                        neginf=-1e6,
                     )
-            
-            # assert torch.isfinite(big_tf.feat_dict[torch_frame.numerical]).all(), f"NaN/Inf in the raw big_tf for {node_type_str}?"
-            
-            out_t = encoder(big_tf)  # shape: [num_rows, channels] or [num_rows, 1, channels]
-            if out_t.dim() == 3 and out_t.shape[1] == 1:
-                out_t = out_t.squeeze(1)  # => [num_rows, channels]
 
-            # Insert each row into encoded_flat_tensor
+            x_cols = self.table_agnostic_encoder(big_tf)
+
+            batch_size = x_cols.size(0)
+
+            cls_tokens = self.cls_embedding.expand(batch_size, -1, -1)
+
+            x_seq = torch.cat([cls_tokens, x_cols], dim=1)
+
+            x_out = self.shared_transformer(x_seq)
+
+            x_final = x_out[:, 0, :]
+
             idx_list = grouped_indices[t_int]
             idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
-            encoded_flat_tensor[idx_tensor] = out_t
 
-        # 2) Scatter [N, channels] -> [B, K, channels]
-        output = torch.zeros((B, K, self.channels), device=device)
-        
+            encoded_flat_tensor[idx_tensor] = x_final
+
+        output = torch.zeros(
+            (B, K, self.channels),
+            device=device,
+        )
+
         indices_i = torch.tensor(flat_batch_idx, dtype=torch.long, device=device)
-        indices_j = torch.tensor(flat_nbr_idx,   dtype=torch.long, device=device)
+        indices_j = torch.tensor(flat_nbr_idx, dtype=torch.long, device=device)
+
         output[indices_i, indices_j] = encoded_flat_tensor
 
         return output
+
+
+
+
+
+
+
     
     
 from torch_geometric.nn import GINConv
