@@ -24,7 +24,7 @@ Full audit of every component that touches table/dataset identity. Verified that
 | `SharedCategoricalEncoder` | Hash % 9311 → shared embedding. No per-table vocabulary. |
 | `SharedMultiCategoricalEncoder` | Same hash trick, mean pool over elements |
 | `SharedTimestampEncoder` | Sin/cos positional encoding → linear. Universal. |
-| `SharedEmbeddingEncoder` | ModuleDict keyed by embedding dim (discovered from StatType.EMB_DIM) |
+| `SharedEmbeddingEncoder` | ModuleDict keyed by embedding dim (discovered from StatType.EMB_DIM). 2D input reshaped via divisibility check; ambiguous matches raise KeyError. |
 
 ### Model-Level Blockers (NOT in encoders, in model.py)
 
@@ -55,6 +55,16 @@ Full audit of every component that touches table/dataset identity. Verified that
 - Merging without namespacing silently overwrites one dataset's stats
 - Same collision problem for `col_names_dict`, `node_type_map`, HeteroData node types
 - Fix: namespace with `"{dataset_name}__{table_name}"` before merging (data pipeline concern, not encoder concern)
+
+## Validation Guards Added (2026-03-07)
+
+| Guard | Location | What it catches |
+|---|---|---|
+| Contiguous index check | `NeighborNodeTypeEncoder.__init__` | Non-contiguous or non-0-based node_type_map values |
+| Ambiguous 2D reshape | `SharedEmbeddingEncoder.forward` | Multiple projector dims dividing the flattened embedding dim |
+| Safe name collision | `NeighborTfsEncoder.__init__` | Two table names sanitizing to same buffer name (e.g. "a-b" and "a_b") |
+| Missing col_dicts at inference | `NeighborTfsEncoder.forward` | `_num_zscore_tables > 0` but `_node_type_to_safe` empty after checkpoint load |
+| NaN mean imputation | `NeighborTfsEncoder._normalize_numerical` | NaN replaced with column mean before Z-score (prevents outlier injection) |
 
 ## GloVe Buffer Memory
 - Buffer shape: `[num_table_names+1, 300]` floats
