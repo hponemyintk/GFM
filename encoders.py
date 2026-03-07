@@ -365,7 +365,17 @@ class SharedEmbeddingEncoder(nn.Module):
             x = x.values
 
         if x.dim() == 2:
-            x = x.unsqueeze(1)
+            # x is [B, num_cols * emb_dim] — reshape to [B, num_cols, emb_dim]
+            total_dim = x.size(-1)
+            for d_str in self.projectors:
+                d = int(d_str)
+                if total_dim % d == 0:
+                    x = x.view(x.size(0), -1, d)
+                    return self.projectors[d_str](x)
+            raise KeyError(
+                f"Embedding total dim {total_dim} not divisible by any known "
+                f"per-column dim: {set(self.projectors.keys())}"
+            )
 
         D = x.size(-1)
         return self.projectors[str(D)](x)
