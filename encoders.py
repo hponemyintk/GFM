@@ -31,6 +31,11 @@ class NeighborNodeTypeEncoder(nn.Module):
 
         # Build ordered list of table names: index 0..N-1 from map, index N = mask
         num_types = max(node_type_map.values()) + 1
+        if set(node_type_map.values()) != set(range(num_types)):
+            raise ValueError(
+                f"node_type_map values must be contiguous 0..{num_types - 1}, "
+                f"got {sorted(node_type_map.values())}"
+            )
         inv_map = {v: k for k, v in node_type_map.items()}
         all_names = [inv_map[i] for i in range(num_types)] + ["mask"]
 
@@ -367,17 +372,28 @@ class SharedEmbeddingEncoder(nn.Module):
         if x.dim() == 2:
             # x is [B, num_cols * emb_dim] — reshape to [B, num_cols, emb_dim]
             total_dim = x.size(-1)
-            for d_str in self.projectors:
-                d = int(d_str)
-                if total_dim % d == 0:
-                    x = x.view(x.size(0), -1, d)
-                    return self.projectors[d_str](x)
-            raise KeyError(
-                f"Embedding total dim {total_dim} not divisible by any known "
-                f"per-column dim: {set(self.projectors.keys())}"
-            )
+            matches = [d_str for d_str in self.projectors if total_dim % int(d_str) == 0]
+            if len(matches) == 0:
+                raise KeyError(
+                    f"Embedding total dim {total_dim} not divisible by any known "
+                    f"per-column dim: {set(self.projectors.keys())}"
+                )
+            if len(matches) > 1:
+                raise KeyError(
+                    f"Ambiguous embedding reshape: total dim {total_dim} is divisible "
+                    f"by multiple known dims: {matches}. Ensure embedding columns "
+                    f"have distinct dimensions or provide 3D input."
+                )
+            d = int(matches[0])
+            x = x.view(x.size(0), -1, d)
+            return self.projectors[matches[0]](x)
 
         D = x.size(-1)
+        if str(D) not in self.projectors:
+            raise KeyError(
+                f"No projector for embedding dim {D}. "
+                f"Known dims: {set(self.projectors.keys())}"
+            )
         return self.projectors[str(D)](x)
 
 
@@ -490,9 +506,18 @@ class NeighborTfsEncoder(nn.Module):
 
         # Register per-table numerical mean/std as buffers for Z-score normalization
         self._node_type_to_safe = {}
+        _safe_to_node_type = {}  # reverse map for collision detection
+        zscore_table_count = 0
         if col_names_dict and col_stats_dict:
             for node_type, stype_dict in col_names_dict.items():
                 safe_name = re.sub(r'[^a-zA-Z0-9]', '_', node_type)
+                if safe_name in _safe_to_node_type:
+                    raise ValueError(
+                        f"Z-score buffer name collision: '{node_type}' and "
+                        f"'{_safe_to_node_type[safe_name]}' both sanitize to "
+                        f"'{safe_name}'. Rename one of the tables to avoid ambiguity."
+                    )
+                _safe_to_node_type[safe_name] = node_type
                 self._node_type_to_safe[node_type] = safe_name
                 num_cols = stype_dict.get(torch_frame.numerical, [])
                 if not num_cols:
@@ -512,6 +537,13 @@ class NeighborTfsEncoder(nn.Module):
                     f'_num_std_{safe_name}',
                     torch.tensor(stds, dtype=torch.float32),
                 )
+                zscore_table_count += 1
+
+        # Persists through save/load — used to detect missing col_names_dict at inference
+        self.register_buffer(
+            '_num_zscore_tables',
+            torch.tensor(zscore_table_count, dtype=torch.long),
+        )
 
     def reset_parameters(self):
 
@@ -537,6 +569,8 @@ class NeighborTfsEncoder(nn.Module):
         feat = big_tf.feat_dict[torch_frame.numerical]
         if hasattr(feat, "values") and not callable(feat.values):
             feat = feat.values
+        # Replace NaN with column mean so missing values become 0 after Z-score
+        feat = torch.where(torch.isnan(feat), mean, feat)
         big_tf.feat_dict[torch_frame.numerical] = (feat - mean) / (std + 1e-8)
 
     def forward(
@@ -544,6 +578,15 @@ class NeighborTfsEncoder(nn.Module):
         batch_dict: Dict[str, Any],
         neighbor_types: Tensor,
     ) -> Tensor:
+
+        if self._num_zscore_tables > 0 and len(self._node_type_to_safe) == 0:
+            raise RuntimeError(
+                "Model was trained with Z-score normalization for "
+                f"{self._num_zscore_tables.item()} table(s), but "
+                "col_names_dict/col_stats_dict were not provided at "
+                "construction time. Pass the same col_names_dict and "
+                "col_stats_dict used during training to NeighborTfsEncoder."
+            )
 
         grouped_tfs = batch_dict["grouped_tfs"]
         grouped_indices = batch_dict["grouped_indices"]
