@@ -15,35 +15,33 @@ from torch_geometric.data import Data
 
 class NeighborNodeTypeEncoder(nn.Module):
     """
-    Encoder that applies GloVe embeddings on-the-fly to table names.
+    Encoder that maps table name indices to projected GloVe embeddings.
 
-    This allows processing unseen tables if their names are added
-    to the mapping at inference time.
+    GloVe embeddings are precomputed at init time for all known table names
+    and stored as a buffer. Forward pass is a simple index + linear projection.
     """
 
     def __init__(self, node_type_map, embedding_dim):
         """
         Args:
-            node_type_map (dict): Mapping from table names to integer indices
-                                  (used for global bookkeeping).
+            node_type_map (dict): Mapping from table names to integer indices.
             embedding_dim (int): Dimension of the output projected vectors.
         """
         super(NeighborNodeTypeEncoder, self).__init__()
 
-        # Store reverse mapping (Index -> Name)
-        self.inv_node_type_map = {v: k for k, v in node_type_map.items()}
+        # Build ordered list of table names: index 0..N-1 from map, index N = mask
+        num_types = max(node_type_map.values()) + 1
+        inv_map = {v: k for k, v in node_type_map.items()}
+        all_names = [inv_map[i] for i in range(num_types)] + ["mask"]
 
-        # Add mask token
-        self.mask_idx = len(node_type_map)
-        self.inv_node_type_map[self.mask_idx] = "mask"
+        # Precompute GloVe embeddings (local variable, not stored as submodule)
+        embedder = GloveTextEmbedding(device="cpu")
+        with torch.no_grad():
+            all_embeddings = embedder(all_names)  # [num_types+1, 300]
 
-        # Initialize GloVe embedder
-        self.embedder = GloveTextEmbedding(device="cpu")
+        self.register_buffer("glove_embeddings", all_embeddings)
 
-        # Register the internal model as a submodule
-        self.st_model = self.embedder.model
-
-        # Projection layer (GloVe 300d -> embedding_dim)
+        # Trainable projection
         self.proj = nn.Linear(300, embedding_dim)
 
     def reset_parameters(self):
@@ -57,35 +55,7 @@ class NeighborNodeTypeEncoder(nn.Module):
         Returns:
             Tensor: Projected GloVe embeddings of shape [Batch, K, embedding_dim]
         """
-        device = type_indices.device
-
-        # Identify unique indices to avoid redundant embedding
-        unique_indices, inverse_indices = torch.unique(
-            type_indices, return_inverse=True
-        )
-
-        # Convert unique indices to list
-        unique_indices_list = unique_indices.detach().cpu().tolist()
-
-        # Map indices to table names
-        table_names = [
-            self.inv_node_type_map.get(idx, "unknown")
-            for idx in unique_indices_list
-        ]
-
-        # Apply GloVe embedding on-the-fly
-        self.embedder.model = self.st_model
-
-        # Embed unique names: shape [Num_Unique, 300]
-        with torch.no_grad():
-            unique_embeddings = self.embedder(table_names)
-
-        unique_embeddings = unique_embeddings.to(device)
-
-        # Map back to original batch structure
-        x = unique_embeddings[inverse_indices]
-
-        # Project to model dimension
+        x = self.glove_embeddings[type_indices]  # [B, K, 300]
         return self.proj(x)
 
 
@@ -372,13 +342,22 @@ class SharedTimestampEncoder(nn.Module):
 
 class SharedEmbeddingEncoder(nn.Module):
     """
-    Projects upstream embeddings (e.g. BERT/GloVe) to model dimension.
+    Projects upstream embeddings to model dimension.
+    Creates one learned Linear projector per unique embedding dimension
+    discovered from col_stats_dict (via StatType.EMB_DIM).
     """
 
-    def __init__(self, out_channels: int):
+    def __init__(self, out_channels: int, emb_dims: Optional[set] = None):
         super().__init__()
 
-        self.projector = nn.Linear(300, out_channels)
+        self.out_channels = out_channels
+
+        if emb_dims is None:
+            emb_dims = set()
+
+        self.projectors = nn.ModuleDict({
+            str(d): nn.Linear(d, out_channels) for d in emb_dims
+        })
 
     def forward(self, x: Any) -> Tensor:
 
@@ -386,10 +365,10 @@ class SharedEmbeddingEncoder(nn.Module):
             x = x.values
 
         if x.dim() == 2:
-            B = x.size(0)
-            x = x.view(B, -1, 300)
+            x = x.unsqueeze(1)
 
-        return self.projector(x)
+        D = x.size(-1)
+        return self.projectors[str(D)](x)
 
 
 # ============================================================
@@ -398,7 +377,7 @@ class SharedEmbeddingEncoder(nn.Module):
 
 class TableAgnosticStypeEncoder(nn.Module):
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, emb_dims: Optional[set] = None):
         super().__init__()
 
         self.channels = channels
@@ -408,7 +387,7 @@ class TableAgnosticStypeEncoder(nn.Module):
             str(torch_frame.categorical): SharedCategoricalEncoder(channels),
             str(torch_frame.multicategorical): SharedMultiCategoricalEncoder(channels),
             str(torch_frame.timestamp): SharedTimestampEncoder(channels),
-            str(torch_frame.embedding): SharedEmbeddingEncoder(channels),
+            str(torch_frame.embedding): SharedEmbeddingEncoder(channels, emb_dims=emb_dims),
         })
 
     def forward(self, tf: TensorFrame) -> Tensor:
@@ -467,7 +446,18 @@ class NeighborTfsEncoder(nn.Module):
         self.inv_node_type_map = {idx: nt for nt, idx in node_type_map.items()}
         self.channels = channels
 
-        self.table_agnostic_encoder = TableAgnosticStypeEncoder(channels)
+        # Discover all unique embedding dimensions from col_stats_dict
+        emb_dims = set()
+        if col_names_dict and col_stats_dict:
+            for node_type, stype_dict in col_names_dict.items():
+                for col in stype_dict.get(torch_frame.embedding, []):
+                    table_stats = col_stats_dict.get(node_type, {})
+                    cs = table_stats.get(col, {})
+                    dim = cs.get(StatType.EMB_DIM)
+                    if dim is not None and dim > 0:
+                        emb_dims.add(dim)
+
+        self.table_agnostic_encoder = TableAgnosticStypeEncoder(channels, emb_dims=emb_dims)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=channels,
