@@ -67,3 +67,11 @@ Requires Python 3.12, PyTorch with CUDA, PyG (torch_geometric, pyg_lib, torch_sc
 ## Active Branch Context
 
 The `table_agnostic_model` branch modifies the node/feature encoders to be table-agnostic — using shared encoders (hashing for categoricals, shared MLPs for numericals, GloVe for type names) instead of per-table encoders, enabling generalization to unseen tables.
+
+Key changes on this branch:
+- **GloVe precomputation**: `NeighborNodeTypeEncoder` precomputes all embeddings at init into a buffer (no CPU SentenceTransformer in forward)
+- **Dimension-aware embedding projectors**: `SharedEmbeddingEncoder` discovers `EMB_DIM` from `col_stats_dict`, creates one `nn.Linear` per unique dim
+- **Z-score normalization**: per-table mean/std as buffers in `NeighborTfsEncoder`, NaN imputed with column mean
+- **Validation guards**: contiguous index check, ambiguous 2D reshape detection, safe name collision detection, `_num_zscore_tables` buffer for inference guard
+
+Foundation model plan (7 tasks) in `agent_tasks/`. Architecture decisions in `summaries/architecture_changes_and_tradeoffs.md`.

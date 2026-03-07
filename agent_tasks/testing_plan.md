@@ -1,6 +1,19 @@
 # Testing Plan
 
-All tests are organized by phase matching the task dependency graph. Each phase's tests must pass before proceeding to the next phase.
+## Implemented Tests (95 tests, all passing)
+
+Tests for current encoder changes are implemented in `tests/`:
+- `test_type_encoder.py` (15): GloVe precompute, buffer/param checks, index validation
+- `test_embedding_encoder.py` (18): dim-aware projectors, 2D reshape fix, ambiguity detection
+- `test_zscore.py` (26): buffer registration, Z-score math, NaN imputation, serialization guard, save/load roundtrip
+- `test_emb_dims_discovery.py` (9): emb_dims plumbing from col_stats_dict
+- `test_ml_sanity.py` (27): representation quality, gradient health, overfit, Z-score effectiveness
+
+Run: `source relgt_env/bin/activate && python -m pytest tests/ -v`
+
+## Future Task Tests (not yet implemented)
+
+All tests below are organized by phase matching the task dependency graph. Each phase's tests must pass before proceeding to the next phase.
 
 ---
 

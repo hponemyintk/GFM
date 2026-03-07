@@ -121,7 +121,7 @@ Previous design used `c_idx` (per-node centroid assignment, shape `[num_nodes]`)
 
 **Tradeoff**: Loses exact per-node centroid tracking. `_ema_cluster_size` is a smoothed estimate, not exact counts. In practice this is better — EMA is more stable than raw counts, especially early in training.
 
-### 5. GloVe Precomputation (Performance) — IMPLEMENTED (commit 58cdc8d)
+### 5. GloVe Precomputation (Performance) — IMPLEMENTED (commits 58cdc8d, b105fee)
 
 **Design**: Precompute all GloVe embeddings at `__init__` time, store as buffer.
 
@@ -131,7 +131,7 @@ Previous code ran SentenceTransformer on CPU every forward pass AND registered i
 
 **Tradeoff**: Loses the ability to dynamically embed new table names at inference without re-initializing. This is acceptable — the set of tables is known at model creation time.
 
-### 5b. SharedEmbeddingEncoder Dimension Discovery — IMPLEMENTED (commit 58cdc8d)
+### 5b. SharedEmbeddingEncoder Dimension Discovery — IMPLEMENTED (commits 58cdc8d, a720e31, b105fee)
 
 **Design**: Discover embedding dimensions from `col_stats_dict` via `StatType.EMB_DIM` (already computed by torch_frame). Create one `nn.Linear(dim, out_channels)` per unique dim in `nn.ModuleDict`.
 
@@ -140,6 +140,11 @@ Previous code ran SentenceTransformer on CPU every forward pass AND registered i
 **Implementation**: `NeighborTfsEncoder` scans `col_stats_dict` at init → extracts all `EMB_DIM` values → passes `emb_dims` set through `TableAgnosticStypeEncoder` → `SharedEmbeddingEncoder`.
 
 **Tradeoff**: Requires user to use the same text embedder at inference as training. This is enforced by the data pipeline (`make_pkey_fkey_graph` + `text_embedder_cfg`).
+
+**Bug fixes (commits a720e31, b105fee)**:
+- torch_frame flattens multiple embedding columns to `[B, num_cols*emb_dim]`. Original `unsqueeze(1)` created `[B, 1, total_dim]` → KeyError. Fixed to reshape using known per-column dim.
+- When multiple projector dims divide the total dim (e.g., {300, 600} with input 1200), now raises KeyError("Ambiguous") instead of non-deterministic dispatch.
+- 3D path error message improved from bare KeyError to descriptive message.
 
 ### 6. Zero-Shot Evaluation Protocol
 
@@ -179,6 +184,9 @@ Key findings about the data pipeline:
 | `c_idx` per-node tracking | BROKEN | Each GPU updates locally, diverges | Eliminate entirely, use `_ema_cluster_size` (Task 7) |
 | VQ BatchNorm | CHECK | May or may not be caught by SyncBatchNorm | Verify conversion, add explicit check (Task 7) |
 | GloVe in forward() | FIXED (58cdc8d) | CPU SentenceTransformer every step | Precomputed at init, stored as buffer |
+| Z-score missing at inference | FIXED (b105fee) | `_node_type_to_safe` lost on save/load | `_num_zscore_tables` buffer guard in forward |
+| NaN → outlier via Z-score | FIXED (b105fee) | NaN replaced with 0 then Z-scored to (0-mean)/std | Impute NaN with column mean before Z-score |
+| Safe name collision | FIXED (b105fee) | "a-b" and "a_b" silently overwrite buffers | Collision detection raises ValueError |
 | Interleaved sampling | Safe | Different GPUs may get different datasets | This is fine — DDP syncs gradients regardless |
 
 ---
