@@ -147,7 +147,7 @@ if local_rank == 0:
     tabpfn_emb_dim = precompute_tabpfn_embeddings(
         hetero_data,
         cache_dir=tabpfn_cache_dir,
-        device="cpu",
+        device=f"cuda:{local_rank}",
         seed=args.seed,
     )
     print(f"TabPFN embedding dim: {tabpfn_emb_dim}")
@@ -156,7 +156,7 @@ if local_rank != 0:
     tabpfn_emb_dim = precompute_tabpfn_embeddings(
         hetero_data,
         cache_dir=tabpfn_cache_dir,
-        device="cpu",
+        device=f"cuda:{local_rank}",
         seed=args.seed,
     )  # loads from cache
 
