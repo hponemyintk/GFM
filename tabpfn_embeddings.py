@@ -20,13 +20,17 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _torchframe_to_dataframe(tf) -> pd.DataFrame:
+def _torchframe_to_dataframe(tf, max_features: int = 500) -> pd.DataFrame:
     """Convert a TorchFrame to a pandas DataFrame preserving dtypes.
 
     - Numerical/timestamp columns -> float64
     - Categorical columns -> pd.CategoricalDtype (so TabPFN detects them)
     - Multicategorical columns -> exploded into binary indicator columns
     - Embedding columns -> flattened into individual float columns
+
+    If the resulting DataFrame exceeds *max_features* columns, embedding
+    columns are dropped first; if still over the limit, columns are randomly
+    sampled down to *max_features*.
 
     Returns a DataFrame where TabPFN's internal preprocessing can correctly
     identify and handle each column type.
@@ -119,6 +123,27 @@ def _torchframe_to_dataframe(tf) -> pd.DataFrame:
         raise ValueError("No extractable features found in TorchFrame")
 
     df = pd.DataFrame(parts)
+
+    # ---- Enforce max_features limit -----------------------------------------
+    if max_features is not None and df.shape[1] > max_features:
+        emb_cols = [c for c in df.columns if c.startswith("emb__")]
+        non_emb_cols = [c for c in df.columns if not c.startswith("emb__")]
+
+        if len(non_emb_cols) <= max_features:
+            # Drop embedding columns to fit within the limit
+            n_emb_keep = max_features - len(non_emb_cols)
+            keep_cols = non_emb_cols + emb_cols[:n_emb_keep]
+        else:
+            # Even without embeddings we exceed the limit; randomly sample
+            rng = np.random.RandomState(42)
+            keep_idx = rng.choice(len(non_emb_cols), max_features, replace=False)
+            keep_cols = [non_emb_cols[i] for i in sorted(keep_idx)]
+
+        logger.info(
+            "  Trimming columns from %d to %d (max_features=%d)",
+            df.shape[1], len(keep_cols), max_features,
+        )
+        df = df[keep_cols]
 
     # Impute NaN/Inf with column means for numeric columns
     numeric_cols = df.select_dtypes(include=[np.number]).columns
