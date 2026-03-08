@@ -317,10 +317,12 @@ def precompute_tabpfn_embeddings(
                     if is_categorical:
                         model = TabPFNClassifier(
                             device=device, n_estimators=1,
+                            ignore_pretraining_limits=True,
                         )
                     else:
                         model = TabPFNRegressor(
                             device=device, n_estimators=1,
+                            ignore_pretraining_limits=True,
                         )
                     model.fit(X_support, y_support)
                     emb = get_embeddings(model, X_query, data_source="test")
