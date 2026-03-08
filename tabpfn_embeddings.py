@@ -174,6 +174,7 @@ def precompute_tabpfn_embeddings(
     """
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn.base import get_embeddings
+    from tabpfn.constants import ModelVersion
 
     rng = np.random.RandomState(seed)
     os.makedirs(cache_dir, exist_ok=True)
@@ -286,12 +287,14 @@ def precompute_tabpfn_embeddings(
                         y_support = y_support[sub_idx]
 
                     if is_categorical:
-                        model = TabPFNClassifier(
-                            device=device, n_estimators=1
+                        model = TabPFNClassifier.create_default_for_version(
+                            ModelVersion.V2,
+                            device=device, n_estimators=1,
                         )
                     else:
-                        model = TabPFNRegressor(
-                            device=device, n_estimators=1
+                        model = TabPFNRegressor.create_default_for_version(
+                            ModelVersion.V2,
+                            device=device, n_estimators=1,
                         )
                     model.fit(X_support, y_support)
                     emb = get_embeddings(model, X_query, data_source="test")
