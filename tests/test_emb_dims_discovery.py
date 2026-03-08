@@ -13,13 +13,22 @@ from unittest.mock import patch, MagicMock
 from encoders import NeighborTfsEncoder
 
 
+class _FakeGlove:
+    """Deterministic GloVe mock: different names → different vectors."""
+    def __init__(self, device="cpu"):
+        pass
+
+    def __call__(self, names):
+        out = torch.zeros(len(names), 300)
+        for i, name in enumerate(names):
+            torch.manual_seed(hash(name) % 2**32)
+            out[i] = torch.randn(300)
+        return out
+
+
 def _make_encoder(node_type_map, col_names_dict, col_stats_dict, channels=32):
     """Create NeighborTfsEncoder with mocked GloVe."""
-    with patch("encoders.GloveTextEmbedding") as MockGlove:
-        mock_instance = MagicMock()
-        mock_instance.__call__ = lambda names: torch.randn(len(names), 300)
-        MockGlove.return_value = mock_instance
-
+    with patch("encoders.GloveTextEmbedding", _FakeGlove):
         enc = NeighborTfsEncoder(
             channels=channels,
             node_type_map=node_type_map,

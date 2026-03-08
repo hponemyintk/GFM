@@ -15,6 +15,19 @@ from unittest.mock import patch, MagicMock
 from encoders import NeighborTfsEncoder
 
 
+class _FakeGlove:
+    """Deterministic GloVe mock: different names → different vectors."""
+    def __init__(self, device="cpu"):
+        pass
+
+    def __call__(self, names):
+        out = torch.zeros(len(names), 300)
+        for i, name in enumerate(names):
+            torch.manual_seed(hash(name) % 2**32)
+            out[i] = torch.randn(300)
+        return out
+
+
 def _make_encoder(
     node_type_map,
     col_names_dict,
@@ -22,12 +35,7 @@ def _make_encoder(
     channels=32,
 ):
     """Create NeighborTfsEncoder with mocked GloVe."""
-    with patch("encoders.GloveTextEmbedding") as MockGlove:
-        mock_instance = MagicMock()
-        num_types = max(node_type_map.values()) + 1
-        mock_instance.__call__ = lambda names: torch.randn(len(names), 300)
-        MockGlove.return_value = mock_instance
-
+    with patch("encoders.GloveTextEmbedding", _FakeGlove):
         enc = NeighborTfsEncoder(
             channels=channels,
             node_type_map=node_type_map,
@@ -346,7 +354,12 @@ class TestZScoreSerializationGuard:
             col_names_dict=None,
             col_stats_dict=None,
         )
-        enc_infer.load_state_dict(state, strict=False)
+        # Filter out column-semantic buffer (size mismatch: trained has columns,
+        # inference has none). This is expected — column names must be provided
+        # at construction time, just like Z-score stats.
+        filtered_state = {k: v for k, v in state.items()
+                          if not k.startswith('_col_glove')}
+        enc_infer.load_state_dict(filtered_state, strict=False)
 
         # 3. _num_zscore_tables is loaded (=1), but _node_type_to_safe is empty
         assert enc_infer._num_zscore_tables.item() == 1
