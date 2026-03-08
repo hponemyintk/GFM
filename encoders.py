@@ -162,37 +162,37 @@ from torch_frame.data.stats import StatType
 class SharedNumericalEncoder(nn.Module):
     """
     Projects continuous values using a shared MLP.
+    Each value is encoded as [value, is_missing] so the model can
+    distinguish true zeros from missing data.
     """
 
     def __init__(self, out_channels: int):
         super().__init__()
 
         self.mlp = nn.Sequential(
-            nn.Linear(1, out_channels),
+            nn.Linear(2, out_channels),
             nn.ReLU(),
             nn.Linear(out_channels, out_channels),
         )
 
     def forward(self, x: Any) -> Tensor:
-        # Extract underlying tensor if wrapped by torch_frame
         if hasattr(x, "values") and not callable(x.values):
             x = x.values
 
-        # x: [B, Num_Cols]
         if x.dim() > 2:
             x = x.squeeze(-1)
 
         B, C = x.shape
 
-        # Replace NaNs
+        nan_mask = torch.isnan(x).float()  # [B, C]
         x = torch.nan_to_num(x, nan=0.0)
 
-        # Flatten
-        x_flat = x.view(B * C, 1)
+        # [B, C, 2]: value + missingness indicator
+        x_aug = torch.stack([x, nan_mask], dim=-1)
+        x_flat = x_aug.view(B * C, 2)
 
         out = self.mlp(x_flat)
 
-        # [B, Num_Cols, Channels]
         return out.view(B, C, -1)
 
 
@@ -558,7 +558,9 @@ class NeighborTfsEncoder(nn.Module):
                 m.reset_parameters()
 
     def _normalize_numerical(self, big_tf, node_type: str):
-        """Z-score normalize numerical columns using precomputed per-table stats."""
+        """Z-score normalize numerical columns using precomputed per-table stats.
+        NaN values propagate through arithmetic so SharedNumericalEncoder
+        can detect and handle them with a learned missingness indicator."""
         if torch_frame.numerical not in big_tf.feat_dict:
             return
         safe_name = self._node_type_to_safe.get(node_type)
@@ -569,8 +571,7 @@ class NeighborTfsEncoder(nn.Module):
         feat = big_tf.feat_dict[torch_frame.numerical]
         if hasattr(feat, "values") and not callable(feat.values):
             feat = feat.values
-        # Replace NaN with column mean so missing values become 0 after Z-score
-        feat = torch.where(torch.isnan(feat), mean, feat)
+        # NaN propagates naturally: (NaN - mean) / std = NaN
         big_tf.feat_dict[torch_frame.numerical] = (feat - mean) / (std + 1e-8)
 
     def forward(
@@ -609,6 +610,8 @@ class NeighborTfsEncoder(nn.Module):
             big_tf = big_tf.to(device)
 
             for stype, tensor in big_tf.feat_dict.items():
+                if stype == torch_frame.numerical:
+                    continue  # NaN preserved for missingness detection
                 if isinstance(tensor, torch.Tensor):
                     big_tf.feat_dict[stype] = torch.nan_to_num(
                         tensor,

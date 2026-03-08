@@ -239,24 +239,25 @@ class TestNormalizeNumerical:
         result = tf.feat_dict[torch_frame.numerical]
         assert torch.isfinite(result).all()
 
-    def test_nan_imputed_with_mean_before_zscore(self):
-        """NaN values should become 0.0 after Z-score (imputed with column mean)."""
+    def test_nan_propagates_through_zscore(self):
+        """NaN values should remain NaN after Z-score so downstream
+        SharedNumericalEncoder can detect them for missingness handling."""
         feat = torch.tensor([[float("nan"), 50.0], [100.0, float("nan")]])
         enc, tf = self._build_encoder_and_tf(
             mean=[100.0, 50.0], std=[10.0, 5.0], feat_values=feat,
         )
         enc._normalize_numerical(tf, "t")
         result = tf.feat_dict[torch_frame.numerical]
-        # NaN positions should become 0.0 (mean imputed, then (mean-mean)/std = 0)
-        assert torch.isfinite(result).all()
-        assert result[0, 0].item() == pytest.approx(0.0, abs=1e-6)  # was NaN in col 0
-        assert result[1, 1].item() == pytest.approx(0.0, abs=1e-6)  # was NaN in col 1
+        # NaN positions should stay NaN (propagated for downstream detection)
+        assert torch.isnan(result[0, 0]), "NaN should propagate through Z-score"
+        assert torch.isnan(result[1, 1]), "NaN should propagate through Z-score"
         # Non-NaN values should be Z-scored normally
         assert result[0, 1].item() == pytest.approx(0.0, abs=1e-6)  # (50-50)/5 = 0
         assert result[1, 0].item() == pytest.approx(0.0, abs=1e-6)  # (100-100)/10 = 0
 
-    def test_nan_does_not_become_outlier(self):
-        """NaN should NOT become (0-mean)/std, which is an outlier for large means."""
+    def test_nan_not_silently_converted_to_outlier(self):
+        """NaN must NOT become (0-mean)/std, which is an outlier for large means.
+        Instead NaN should propagate through Z-score for downstream handling."""
         feat = torch.tensor([[float("nan")]])
         enc = _make_encoder(
             node_type_map={"t": 0},
@@ -267,10 +268,9 @@ class TestNormalizeNumerical:
         tf.feat_dict = {torch_frame.numerical: feat}
         enc._normalize_numerical(tf, "t")
         result = tf.feat_dict[torch_frame.numerical]
-        # If NaN was naively replaced with 0 before Z-score: (0-1000)/10 = -100 (outlier!)
-        # Correct: impute with mean first, so (1000-1000)/10 = 0
-        assert result.abs().item() < 1.0, (
-            f"NaN became {result.item():.1f} after Z-score — should be ~0.0, not an outlier"
+        # NaN should stay NaN, not become -100 ((0-1000)/10)
+        assert torch.isnan(result).all(), (
+            f"NaN became {result.item():.1f} — should stay NaN for missingness detection"
         )
 
     def test_in_place_mutation(self):
