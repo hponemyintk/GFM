@@ -101,20 +101,19 @@ def _torchframe_to_dataframe(tf) -> pd.DataFrame:
 
     # ---- Embedding columns (flatten each dim as a float column) -------------
     if torch_frame.embedding in feat_dict:
+        from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor
+
         t = feat_dict[torch_frame.embedding]
-        if t.dim() == 3:
+        if isinstance(t, MultiEmbeddingTensor):
+            # values is already [num_rows, total_dims] (all cols concatenated)
+            arr = t.values.cpu().float().numpy()
+        elif t.dim() == 3:
             n, cols, d = t.shape
-            t = t.reshape(n, cols * d)
-        arr = t.cpu().float().numpy()
-        names = col_names_dict.get(torch_frame.embedding, [])
-        if t.shape[1] == len(names):
-            # 1-d per column
-            for i, name in enumerate(names):
-                parts[f"emb__{name}"] = arr[:, i].astype(np.float64)
+            arr = t.reshape(n, cols * d).cpu().float().numpy()
         else:
-            # Multi-dim: use positional naming
-            for i in range(arr.shape[1]):
-                parts[f"emb__dim{i}"] = arr[:, i].astype(np.float64)
+            arr = t.cpu().float().numpy()
+        for i in range(arr.shape[1]):
+            parts[f"emb__dim{i}"] = arr[:, i].astype(np.float64)
 
     if not parts:
         raise ValueError("No extractable features found in TorchFrame")
