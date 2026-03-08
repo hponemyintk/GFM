@@ -44,36 +44,38 @@ def _torchframe_to_dataframe(tf, max_features: int = 500) -> pd.DataFrame:
 
     def _to_2d(t):
         """Ensure tensor is 2D [n_rows, n_cols]."""
-        t = t.cpu().float()
-        if t.dim() == 3:
-            t = t.squeeze(-1)
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        return t.numpy()
+        arr = t.cpu().float().numpy()
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        elif arr.ndim == 3:
+            if arr.shape[-1] == 1:
+                arr = arr.squeeze(-1)  # [n, cols, 1] -> [n, cols]
+            else:
+                arr = arr.reshape(arr.shape[0], -1)  # [n, cols, k] -> [n, cols*k]
+        elif arr.ndim > 3:
+            arr = arr.reshape(arr.shape[0], -1)
+        return arr
 
     # ---- Numerical columns --------------------------------------------------
     if torch_frame.numerical in feat_dict:
         arr = _to_2d(feat_dict[torch_frame.numerical])
-        names = col_names_dict[torch_frame.numerical]
-        for i, name in enumerate(names):
-            parts[f"num__{name}"] = arr[:, i].astype(np.float64)
+        for i in range(arr.shape[1]):
+            parts[f"num__{i}"] = arr[:, i].astype(np.float64)
 
     # ---- Timestamp columns --------------------------------------------------
     if torch_frame.timestamp in feat_dict:
         arr = _to_2d(feat_dict[torch_frame.timestamp])
-        names = col_names_dict[torch_frame.timestamp]
-        for i, name in enumerate(names):
-            parts[f"ts__{name}"] = arr[:, i].astype(np.float64)
+        for i in range(arr.shape[1]):
+            parts[f"ts__{i}"] = arr[:, i].astype(np.float64)
 
     # ---- Categorical columns (preserve as pd.Categorical) -------------------
     if torch_frame.categorical in feat_dict:
         arr = _to_2d(feat_dict[torch_frame.categorical]).astype(np.int64)
-        names = col_names_dict[torch_frame.categorical]
-        for i, name in enumerate(names):
+        for i in range(arr.shape[1]):
             col = arr[:, i]
             # Map -1 (missing) to None, keep valid indices as string categories
             cats = [str(v) if v >= 0 else None for v in col]
-            parts[f"cat__{name}"] = pd.Categorical(cats)
+            parts[f"cat__{i}"] = pd.Categorical(cats)
 
     # ---- Multicategorical columns (explode to binary indicators) ------------
     if torch_frame.multicategorical in feat_dict:
@@ -201,7 +203,6 @@ def precompute_tabpfn_embeddings(
     """
     from tabpfn import TabPFNClassifier, TabPFNRegressor
     from tabpfn.base import get_embeddings
-    from tabpfn.constants import ModelVersion
 
     rng = np.random.RandomState(seed)
     os.makedirs(cache_dir, exist_ok=True)
@@ -314,13 +315,11 @@ def precompute_tabpfn_embeddings(
                         y_support = y_support[sub_idx]
 
                     if is_categorical:
-                        model = TabPFNClassifier.create_default_for_version(
-                            ModelVersion.V2,
+                        model = TabPFNClassifier(
                             device=device, n_estimators=1,
                         )
                     else:
-                        model = TabPFNRegressor.create_default_for_version(
-                            ModelVersion.V2,
+                        model = TabPFNRegressor(
                             device=device, n_estimators=1,
                         )
                     model.fit(X_support, y_support)
