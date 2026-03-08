@@ -504,3 +504,63 @@ class TestOutputSanity:
         )
         assert torch.allclose(out[0, 1], out_perm[0, 2], atol=1e-5)
         assert torch.allclose(out[0, 2], out_perm[0, 0], atol=1e-5)
+
+
+# ═══════════════════════════════════════════════════════════
+# 6. MISSINGNESS INDICATOR
+# ═══════════════════════════════════════════════════════════
+
+class TestMissingnessIndicator:
+    """Verify SharedNumericalEncoder distinguishes missing from present values."""
+
+    def test_nan_and_zero_produce_different_outputs(self):
+        """NaN (missing) and 0.0 (observed zero) should encode differently."""
+        enc = SharedNumericalEncoder(64)
+        x_zero = torch.tensor([[0.0]])
+        x_nan = torch.tensor([[float("nan")]])
+        out_zero = enc(x_zero)
+        out_nan = enc(x_nan)
+        assert not torch.allclose(out_zero, out_nan, atol=1e-5), (
+            "Encoder cannot distinguish NaN from 0.0 — missingness indicator broken"
+        )
+
+    def test_nan_produces_finite_output(self):
+        """NaN inputs must produce finite encoder output."""
+        enc = SharedNumericalEncoder(64)
+        x = torch.tensor([[float("nan"), 1.0], [2.0, float("nan")]])
+        out = enc(x)
+        assert torch.isfinite(out).all(), "NaN input produced non-finite output"
+
+    def test_all_nan_row_produces_finite_output(self):
+        """A row where every column is NaN should still produce finite output."""
+        enc = SharedNumericalEncoder(64)
+        x = torch.tensor([[float("nan"), float("nan"), float("nan")]])
+        out = enc(x)
+        assert torch.isfinite(out).all()
+
+    def test_missingness_signal_has_gradient(self):
+        """The missingness path should receive gradients when NaN is present."""
+        enc = SharedNumericalEncoder(64)
+        x = torch.tensor([[float("nan"), 1.0]])
+        out = enc(x)
+        loss = out.sum()
+        loss.backward()
+        # First layer weight has shape [out_channels, 2]
+        # Column 1 corresponds to the missingness flag
+        first_weight = list(enc.mlp.parameters())[0]  # [64, 2]
+        mask_grad = first_weight.grad[:, 1]  # gradient for missingness input
+        assert mask_grad.abs().sum() > 0, (
+            "Missingness input column receives no gradient"
+        )
+
+    def test_mixed_nan_batch_consistent(self):
+        """Encoding a value should be the same whether other columns have NaN or not."""
+        enc = SharedNumericalEncoder(64)
+        x_clean = torch.tensor([[5.0, 3.0]])
+        x_mixed = torch.tensor([[5.0, float("nan")]])
+        out_clean = enc(x_clean)
+        out_mixed = enc(x_mixed)
+        # Column 0 (value=5.0, not NaN) should encode identically in both cases
+        assert torch.allclose(out_clean[0, 0], out_mixed[0, 0], atol=1e-5), (
+            "Present value encodes differently depending on NaN in other columns"
+        )
