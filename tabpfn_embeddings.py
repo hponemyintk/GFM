@@ -274,9 +274,9 @@ def precompute_tabpfn_embeddings(
             if is_categorical:
                 # Use category codes as integer labels for classification
                 y_all = df[target_col].cat.codes.values.copy()  # -1 = NaN
-                # Need at least 2 distinct non-missing classes
+                # Need 2-10 distinct non-missing classes (TabPFN limit)
                 valid_classes = np.unique(y_all[y_all >= 0])
-                if len(valid_classes) < 2:
+                if len(valid_classes) < 2 or len(valid_classes) > 10:
                     continue
             else:
                 y_all = df[target_col].values.astype(np.float64)
