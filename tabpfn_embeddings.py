@@ -42,66 +42,69 @@ def _torchframe_to_dataframe(tf, max_features: int = 500) -> pd.DataFrame:
     col_names_dict = tf.col_names_dict
     parts = {}
 
-    # ---- Numerical columns --------------------------------------------------
-    if torch_frame.numerical in feat_dict:
-        t = feat_dict[torch_frame.numerical]
+    def _to_2d(t):
+        """Ensure tensor is 2D [n_rows, n_cols]."""
+        t = t.cpu().float()
         if t.dim() == 3:
             t = t.squeeze(-1)
-        arr = t.cpu().float().numpy()
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)
+        return t.numpy()
+
+    # ---- Numerical columns --------------------------------------------------
+    if torch_frame.numerical in feat_dict:
+        arr = _to_2d(feat_dict[torch_frame.numerical])
         names = col_names_dict[torch_frame.numerical]
         for i, name in enumerate(names):
             parts[f"num__{name}"] = arr[:, i].astype(np.float64)
 
     # ---- Timestamp columns --------------------------------------------------
     if torch_frame.timestamp in feat_dict:
-        t = feat_dict[torch_frame.timestamp]
-        if t.dim() == 3:
-            t = t.squeeze(-1)
-        arr = t.cpu().float().numpy()
+        arr = _to_2d(feat_dict[torch_frame.timestamp])
         names = col_names_dict[torch_frame.timestamp]
         for i, name in enumerate(names):
             parts[f"ts__{name}"] = arr[:, i].astype(np.float64)
 
     # ---- Categorical columns (preserve as pd.Categorical) -------------------
     if torch_frame.categorical in feat_dict:
-        t = feat_dict[torch_frame.categorical]
-        if t.dim() == 3:
-            t = t.squeeze(-1)
-        arr = t.cpu().long().numpy()  # integer category indices
+        arr = _to_2d(feat_dict[torch_frame.categorical]).astype(np.int64)
         names = col_names_dict[torch_frame.categorical]
         for i, name in enumerate(names):
             col = arr[:, i]
-            # Map -1 (missing) to NaN, keep valid indices as string categories
-            cats = []
-            for v in col:
-                cats.append(str(v) if v >= 0 else None)
+            # Map -1 (missing) to None, keep valid indices as string categories
+            cats = [str(v) if v >= 0 else None for v in col]
             parts[f"cat__{name}"] = pd.Categorical(cats)
 
     # ---- Multicategorical columns (explode to binary indicators) ------------
     if torch_frame.multicategorical in feat_dict:
         mnt = feat_dict[torch_frame.multicategorical]
         names = col_names_dict[torch_frame.multicategorical]
-        assert isinstance(mnt, MultiNestedTensor)
-        n_rows = mnt.num_rows
-        n_cols = mnt.num_cols
-        for col_idx, col_name in enumerate(names):
-            # Collect all unique category indices for this column
-            all_cats = set()
-            for row_idx in range(n_rows):
-                vals = mnt[row_idx, col_idx]
-                valid = vals[vals >= 0]  # -1 = missing
-                all_cats.update(valid.tolist())
-            all_cats = sorted(all_cats)
-            if not all_cats:
-                continue
-            # Build binary indicator columns
-            for cat_val in all_cats:
-                indicator = np.zeros(n_rows, dtype=np.float64)
+        if isinstance(mnt, MultiNestedTensor):
+            n_rows = mnt.num_rows
+            n_cols = mnt.num_cols
+            for col_idx, col_name in enumerate(names):
+                # Collect all unique category indices for this column
+                all_cats = set()
                 for row_idx in range(n_rows):
                     vals = mnt[row_idx, col_idx]
-                    if cat_val in vals.tolist():
-                        indicator[row_idx] = 1.0
-                parts[f"mcat__{col_name}__{cat_val}"] = indicator
+                    valid = vals[vals >= 0]  # -1 = missing
+                    all_cats.update(valid.tolist())
+                all_cats = sorted(all_cats)
+                if not all_cats:
+                    continue
+                # Build binary indicator columns
+                for cat_val in all_cats:
+                    indicator = np.zeros(n_rows, dtype=np.float64)
+                    for row_idx in range(n_rows):
+                        vals = mnt[row_idx, col_idx]
+                        if cat_val in vals.tolist():
+                            indicator[row_idx] = 1.0
+                    parts[f"mcat__{col_name}__{cat_val}"] = indicator
+        else:
+            logger.warning(
+                "  Multicategorical data is not a MultiNestedTensor (%s), skipping",
+                type(mnt).__name__,
+            )
 
     # ---- Embedding columns (flatten each dim as a float column) -------------
     if torch_frame.embedding in feat_dict:
@@ -111,11 +114,10 @@ def _torchframe_to_dataframe(tf, max_features: int = 500) -> pd.DataFrame:
         if isinstance(t, MultiEmbeddingTensor):
             # values is already [num_rows, total_dims] (all cols concatenated)
             arr = t.values.cpu().float().numpy()
-        elif t.dim() == 3:
-            n, cols, d = t.shape
-            arr = t.reshape(n, cols * d).cpu().float().numpy()
         else:
-            arr = t.cpu().float().numpy()
+            arr = _to_2d(t)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
         for i in range(arr.shape[1]):
             parts[f"emb__dim{i}"] = arr[:, i].astype(np.float64)
 
