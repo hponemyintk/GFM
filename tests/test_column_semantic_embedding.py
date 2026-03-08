@@ -799,3 +799,389 @@ class TestColumnSemanticReset:
         original = enc._col_glove_embeddings.clone()
         enc.reset_parameters()
         assert torch.allclose(enc._col_glove_embeddings, original)
+
+
+# ═══════════════════════════════════════════════════════════
+# 9. MULTI-STYPE FORWARD
+# ═══════════════════════════════════════════════════════════
+
+class TestMultiStypeForward:
+    """Verify column semantic embeddings work across multiple stypes."""
+
+    def test_numerical_and_categorical_columns(self):
+        """Forward with both numerical and categorical columns should produce
+        finite output with correct shape, and semantic embeddings should be
+        applied (all column names are in the buffer)."""
+        channels = 32
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {
+                torch_frame.numerical: ["price"],
+                torch_frame.categorical: ["color"],
+            }},
+            col_stats_dict={"t": {
+                "price": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+                "color": {},
+            }},
+            channels=channels,
+        )
+
+        B, K = 2, 3
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+
+        # TF with both numerical and categorical
+        num_feat = torch.randn(B * K, 1)
+        cat_feat = torch.randint(0, 5, (B * K, 1))
+        big_tf = _make_tensorframe(
+            feat_dict={
+                torch_frame.numerical: num_feat,
+                torch_frame.categorical: cat_feat,
+            },
+            col_names_dict={
+                torch_frame.numerical: ["price"],
+                torch_frame.categorical: ["color"],
+            },
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: list(range(B * K))},
+            "flat_batch_idx": [b for b in range(B) for _ in range(K)],
+            "flat_nbr_idx": [k for _ in range(B) for k in range(K)],
+        }
+
+        out = enc(batch_dict, neighbor_types)
+        assert out.shape == (B, K, channels)
+        assert torch.isfinite(out).all()
+
+    def test_multi_stype_semantic_changes_output(self):
+        """With multi-stype TF, zeroing the GloVe buffer should change
+        the output (proving semantics were applied)."""
+        channels = 32
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {
+                torch_frame.numerical: ["price"],
+                torch_frame.categorical: ["color"],
+            }},
+            col_stats_dict={"t": {
+                "price": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+                "color": {},
+            }},
+            channels=channels,
+        )
+        enc.eval()
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+
+        num_feat = torch.randn(1, 1)
+        cat_feat = torch.randint(0, 5, (1, 1))
+        big_tf = _make_tensorframe(
+            feat_dict={
+                torch_frame.numerical: num_feat,
+                torch_frame.categorical: cat_feat,
+            },
+            col_names_dict={
+                torch_frame.numerical: ["price"],
+                torch_frame.categorical: ["color"],
+            },
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        with torch.no_grad():
+            out_with = enc(batch_dict, neighbor_types).clone()
+
+        enc._col_glove_embeddings.zero_()
+        batch_dict["grouped_tfs"] = {0: big_tf}
+        with torch.no_grad():
+            out_without = enc(batch_dict, neighbor_types).clone()
+
+        assert not torch.allclose(out_with, out_without, atol=1e-4), (
+            "Column semantics had no effect on multi-stype output"
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# 10. SHAPE MISMATCH WARNING
+# ═══════════════════════════════════════════════════════════
+
+class TestShapeMismatchWarning:
+    """Verify a warning is emitted when column count doesn't match."""
+
+    def test_mismatch_emits_warning(self):
+        """When col_names_dict has fewer names than the encoder produces
+        columns, a warning should be emitted."""
+        channels = 32
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["price", "age"]}},
+            col_stats_dict={"t": {
+                "price": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+                "age": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+            }},
+            channels=channels,
+        )
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+
+        # TF has 2 numerical columns but col_names_dict lists only 1 name
+        # → Z-score broadcasts 2-element buffer onto 1-col tensor → 2 value cols
+        # but only 1 semantic col → shape mismatch warning
+        feat = torch.randn(1, 1)
+        big_tf = _make_tensorframe(
+            feat_dict={torch_frame.numerical: feat},
+            col_names_dict={torch_frame.numerical: ["price"]},
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        import warnings as w
+        with w.catch_warnings(record=True) as caught:
+            w.simplefilter("always")
+            enc(batch_dict, neighbor_types)
+
+        mismatch_warnings = [
+            x for x in caught
+            if "Column semantic count" in str(x.message)
+        ]
+        assert len(mismatch_warnings) >= 1, (
+            f"Expected shape mismatch warning, got: {[str(x.message) for x in caught]}"
+        )
+
+    def test_no_warning_when_shapes_match(self):
+        """No warning when column counts align."""
+        channels = 32
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["price"]}},
+            col_stats_dict={"t": {
+                "price": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+            }},
+            channels=channels,
+        )
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+        feat = torch.randn(1, 1)
+        big_tf = _make_tensorframe(
+            feat_dict={torch_frame.numerical: feat},
+            col_names_dict={torch_frame.numerical: ["price"]},
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        import warnings as w
+        with w.catch_warnings(record=True) as caught:
+            w.simplefilter("always")
+            enc(batch_dict, neighbor_types)
+
+        mismatch_warnings = [
+            x for x in caught
+            if "Column semantic count" in str(x.message)
+        ]
+        assert len(mismatch_warnings) == 0, (
+            f"Unexpected warning: {[str(x.message) for x in caught]}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# 11. UNSEEN COLUMN CACHE
+# ═══════════════════════════════════════════════════════════
+
+class TestUnseenColumnCache:
+    """Verify unseen column GloVe vectors are cached after first computation."""
+
+    def test_cache_populated_on_first_forward(self):
+        """After forward with an unseen column, _col_unseen_cache should have it."""
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["speed"]}},
+            col_stats_dict={"t": {"speed": {StatType.MEAN: 0.0, StatType.STD: 1.0}}},
+            channels=32,
+        )
+
+        assert len(enc._col_unseen_cache) == 0
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+        feat = torch.randn(1, 1)
+        big_tf = _make_tensorframe(
+            feat_dict={torch_frame.numerical: feat},
+            col_names_dict={torch_frame.numerical: ["weight"]},  # unseen
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        enc(batch_dict, neighbor_types)
+
+        assert "weight" in enc._col_unseen_cache
+        assert enc._col_unseen_cache["weight"].shape == (300,)
+
+    def test_cache_reused_on_second_forward(self):
+        """Second forward with same unseen column should use the cached vector,
+        not recompute GloVe."""
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["speed"]}},
+            col_stats_dict={"t": {"speed": {StatType.MEAN: 0.0, StatType.STD: 1.0}}},
+            channels=32,
+        )
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+        feat = torch.randn(1, 1)
+        big_tf = _make_tensorframe(
+            feat_dict={torch_frame.numerical: feat},
+            col_names_dict={torch_frame.numerical: ["weight"]},
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        # First forward — populates cache
+        enc(batch_dict, neighbor_types)
+        cached_vec = enc._col_unseen_cache["weight"].clone()
+
+        # Second forward — should use cached
+        batch_dict["grouped_tfs"] = {0: big_tf}
+        enc(batch_dict, neighbor_types)
+
+        assert torch.allclose(enc._col_unseen_cache["weight"], cached_vec), (
+            "Cache was overwritten on second forward"
+        )
+
+    def test_unseen_column_no_embedder_uses_zeros(self):
+        """When col_names_dict is None (no embedder), unseen columns should
+        produce zero GloVe vectors and still give finite output."""
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict=None,
+            col_stats_dict=None,
+            channels=32,
+        )
+
+        B, K = 1, 1
+        neighbor_types = torch.zeros(B, K, dtype=torch.long)
+        feat = torch.randn(1, 1)
+        big_tf = _make_tensorframe(
+            feat_dict={torch_frame.numerical: feat},
+            col_names_dict={torch_frame.numerical: ["anything"]},
+        )
+
+        batch_dict = {
+            "grouped_tfs": {0: big_tf},
+            "grouped_indices": {0: [0]},
+            "flat_batch_idx": [0],
+            "flat_nbr_idx": [0],
+        }
+
+        out = enc(batch_dict, neighbor_types)
+        assert torch.isfinite(out).all(), "Unseen column without embedder produced NaN/Inf"
+
+
+# ═══════════════════════════════════════════════════════════
+# 12. INFERENCE GUARD
+# ═══════════════════════════════════════════════════════════
+
+class TestColumnSemanticInferenceGuard:
+    """Verify inference guard detects missing col_names_dict."""
+
+    def test_guard_fires_when_loaded_without_col_names(self):
+        """Model trained with column semantics should crash if loaded without
+        col_names_dict, preventing silent degradation.
+
+        Uses categorical columns to avoid Z-score guard firing first.
+        """
+        enc_train = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.categorical: ["color"]}},
+            col_stats_dict={"t": {"color": {}}},
+        )
+        state = enc_train.state_dict()
+
+        # Rebuild without col_names_dict
+        enc_infer = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict=None,
+            col_stats_dict=None,
+        )
+        # Filter mismatched buffers for loading
+        filtered_state = {k: v for k, v in state.items()
+                          if not k.startswith('_col_glove')}
+        enc_infer.load_state_dict(filtered_state, strict=False)
+
+        # _num_col_semantic_cols is loaded (=1), but _col_name_to_idx is empty
+        assert enc_infer._num_col_semantic_cols.item() == 1
+        assert len(enc_infer._col_name_to_idx) == 0
+
+        dummy_batch = {
+            "grouped_tfs": {},
+            "grouped_indices": {},
+            "flat_batch_idx": [],
+            "flat_nbr_idx": [],
+        }
+        with pytest.raises(RuntimeError, match="column semantic"):
+            enc_infer.forward(dummy_batch, torch.zeros(1, 1, dtype=torch.long))
+
+    def test_guard_buffer_registered(self):
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["x", "y"]}},
+            col_stats_dict={"t": {
+                "x": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+                "y": {StatType.MEAN: 0.0, StatType.STD: 1.0},
+            }},
+        )
+        assert hasattr(enc, "_num_col_semantic_cols")
+        assert enc._num_col_semantic_cols.item() == 2
+
+    def test_guard_zero_when_no_columns(self):
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict=None,
+            col_stats_dict=None,
+        )
+        assert enc._num_col_semantic_cols.item() == 0
+
+    def test_no_guard_when_no_semantics(self):
+        """Model without column semantics should not trigger the guard."""
+        enc = _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict=None,
+            col_stats_dict=None,
+        )
+        dummy_batch = {
+            "grouped_tfs": {},
+            "grouped_indices": {},
+            "flat_batch_idx": [],
+            "flat_nbr_idx": [],
+        }
+        # Should not raise
+        enc.forward(dummy_batch, torch.zeros(1, 1, dtype=torch.long))
