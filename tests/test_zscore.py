@@ -354,11 +354,12 @@ class TestZScoreSerializationGuard:
             col_names_dict=None,
             col_stats_dict=None,
         )
-        # Filter out column-semantic buffer (size mismatch: trained has columns,
-        # inference has none). This is expected — column names must be provided
-        # at construction time, just like Z-score stats.
+        # Filter out column-semantic buffers (size mismatch: trained has
+        # columns, inference has none). This is expected — column names must
+        # be provided at construction time, just like Z-score stats.
         filtered_state = {k: v for k, v in state.items()
-                          if not k.startswith('_col_glove')}
+                          if not k.startswith('_col_glove')
+                          and k != '_num_col_semantic_cols'}
         enc_infer.load_state_dict(filtered_state, strict=False)
 
         # 3. _num_zscore_tables is loaded (=1), but _node_type_to_safe is empty

@@ -1,4 +1,5 @@
 import re
+import warnings
 from typing import Dict
 
 import torch
@@ -418,20 +419,26 @@ class TableAgnosticStypeEncoder(nn.Module):
             str(torch_frame.embedding): SharedEmbeddingEncoder(channels, emb_dims=emb_dims),
         })
 
+    def iter_active_stypes(self, feat_dict):
+        """Yield stypes from feat_dict that have a registered encoder.
+
+        This defines the canonical column ordering for concatenation.
+        Both forward() and NeighborTfsEncoder._get_col_semantic_embeddings()
+        must use this to stay aligned.
+        """
+        for stype in feat_dict.keys():
+            if str(stype) in self.encoders:
+                yield stype
+
     def forward(self, tf: TensorFrame) -> Tensor:
 
         atom_embeddings: List[Tensor] = []
 
-        for stype_name in tf.feat_dict.keys():
-
-            stype_str = str(stype_name)
-
-            if stype_str not in self.encoders:
-                continue
+        for stype_name in self.iter_active_stypes(tf.feat_dict):
 
             feat = tf.feat_dict[stype_name]
 
-            x_stype = self.encoders[stype_str](feat)
+            x_stype = self.encoders[str(stype_name)](feat)
 
             atom_embeddings.append(x_stype)
 
@@ -567,12 +574,28 @@ class NeighborTfsEncoder(nn.Module):
             with torch.no_grad():
                 col_embeddings = col_embedder(all_col_names)  # [N_unique, 300]
             self.register_buffer("_col_glove_embeddings", col_embeddings)
-            self._glove_embedder = col_embedder  # kept for unseen columns
+            # Kept for on-the-fly embedding of unseen columns. Plain Python
+            # object — not in state_dict, but each DDP rank creates its own
+            # during __init__ so no pickle/broadcast needed. GloVe is
+            # deterministic, so all ranks produce identical vectors.
+            self._glove_embedder = col_embedder
         else:
             self.register_buffer("_col_glove_embeddings", torch.zeros(0, 300))
             self._glove_embedder = None
 
+        # Runtime cache for unseen column GloVe vectors. Populated lazily
+        # during forward — avoids repeated CPU inference across batches.
+        # Per-rank dict (fine for DDP since GloVe is deterministic).
+        self._col_unseen_cache: Dict[str, Tensor] = {}
+
         self.col_name_proj = nn.Linear(300, channels)
+
+        # Guard: detect when model trained with column semantics is loaded
+        # without col_names_dict (analogous to _num_zscore_tables guard)
+        self.register_buffer(
+            '_num_col_semantic_cols',
+            torch.tensor(len(all_col_names), dtype=torch.long),
+        )
 
     def reset_parameters(self):
 
@@ -610,39 +633,55 @@ class NeighborTfsEncoder(nn.Module):
     def _get_col_semantic_embeddings(self, big_tf, device):
         """Build [num_cols, channels] semantic embedding for the columns in big_tf.
 
-        Columns are ordered to match TableAgnosticStypeEncoder's concatenation:
-        for each stype in feat_dict iteration order, extend with that stype's
-        column names from big_tf.col_names_dict.
+        Column ordering is defined by TableAgnosticStypeEncoder.iter_active_stypes
+        to stay aligned with the value encoding concatenation order.
 
-        For column names not seen at init, computes GloVe on-the-fly via the
-        stored embedder, or falls back to a zero vector.
+        Known columns are batch-indexed from the precomputed buffer. Unseen
+        columns are computed on-the-fly via GloVe and cached for the lifetime
+        of the process (avoids repeated CPU inference across batches in DDP).
         """
+        if not hasattr(big_tf, 'col_names_dict'):
+            return None
+
+        # Collect column names in the same order as value encoding
         ordered_col_names: List[str] = []
-        for stype in big_tf.feat_dict.keys():
-            stype_str = str(stype)
-            if stype_str not in self.table_agnostic_encoder.encoders:
-                continue
-            if hasattr(big_tf, 'col_names_dict') and stype in big_tf.col_names_dict:
+        for stype in self.table_agnostic_encoder.iter_active_stypes(big_tf.feat_dict):
+            if stype in big_tf.col_names_dict:
                 ordered_col_names.extend(big_tf.col_names_dict[stype])
 
         if not ordered_col_names:
             return None
 
-        glove_vecs: List[Tensor] = []
+        # Resolve unseen columns: compute GloVe once, cache forever
+        has_unseen = False
         for name in ordered_col_names:
-            if name in self._col_name_to_idx:
-                idx = self._col_name_to_idx[name]
-                glove_vecs.append(self._col_glove_embeddings[idx])
-            else:
-                # Unseen column: compute on-the-fly or fall back to zeros
-                if self._glove_embedder is not None:
-                    with torch.no_grad():
-                        vec = self._glove_embedder([name])[0].to(device)
-                else:
-                    vec = torch.zeros(300, device=device)
-                glove_vecs.append(vec)
+            if name not in self._col_name_to_idx:
+                has_unseen = True
+                if name not in self._col_unseen_cache:
+                    if self._glove_embedder is not None:
+                        with torch.no_grad():
+                            vec = self._glove_embedder([name])[0]
+                    else:
+                        vec = torch.zeros(300)
+                    self._col_unseen_cache[name] = vec  # stored on CPU
 
-        glove_stack = torch.stack(glove_vecs, dim=0)  # [num_cols, 300]
+        if not has_unseen:
+            # Fast path: all columns known — single batch index
+            idx_tensor = torch.tensor(
+                [self._col_name_to_idx[n] for n in ordered_col_names],
+                dtype=torch.long, device=device,
+            )
+            glove_stack = self._col_glove_embeddings[idx_tensor]
+        else:
+            # Mixed path: gather from buffer + cache
+            vecs: List[Tensor] = []
+            for name in ordered_col_names:
+                if name in self._col_name_to_idx:
+                    vecs.append(self._col_glove_embeddings[self._col_name_to_idx[name]])
+                else:
+                    vecs.append(self._col_unseen_cache[name].to(device))
+            glove_stack = torch.stack(vecs, dim=0)
+
         return self.col_name_proj(glove_stack)  # [num_cols, channels]
 
     def forward(
@@ -658,6 +697,15 @@ class NeighborTfsEncoder(nn.Module):
                 "col_names_dict/col_stats_dict were not provided at "
                 "construction time. Pass the same col_names_dict and "
                 "col_stats_dict used during training to NeighborTfsEncoder."
+            )
+
+        if self._num_col_semantic_cols > 0 and len(self._col_name_to_idx) == 0:
+            raise RuntimeError(
+                "Model was trained with column semantic embeddings for "
+                f"{self._num_col_semantic_cols.item()} column(s), but "
+                "col_names_dict was not provided at construction time. "
+                "Pass the same col_names_dict used during training to "
+                "NeighborTfsEncoder."
             )
 
         grouped_tfs = batch_dict["grouped_tfs"]
@@ -699,8 +747,17 @@ class NeighborTfsEncoder(nn.Module):
 
             # Add column-name semantic embeddings
             col_sem = self._get_col_semantic_embeddings(big_tf, device)
-            if col_sem is not None and col_sem.shape[0] == x_cols.shape[1]:
-                x_cols = x_cols + col_sem.unsqueeze(0)  # broadcast over batch
+            if col_sem is not None:
+                if col_sem.shape[0] == x_cols.shape[1]:
+                    x_cols = x_cols + col_sem.unsqueeze(0)  # broadcast over batch
+                else:
+                    warnings.warn(
+                        f"Column semantic count ({col_sem.shape[0]}) != value "
+                        f"column count ({x_cols.shape[1]}) for table type "
+                        f"{t_int}. Skipping column semantic embeddings for "
+                        f"this batch. This may indicate a data pipeline bug.",
+                        stacklevel=2,
+                    )
 
             batch_size = x_cols.size(0)
 
