@@ -184,6 +184,8 @@ class SharedNumericalEncoder(nn.Module):
 
         B, C = x.shape
 
+        # Clamp infinities while preserving NaN for missingness detection
+        x = x.clamp(min=-1e6, max=1e6)
         nan_mask = torch.isnan(x).float()  # [B, C]
         x = torch.nan_to_num(x, nan=0.0)
 
@@ -572,7 +574,8 @@ class NeighborTfsEncoder(nn.Module):
         if hasattr(feat, "values") and not callable(feat.values):
             feat = feat.values
         # NaN propagates naturally: (NaN - mean) / std = NaN
-        big_tf.feat_dict[torch_frame.numerical] = (feat - mean) / (std + 1e-8)
+        # Clamp to ±10 std devs to control outliers (clamp preserves NaN)
+        big_tf.feat_dict[torch_frame.numerical] = ((feat - mean) / (std + 1e-8)).clamp(-10, 10)
 
     def forward(
         self,
