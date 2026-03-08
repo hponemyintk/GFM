@@ -547,6 +547,33 @@ class NeighborTfsEncoder(nn.Module):
             torch.tensor(zscore_table_count, dtype=torch.long),
         )
 
+        # Precompute GloVe embeddings for column names (semantic column identity)
+        all_col_names: List[str] = []
+        col_name_set: set = set()
+        if col_names_dict:
+            for node_type, stype_dict in col_names_dict.items():
+                for stype, col_list in stype_dict.items():
+                    for col_name in col_list:
+                        if col_name not in col_name_set:
+                            all_col_names.append(col_name)
+                            col_name_set.add(col_name)
+
+        self._col_name_to_idx: Dict[str, int] = {
+            name: i for i, name in enumerate(all_col_names)
+        }
+
+        if all_col_names:
+            col_embedder = GloveTextEmbedding(device="cpu")
+            with torch.no_grad():
+                col_embeddings = col_embedder(all_col_names)  # [N_unique, 300]
+            self.register_buffer("_col_glove_embeddings", col_embeddings)
+            self._glove_embedder = col_embedder  # kept for unseen columns
+        else:
+            self.register_buffer("_col_glove_embeddings", torch.zeros(0, 300))
+            self._glove_embedder = None
+
+        self.col_name_proj = nn.Linear(300, channels)
+
     def reset_parameters(self):
 
         nn.init.normal_(self.cls_embedding, std=0.01)
@@ -558,6 +585,9 @@ class NeighborTfsEncoder(nn.Module):
         for m in self.table_agnostic_encoder.modules():
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
+
+        if hasattr(self, "col_name_proj"):
+            self.col_name_proj.reset_parameters()
 
     def _normalize_numerical(self, big_tf, node_type: str):
         """Z-score normalize numerical columns using precomputed per-table stats.
@@ -576,6 +606,44 @@ class NeighborTfsEncoder(nn.Module):
         # NaN propagates naturally: (NaN - mean) / std = NaN
         # Clamp to ±10 std devs to control outliers (clamp preserves NaN)
         big_tf.feat_dict[torch_frame.numerical] = ((feat - mean) / (std + 1e-8)).clamp(-10, 10)
+
+    def _get_col_semantic_embeddings(self, big_tf, device):
+        """Build [num_cols, channels] semantic embedding for the columns in big_tf.
+
+        Columns are ordered to match TableAgnosticStypeEncoder's concatenation:
+        for each stype in feat_dict iteration order, extend with that stype's
+        column names from big_tf.col_names_dict.
+
+        For column names not seen at init, computes GloVe on-the-fly via the
+        stored embedder, or falls back to a zero vector.
+        """
+        ordered_col_names: List[str] = []
+        for stype in big_tf.feat_dict.keys():
+            stype_str = str(stype)
+            if stype_str not in self.table_agnostic_encoder.encoders:
+                continue
+            if hasattr(big_tf, 'col_names_dict') and stype in big_tf.col_names_dict:
+                ordered_col_names.extend(big_tf.col_names_dict[stype])
+
+        if not ordered_col_names:
+            return None
+
+        glove_vecs: List[Tensor] = []
+        for name in ordered_col_names:
+            if name in self._col_name_to_idx:
+                idx = self._col_name_to_idx[name]
+                glove_vecs.append(self._col_glove_embeddings[idx])
+            else:
+                # Unseen column: compute on-the-fly or fall back to zeros
+                if self._glove_embedder is not None:
+                    with torch.no_grad():
+                        vec = self._glove_embedder([name])[0].to(device)
+                else:
+                    vec = torch.zeros(300, device=device)
+                glove_vecs.append(vec)
+
+        glove_stack = torch.stack(glove_vecs, dim=0)  # [num_cols, 300]
+        return self.col_name_proj(glove_stack)  # [num_cols, channels]
 
     def forward(
         self,
@@ -628,6 +696,11 @@ class NeighborTfsEncoder(nn.Module):
             self._normalize_numerical(big_tf, node_type)
 
             x_cols = self.table_agnostic_encoder(big_tf)
+
+            # Add column-name semantic embeddings
+            col_sem = self._get_col_semantic_embeddings(big_tf, device)
+            if col_sem is not None and col_sem.shape[0] == x_cols.shape[1]:
+                x_cols = x_cols + col_sem.unsqueeze(0)  # broadcast over batch
 
             batch_size = x_cols.size(0)
 
