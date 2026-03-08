@@ -11,10 +11,9 @@ from codebook import VectorQuantizerEMA
 from einops import rearrange
 from local_module import LocalModule
 
-from torch_frame.data.stats import StatType
 from typing import Dict, Any, List
 
-from encoders import NeighborNodeTypeEncoder, NeighborHopEncoder, NeighborTimeEncoder, NeighborTfsEncoder, GNNPEEncoder
+from encoders import NeighborNodeTypeEncoder, NeighborHopEncoder, NeighborTimeEncoder, NeighborTabPFNEncoder, GNNPEEncoder
 
 class RelGTLayer(nn.Module):
     def __init__(
@@ -167,8 +166,7 @@ class RelGT(torch.nn.Module):
         num_nodes: int,
         max_neighbor_hop: int,
         node_type_map: Dict[str, int],
-        col_names_dict: Dict[str, Dict[str, List[str]]],
-        col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]],
+        tabpfn_emb_dim: int,
         local_num_layers: int,
         channels: int,
         out_channels: int,
@@ -193,7 +191,7 @@ class RelGT(torch.nn.Module):
         self.type_encoder = NeighborNodeTypeEncoder(embedding_dim=channels, node_type_map=self.node_type_map)
         self.hop_encoder = NeighborHopEncoder(embedding_dim=channels, max_neighbor_hop=self.max_neighbor_hop)
         self.time_encoder = NeighborTimeEncoder(embedding_dim=channels)
-        self.tfs_encoder = NeighborTfsEncoder(channels=channels, node_type_map=self.node_type_map, col_names_dict=col_names_dict, col_stats_dict=col_stats_dict)
+        self.tfs_encoder = NeighborTabPFNEncoder(tabpfn_emb_dim=tabpfn_emb_dim, channels=channels)
         self.pe_encoder = GNNPEEncoder(embedding_dim=channels, pe_dim = gnn_pe_dim)
 
         self.layer_norm_type = nn.LayerNorm(channels)
@@ -281,17 +279,17 @@ class RelGT(torch.nn.Module):
 
         self.head.reset_parameters()
 
-    def forward(self, 
+    def forward(self,
                 neighbor_types,
                 node_indices,
                 neighbor_hops,
                 neighbor_times,
-                grouped_tf_dict,
+                neighbor_embs,
                 edge_index=None,
                 batch=None,
                 ):
-        
-        neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
+
+        neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(neighbor_embs))
         neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
         neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
         neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))

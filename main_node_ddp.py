@@ -34,6 +34,7 @@ from relbench.tasks import get_task
 # within this project
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
+from tabpfn_embeddings import precompute_tabpfn_embeddings
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -130,7 +131,7 @@ except FileNotFoundError:
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
-data, col_stats_dict = make_pkey_fkey_graph(
+hetero_data, _ = make_pkey_fkey_graph(
     dataset.get_db(),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
@@ -139,13 +140,33 @@ data, col_stats_dict = make_pkey_fkey_graph(
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
 
+# Precompute TabPFN unsupervised-permute embeddings (once, cached to disk)
+# Only rank 0 computes; all ranks load from cache after barrier.
+tabpfn_cache_dir = f"{args.cache_dir}/{args.dataset}/tabpfn_embeddings"
+if local_rank == 0:
+    tabpfn_emb_dim = precompute_tabpfn_embeddings(
+        hetero_data,
+        cache_dir=tabpfn_cache_dir,
+        device="cpu",
+        seed=args.seed,
+    )
+    print(f"TabPFN embedding dim: {tabpfn_emb_dim}")
+dist.barrier()
+if local_rank != 0:
+    tabpfn_emb_dim = precompute_tabpfn_embeddings(
+        hetero_data,
+        cache_dir=tabpfn_cache_dir,
+        device="cpu",
+        seed=args.seed,
+    )  # loads from cache
+
 data = {
     split: RelGTTokens(
-        data=data, 
+        data=hetero_data,
         task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
+        K=args.num_neighbors,
+        split=split,
+        undirected=True,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
         num_workers=args.num_workers,
@@ -226,9 +247,7 @@ model = RelGT(
     num_nodes=data["train"].data.num_nodes,
     max_neighbor_hop=data["train"].max_neighbor_hop,
     node_type_map=data["train"].node_type_to_index,
-    col_names_dict={node_type: data["train"].data[node_type].tf.col_names_dict 
-                    for node_type in data["train"].data.node_types},
-    col_stats_dict=col_stats_dict,
+    tabpfn_emb_dim=tabpfn_emb_dim,
     local_num_layers=args.num_layers,
     channels=args.channels,
     out_channels=out_channels,
@@ -292,15 +311,10 @@ def train_supervised(epoch) -> float:
         node_indices = batch["node_indices"].to(device)
         neighbor_hops = batch["neighbor_hops"].to(device)
         neighbor_times = batch["neighbor_times"].to(device)
+        neighbor_embs = batch["neighbor_embs"].to(device)
         edge_index = batch["edge_index"].to(device)
         batch_vec = batch["batch"].to(device)
 
-        grouped_tf_dict = {
-            'grouped_tfs': batch['grouped_tfs'],
-            'grouped_indices': batch['grouped_indices'],
-            'flat_batch_idx': batch['flat_batch_idx'],
-            'flat_nbr_idx': batch['flat_nbr_idx']
-        }
         labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
@@ -309,7 +323,7 @@ def train_supervised(epoch) -> float:
             node_indices,
             neighbor_hops,
             neighbor_times,
-            grouped_tf_dict,
+            neighbor_embs,
             edge_index=edge_index,
             batch=batch_vec
         )
@@ -353,21 +367,16 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
         node_indices = batch["node_indices"].to(device)
         neighbor_hops = batch["neighbor_hops"].to(device)
         neighbor_times = batch["neighbor_times"].to(device)
+        neighbor_embs = batch["neighbor_embs"].to(device)
         edge_index = batch["edge_index"].to(device)
         batch_vec = batch["batch"].to(device)
-        
-        grouped_tf_dict = {
-            'grouped_tfs': batch['grouped_tfs'],
-            'grouped_indices': batch['grouped_indices'],
-            'flat_batch_idx': batch['flat_batch_idx'],
-            'flat_nbr_idx': batch['flat_nbr_idx']
-        }
+
         pred = eval_model(
             neighbor_types,
             node_indices,
             neighbor_hops,
             neighbor_times,
-            grouped_tf_dict,
+            neighbor_embs,
             edge_index=edge_index,
             batch=batch_vec
         )

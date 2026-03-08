@@ -507,10 +507,11 @@ class RelGTTokens(Dataset):
         sample["first_type"] = sample["types"][0].item()
         sample["first_index"] = sample["indices"][0].item()
 
-        sample["tfs"] = [
-            self.data[self.index_to_node_type[t.item()]].tf[i.item()]
+        # Look up precomputed TabPFN embeddings for each neighbor
+        sample["neighbor_embs"] = torch.stack([
+            self.data[self.index_to_node_type[t.item()]].tabpfn_emb[i.item()]
             for t, i in zip(sample["types"], sample["indices"])
-        ]
+        ])  # [K, tabpfn_emb_dim]
         
         # store the "global index" for ordering
         # 'idx' is the local index within this split, but effectively
@@ -549,40 +550,14 @@ class RelGTTokens(Dataset):
             dtype=torch.long
         )
 
-        B, K = neighbor_types.shape
-        grouped_tfs = {}
-        grouped_positions = {}
-        for t_id in range(len(self.node_types)):
-            # For each possible type, find which neighbors are that type
-            mask = (neighbor_types == t_id)
-            if not mask.any():
-                continue
-            
-            local_idxs = neighbor_indices[mask]  # 1D, length = #neighbors-of-this-type
-            type_str = self.index_to_node_type[t_id]
+        # Stack precomputed TabPFN embeddings → [B, K, tabpfn_emb_dim]
+        neighbor_embs = torch.stack([s["neighbor_embs"] for s in samples], dim=0)
 
-            # an offset for each [b, k]
-            # 'torch.nonzero(mask, as_tuple=False)' gives shape [N, 2] with (b, k)
-            offsets_list = []
-            positions_2d = torch.nonzero(mask, as_tuple=False)
-            for (b, k) in positions_2d.tolist():
-                offset = b * K + k   # Flatten (b, k) into one integer
-                offsets_list.append(offset)
-
-            grouped_tfs[t_id] = self.data[type_str].tf[local_idxs]
-            grouped_positions[t_id] = offsets_list
-
-        flat_batch_idx = torch.arange(B).unsqueeze(1).expand(B, K).reshape(-1).tolist()
-        flat_nbr_idx = torch.arange(K).repeat(B).tolist()
-        
         global_idxs = [s["global_idx"] for s in samples]
         global_idxs = torch.tensor(global_idxs, dtype=torch.long)
 
         out.update({
-            "grouped_tfs": grouped_tfs,
-            "grouped_indices": grouped_positions,
-            "flat_batch_idx": flat_batch_idx,
-            "flat_nbr_idx": flat_nbr_idx,
+            "neighbor_embs": neighbor_embs,
             "global_idx": global_idxs,
         })
         
