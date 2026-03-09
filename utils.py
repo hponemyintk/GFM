@@ -639,8 +639,10 @@ class RelGTTokens(Dataset):
         total = len(self.node_idxs)
         chunk_size = 10000
         data_cpu = self.data.to("cpu")
+        t_total_start = time.time()
 
         # Build CSR adjacency + time arrays ONCE
+        t_csr_start = time.time()
         csr_adj = build_adjacency_csr(data_cpu, undirected=self.undirected)
         time_arrays = {}
         for nt in data_cpu.node_types:
@@ -652,9 +654,14 @@ class RelGTTokens(Dataset):
             for i in range(data_cpu[nt].num_nodes):
                 all_nodes.append((nt, i))
 
+        print(f"[{self.split}] CSR adjacency built in {time.time() - t_csr_start:.1f}s")
+
         num_workers = self.num_workers
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, total))
+
+        print(f"[{self.split}] Starting sampling: {total} seeds, K={self.K}, {num_workers} workers")
+        t_sample_start = time.time()
 
         with h5py.File(self.precomputed_path, 'w') as hf:
             datasets = self._create_datasets(hf, total)
@@ -733,6 +740,12 @@ class RelGTTokens(Dataset):
                     edges_dset[:, start:end_] = e_arr
 
             hf.create_dataset("edges_offsets", data=offsets)
+
+        elapsed = time.time() - t_total_start
+        mins, secs = divmod(elapsed, 60)
+        hrs, mins = divmod(mins, 60)
+        print(f"[{self.split}] Sampling complete: {total} seeds in {int(hrs)}h {int(mins)}m {secs:.1f}s "
+              f"(sampling: {time.time() - t_sample_start:.1f}s)")
 
     def __getitem__(self, idx: int):
         """
