@@ -1,7 +1,7 @@
 import random
 import os
 import time
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, get_context
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Dict
 
@@ -495,7 +495,8 @@ def local_nodes_hetero(
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
 
-        with Pool(
+        ctx = get_context("spawn")
+        with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
             initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, node_types, GLOBAL_TIME_ARRAYS)
@@ -561,11 +562,20 @@ class RelGTTokens(Dataset):
         self.train_stage = train_stage
 
         if self.precompute:
+            # DDP safety: only rank 0 precomputes, others wait
+            rank = int(os.environ.get("RANK", 0))
             if os.path.exists(self.precomputed_path):
                 print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
-            else:
+            elif rank == 0:
                 print(f"[{self.split}] Precomputing neighbor sampling (K={self.K})...")
                 self._precompute_sampling()
+            # Barrier: non-rank-0 processes wait for rank 0 to finish writing
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+                if rank != 0 and not os.path.exists(self.precomputed_path):
+                    raise RuntimeError(
+                        f"Rank {rank}: HDF5 file not found after barrier: {self.precomputed_path}"
+                    )
 
     def _create_global_mappings(self):
         """
@@ -674,10 +684,11 @@ class RelGTTokens(Dataset):
 
             adjacency_all = [None] * total
 
-            # Single Pool for ALL chunks — only lightweight data pickled
+            # Use spawn context — safe after CUDA init (DDP sets up CUDA before this)
             t_pool_start = time.time()
             node_types = list(data_cpu.node_types)
-            with Pool(
+            ctx = get_context("spawn")
+            with ctx.Pool(
                 processes=num_workers,
                 initializer=init_worker_globals,
                 initargs=(csr_adj, all_nodes, node_types, time_arrays)
