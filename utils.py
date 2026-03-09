@@ -24,8 +24,10 @@ from collections import defaultdict
 
 GLOBAL_ADJ = None
 GLOBAL_ALL_NODES = None
-GLOBAL_DATA = None
 GLOBAL_TIME_ARRAYS = None
+GLOBAL_NODE_TYPES = None    # list of str, e.g. ["user", "product", ...]
+GLOBAL_TYPE_TO_IDX = None   # {"user": 0, "product": 1, ...}
+GLOBAL_IDX_TO_TYPE = None   # {0: "user", 1: "product", ...}
 
 class GloveTextEmbedding:
         def __init__(self, device: torch.device):
@@ -113,12 +115,15 @@ def build_adjacency_csr(hetero_data, undirected: bool = True):
     return csr
 
 
-def init_worker_globals(adj, all_nodes, data=None, time_arrays=None):
-    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_DATA, GLOBAL_TIME_ARRAYS
+def init_worker_globals(adj, all_nodes, node_types=None, time_arrays=None):
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
+    global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
     GLOBAL_ADJ = adj
     GLOBAL_ALL_NODES = all_nodes
-    if data is not None:
-        GLOBAL_DATA = data
+    if node_types is not None:
+        GLOBAL_NODE_TYPES = list(node_types)
+        GLOBAL_TYPE_TO_IDX = {nt: i for i, nt in enumerate(GLOBAL_NODE_TYPES)}
+        GLOBAL_IDX_TO_TYPE = {i: nt for i, nt in enumerate(GLOBAL_NODE_TYPES)}
     if time_arrays is not None:
         GLOBAL_TIME_ARRAYS = time_arrays
 
@@ -329,28 +334,28 @@ def _process_one_seed(args):
     perform local nodes expansions up to K, apply fallback if necessary,
     then return a final list of neighbor tokens.
 
-    Uses GLOBAL_ADJ (CSR), GLOBAL_DATA, GLOBAL_TIME_ARRAYS, GLOBAL_ALL_NODES
+    Uses GLOBAL_ADJ (CSR), GLOBAL_NODE_TYPES, GLOBAL_TIME_ARRAYS, GLOBAL_ALL_NODES
     set via init_worker_globals — no pickling of heavy objects per task.
     """
-    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_DATA, GLOBAL_TIME_ARRAYS
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
+    global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
 
     (K, seed_node_type, seed_node_idx, seed_time, seed_val) = args
-    data = GLOBAL_DATA
     random.seed(seed_val)
 
     # 1. gather 1-hop and 2-hop — use vectorized path if CSR available
     if GLOBAL_TIME_ARRAYS is not None and isinstance(GLOBAL_ADJ, dict) and \
        len(GLOBAL_ADJ) > 0 and "offsets" in next(iter(GLOBAL_ADJ.values())):
-        # CSR path
-        type_to_idx = {nt: i for i, nt in enumerate(data.node_types)}
+        # CSR path — uses lightweight globals, no HeteroData needed
         T_hat = gather_1_and_2_hop_vectorized(
-            GLOBAL_ADJ, GLOBAL_TIME_ARRAYS, type_to_idx, data.node_types,
+            GLOBAL_ADJ, GLOBAL_TIME_ARRAYS, GLOBAL_TYPE_TO_IDX, GLOBAL_NODE_TYPES,
             seed_node_type, seed_node_idx, seed_time
         )
     else:
-        # Legacy path (old dict-of-sets adjacency)
-        T_hat = gather_1_and_2_hop_with_seed_time(
-            GLOBAL_ADJ, data, seed_node_type, seed_node_idx, seed_time
+        # Legacy path (old dict-of-sets adjacency) — requires GLOBAL_NODE_TYPES
+        raise RuntimeError(
+            "Legacy dict-of-sets adjacency path is no longer supported in workers. "
+            "Use build_adjacency_csr() to create CSR adjacency before spawning workers."
         )
 
     T_hat_list = list(T_hat)
@@ -380,9 +385,6 @@ def _process_one_seed(args):
             if ft in time_arrays:
                 ft_time = float(time_arrays[ft][fi])
                 rel_time = (seed_time - ft_time) / (60 * 60 * 24)
-            elif hasattr(data[ft], "time"):
-                ft_time = data[ft].time[fi].item()
-                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
             else:
                 rel_time = 0
             chosen_neighbors.append((ft, fi, 3, rel_time, None))
@@ -409,7 +411,7 @@ def _process_one_seed(args):
     adj = GLOBAL_ADJ
     is_csr = isinstance(adj, dict) and len(adj) > 0 and "offsets" in next(iter(adj.values()))
     if is_csr:
-        idx_to_type = {ii: nt for ii, nt in enumerate(data.node_types)}
+        idx_to_type = GLOBAL_IDX_TO_TYPE
 
     for j_src, (t_str, i, hop, t_val, c1hops) in enumerate(final_tokens):
         if is_csr:
@@ -466,7 +468,8 @@ def local_nodes_hetero(
         results = pool.map(_process_one_seed, tasks)
     else:
         # Legacy: create a pool on the fly (for backward compat)
-        global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_DATA, GLOBAL_TIME_ARRAYS
+        global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
+        global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
 
         if GLOBAL_ADJ is None:
             GLOBAL_ADJ = build_adjacency_csr(data, undirected=undirected)
@@ -484,7 +487,10 @@ def local_nodes_hetero(
                 if hasattr(data[nt], "time"):
                     GLOBAL_TIME_ARRAYS[nt] = data[nt].time.numpy()
 
-        GLOBAL_DATA = data
+        node_types = list(data.node_types)
+        GLOBAL_NODE_TYPES = node_types
+        GLOBAL_TYPE_TO_IDX = {nt: i for i, nt in enumerate(node_types)}
+        GLOBAL_IDX_TO_TYPE = {i: nt for i, nt in enumerate(node_types)}
 
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
@@ -492,7 +498,7 @@ def local_nodes_hetero(
         with Pool(
             processes=num_workers,
             initializer=init_worker_globals,
-            initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, data, GLOBAL_TIME_ARRAYS)
+            initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, node_types, GLOBAL_TIME_ARRAYS)
         ) as p:
             results = p.map(_process_one_seed, tasks)
 
@@ -668,12 +674,15 @@ class RelGTTokens(Dataset):
 
             adjacency_all = [None] * total
 
-            # Single Pool for ALL chunks — adjacency/data pickled only once
+            # Single Pool for ALL chunks — only lightweight data pickled
+            t_pool_start = time.time()
+            node_types = list(data_cpu.node_types)
             with Pool(
                 processes=num_workers,
                 initializer=init_worker_globals,
-                initargs=(csr_adj, all_nodes, data_cpu, time_arrays)
+                initargs=(csr_adj, all_nodes, node_types, time_arrays)
             ) as pool:
+                print(f"[{self.split}] Pool created in {time.time() - t_pool_start:.1f}s")
 
                 with tqdm(total=total, desc=f"Precomputing '{self.split}'") as pbar:
                     for start_idx in range(0, total, chunk_size):

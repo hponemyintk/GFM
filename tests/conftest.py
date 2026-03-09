@@ -219,20 +219,26 @@ def isolated_hetero():
 # ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def worker_globals_small(small_hetero, small_adj):
-    """Initialize all worker globals for small_hetero (old dict-of-sets adj)."""
+def worker_globals_small(small_hetero):
+    """Initialize worker globals with CSR adjacency + time arrays for small_hetero."""
     import utils
+    csr_adj = build_adjacency_csr(small_hetero, undirected=True)
     all_nodes = []
     for nt in small_hetero.node_types:
         for i in range(small_hetero[nt].num_nodes):
             all_nodes.append((nt, i))
-    init_worker_globals(small_adj, all_nodes, data=small_hetero)
-    # GLOBAL_TIME_ARRAYS not set → _process_one_seed uses legacy path
-    utils.GLOBAL_TIME_ARRAYS = None
+    time_arrays = {}
+    for nt in small_hetero.node_types:
+        if hasattr(small_hetero[nt], "time"):
+            time_arrays[nt] = small_hetero[nt].time.numpy()
+    node_types = list(small_hetero.node_types)
+    init_worker_globals(csr_adj, all_nodes, node_types=node_types, time_arrays=time_arrays)
     yield
     init_worker_globals(None, None)
-    utils.GLOBAL_DATA = None
     utils.GLOBAL_TIME_ARRAYS = None
+    utils.GLOBAL_NODE_TYPES = None
+    utils.GLOBAL_TYPE_TO_IDX = None
+    utils.GLOBAL_IDX_TO_TYPE = None
 
 
 @pytest.fixture
@@ -248,8 +254,11 @@ def worker_globals_csr(small_hetero):
     for nt in small_hetero.node_types:
         if hasattr(small_hetero[nt], "time"):
             time_arrays[nt] = small_hetero[nt].time.numpy()
-    init_worker_globals(csr_adj, all_nodes, data=small_hetero, time_arrays=time_arrays)
+    node_types = list(small_hetero.node_types)
+    init_worker_globals(csr_adj, all_nodes, node_types=node_types, time_arrays=time_arrays)
     yield
     init_worker_globals(None, None)
-    utils.GLOBAL_DATA = None
     utils.GLOBAL_TIME_ARRAYS = None
+    utils.GLOBAL_NODE_TYPES = None
+    utils.GLOBAL_TYPE_TO_IDX = None
+    utils.GLOBAL_IDX_TO_TYPE = None
