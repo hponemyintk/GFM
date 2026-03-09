@@ -66,6 +66,8 @@ parser.add_argument("--max_degree", type=int, default=10000)
 parser.add_argument("--pos_enc_dim", type=int, default=128)
 parser.add_argument("--max_steps_per_epoch", type=int, default=3000)
 parser.add_argument("--num_workers", type=int, default=2)
+parser.add_argument("--sampling_workers", type=int, default=None,
+                    help="Workers for precompute sampling (default: min(32, cpu_count()-1))")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--out_dir", type=str, default="results/debug")
 parser.add_argument("--run_name", type=str, default="debug")
@@ -78,6 +80,8 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 
 args = parser.parse_args()
+if args.sampling_workers is None:
+    args.sampling_workers = max(1, min(32, os.cpu_count() - 1))
 
 ############################
 # 2. Initialize DDP and set device
@@ -141,14 +145,14 @@ data, col_stats_dict = make_pkey_fkey_graph(
 
 data = {
     split: RelGTTokens(
-        data=data, 
+        data=data,
         task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
+        K=args.num_neighbors,
+        split=split,
+        undirected=True,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
-        num_workers=args.num_workers,
+        num_workers=args.sampling_workers,
         train_stage=args.train_stage)
         for split in ["train", "val", "test"]
     }
