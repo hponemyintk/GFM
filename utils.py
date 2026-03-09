@@ -495,7 +495,7 @@ def local_nodes_hetero(
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
 
-        ctx = get_context("forkserver")
+        ctx = get_context("fork")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
@@ -687,7 +687,7 @@ class RelGTTokens(Dataset):
             # Use spawn context — safe after CUDA init (DDP sets up CUDA before this)
             t_pool_start = time.time()
             node_types = list(data_cpu.node_types)
-            ctx = get_context("forkserver")
+            ctx = get_context("fork")
             with ctx.Pool(
                 processes=num_workers,
                 initializer=init_worker_globals,
