@@ -320,13 +320,17 @@ class TestProcessOneSeed:
         iso_data["X", "rel", "Y"].edge_index = torch.tensor(
             [[0, 1], [0, 1]], dtype=torch.long
         )
-        adj = build_adjacency_hetero(iso_data, undirected=True)
+        csr_adj = build_adjacency_csr(iso_data, undirected=True)
         all_nodes = []
         for nt in iso_data.node_types:
             for i in range(iso_data[nt].num_nodes):
                 all_nodes.append((nt, i))
-        init_worker_globals(adj, all_nodes, data=iso_data)
-        utils.GLOBAL_TIME_ARRAYS = None  # use legacy path
+        time_arrays = {}
+        for nt in iso_data.node_types:
+            if hasattr(iso_data[nt], "time"):
+                time_arrays[nt] = iso_data[nt].time.numpy()
+        node_types = list(iso_data.node_types)
+        init_worker_globals(csr_adj, all_nodes, node_types=node_types, time_arrays=time_arrays)
 
         K = 4
         _, _, tokens, _ = _process_one_seed(
