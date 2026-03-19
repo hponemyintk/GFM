@@ -226,12 +226,16 @@ def local_nodes_hetero(
     """
     global GLOBAL_ADJ, GLOBAL_ALL_NODES
 
+    t_total_start = time.time()
+
     # 1) Build adjacency once
+    t_adj_start = time.time()
     if GLOBAL_ADJ is None:
         adjacency = build_adjacency_hetero(data, undirected=undirected)
         GLOBAL_ADJ = adjacency
     else:
         adjacency = GLOBAL_ADJ
+    t_adj = time.time() - t_adj_start
 
     # 2) Build fallback list of all nodes ONCE
     if GLOBAL_ALL_NODES is None:
@@ -256,20 +260,28 @@ def local_nodes_hetero(
 
     if num_workers is None:
         from multiprocessing import cpu_count
-        num_workers = min(cpu_count()-20, len(tasks))
+        num_workers = min(max(cpu_count() - 2, 1), len(tasks))
 
     # 4) Run neighbor sampling for each node in parallel
+    t_sample_start = time.time()
     with Pool(
         processes=num_workers,
         initializer=init_worker_globals,
         initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
     ) as pool:
         results = pool.map(_process_one_seed, tasks)
+    t_sample = time.time() - t_sample_start
 
     # 5) Build the final dictionary S
     S = {seed_node_type: {}}
     for (nt, idx, final_list, edge_index) in results:
         S[nt][idx] = (final_list, edge_index)
+
+    t_total = time.time() - t_total_start
+    num_seeds = len(seed_node_idxs)
+    print(f"  [Sampling] {num_seeds} seeds | adj: {t_adj:.2f}s | "
+          f"parallel sampling: {t_sample:.2f}s | total: {t_total:.2f}s | "
+          f"{num_seeds/t_total:.0f} seeds/s")
 
     return S
 
@@ -403,6 +415,7 @@ class RelGTTokens(Dataset):
         """
         total = len(self.node_idxs)
         chunk_size = 10000
+        precompute_start = time.time()
 
         with h5py.File(self.precomputed_path, 'w') as hf:
             datasets = self._create_datasets(hf, total)
@@ -477,6 +490,10 @@ class RelGTTokens(Dataset):
                     edges_dset[:, start:end_] = e_arr
                     
             hf.create_dataset("edges_offsets", data=offsets)
+
+        precompute_elapsed = time.time() - precompute_start
+        print(f"[{self.split}] Precompute complete: {total} samples in {precompute_elapsed:.2f}s "
+              f"({total/precompute_elapsed:.0f} samples/s)")
 
     def __getitem__(self, idx: int):
         """
