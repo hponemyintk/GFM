@@ -6,7 +6,10 @@ import math
 import os
 from pathlib import Path
 from typing import Dict
-import wandb
+if os.environ.get('WANDB_API_KEY'):
+    from c1_aiml_aem import wandb
+else:
+    import wandb
 
 import numpy as np
 import torch
@@ -206,24 +209,25 @@ data = {
 ############################
 train_sampler = DistributedSampler(data["train"], shuffle=True, seed=args.seed)
 loader_train = DataLoader(
-    data["train"], 
-    batch_size=args.batch_size, 
+    data["train"],
+    batch_size=args.batch_size,
     sampler=train_sampler,
     collate_fn=data["train"].collate,
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
-    pin_memory=True)
+    pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None)
 
 val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
 loader_val = DataLoader(
     data["val"],
     batch_size=args.batch_size,
     sampler=val_sampler,
-    # shuffle=False,
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None
 )
 
 test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
@@ -231,11 +235,11 @@ loader_test = DataLoader(
     data["test"],
     batch_size=args.batch_size,
     sampler=test_sampler,
-    # shuffle=False,
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None
 )
 
 
