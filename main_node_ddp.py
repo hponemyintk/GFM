@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict
 if os.environ.get('WANDB_API_KEY'):
@@ -108,7 +109,7 @@ torch.autograd.set_detect_anomaly(args.debug)
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl")
+dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
 # local_rank = args.local_rank
 local_rank = int(os.environ["LOCAL_RANK"])
 device = torch.device("cuda", local_rank)
