@@ -15,7 +15,7 @@ TASK="${2:-driver-top3}"
 # TASK="${2:-user-churn}"
 BATCH_SIZE="${3:-32}"
 EPOCHS="${4:-10}"
-NUM_GPUS="${5:-8}"
+NUM_GPUS="${5:-1}"
 
 LOG_DIR="logs"
 mkdir -p "${LOG_DIR}"
