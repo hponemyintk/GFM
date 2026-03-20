@@ -44,7 +44,7 @@ torchrun \
     --channels 512 \
     --num_centroids 4096 \
     --max_steps_per_epoch 3000 \
-    --num_workers 0 \
+    --num_workers 2 \
     --epochs "${EPOCHS}" \
     --amp --amp_dtype bfloat16 \
     --lr 0.0001 \
