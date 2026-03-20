@@ -380,11 +380,11 @@ def gather_1_and_2_hop_vectorized(
         cat_conn_k = cat_conn_k[tmask]
 
         # Vectorized seed/1-hop exclusion using composite keys
-        candidate_keys = cat_n2_t.astype(np.int64) * np.int64(2**31) + cat_n2_i.astype(np.int64)
-        seed_ck = np.int64(seed_key[0]) * np.int64(2**31) + np.int64(seed_key[1])
+        candidate_keys = (cat_n2_t.astype(np.int64) << np.int64(32)) | cat_n2_i.astype(np.int64)
+        seed_ck = (np.int64(seed_key[0]) << np.int64(32)) | np.int64(seed_key[1])
 
         # Build 1-hop composite key array for exclusion
-        n1_ck = n1_types.astype(np.int64) * np.int64(2**31) + n1_indices.astype(np.int64)
+        n1_ck = (n1_types.astype(np.int64) << np.int64(32)) | n1_indices.astype(np.int64)
         n1_ck_set = set(n1_ck.tolist())
         n1_ck_set.add(int(seed_ck))
 
@@ -445,6 +445,7 @@ def _process_one_seed(args):
         (K, seed_node_type, seed_node_idx, seed_time, seed_val) = args
         row_idx = None
     random.seed(seed_val)
+    np.random.seed(seed_val % (2**32))
 
     # 1. gather 1-hop and 2-hop — use vectorized path if CSR available
     if GLOBAL_TIME_ARRAYS is not None and isinstance(GLOBAL_ADJ, dict) and \
@@ -594,7 +595,7 @@ def local_nodes_hetero(
             GLOBAL_TIME_ARRAYS = {}
             for nt in data.node_types:
                 if hasattr(data[nt], "time"):
-                    GLOBAL_TIME_ARRAYS[nt] = data[nt].time.numpy()
+                    GLOBAL_TIME_ARRAYS[nt] = data[nt].time.numpy().copy()
 
         node_types = list(data.node_types)
         GLOBAL_NODE_TYPES = node_types
@@ -604,7 +605,7 @@ def local_nodes_hetero(
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
 
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         chunksize = max(1, len(tasks) // (num_workers * 4))
         with ctx.Pool(
             processes=num_workers,
@@ -779,7 +780,7 @@ class RelGTTokens(Dataset):
         time_arrays = {}
         for nt in data_cpu.node_types:
             if hasattr(data_cpu[nt], "time"):
-                time_arrays[nt] = data_cpu[nt].time.numpy()
+                time_arrays[nt] = data_cpu[nt].time.numpy().copy()
 
         all_nodes_compact = _build_all_nodes_compact(data_cpu)
 
@@ -811,7 +812,7 @@ class RelGTTokens(Dataset):
 
         t_pool_start = time.time()
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
@@ -893,7 +894,7 @@ class RelGTTokens(Dataset):
         time_arrays = {}
         for nt in data_cpu.node_types:
             if hasattr(data_cpu[nt], "time"):
-                time_arrays[nt] = data_cpu[nt].time.numpy()
+                time_arrays[nt] = data_cpu[nt].time.numpy().copy()
         all_nodes_compact = _build_all_nodes_compact(data_cpu)
         print(f"[{self.split}] Rank {rank}: CSR built in {time.time() - t_csr_start:.1f}s")
 
@@ -927,7 +928,7 @@ class RelGTTokens(Dataset):
         shard_adjacency = [None] * shard_size
 
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,

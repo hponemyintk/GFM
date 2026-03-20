@@ -91,7 +91,7 @@ class LocalModule(nn.Module):
         neighbor_tensor = neighbor_tensor * layer_atten
         neighbor_tensor = torch.sum(neighbor_tensor, dim=1, keepdim=True)
 
-        output = (node_tensor + neighbor_tensor).squeeze()
+        output = (node_tensor + neighbor_tensor).squeeze(1)
 
         return output
 

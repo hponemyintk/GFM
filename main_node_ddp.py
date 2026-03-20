@@ -113,9 +113,10 @@ local_rank = int(os.environ["LOCAL_RANK"])
 device = torch.device("cuda", local_rank)
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", timeout=timedelta(hours=24), device_id=device)
+global_rank = dist.get_rank()
 
 # Only the main process (rank 0) initializes wandb and prints logs.
-if local_rank == 0:
+if global_rank == 0:
     args.run_name = f"{args.dataset}-{args.task}-{args.run_name}"
 
 def init_gpu_utilization(device_index):
@@ -141,7 +142,7 @@ gpu_handle = init_gpu_utilization(local_rank)
 # 3. Load dataset, task, and prepare data
 ############################
 # Only rank 0 downloads/caches to avoid race conditions that cause segfaults.
-if local_rank == 0:
+if global_rank == 0:
     dataset: Dataset = get_dataset(args.dataset, download=True)
     task: EntityTask = get_task(args.dataset, args.task, download=True)
 
@@ -170,7 +171,7 @@ if local_rank == 0:
 dist.barrier()
 
 # Non-rank-0 processes load from cache after rank 0 has finished downloading.
-if local_rank != 0:
+if global_rank != 0:
     dataset: Dataset = get_dataset(args.dataset, download=True)
     task: EntityTask = get_task(args.dataset, args.task, download=True)
 
@@ -216,6 +217,7 @@ loader_train = DataLoader(
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
     pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
 )
 
 val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
@@ -226,7 +228,8 @@ loader_val = DataLoader(
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
 )
 
 test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
@@ -237,7 +240,8 @@ loader_test = DataLoader(
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True
+    pin_memory=True,
+    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
 )
 
 
@@ -298,7 +302,7 @@ model = RelGT(
 if args.gradient_checkpointing:
     for conv in model.convs:
         conv.local_module.gradient_checkpointing = True
-    if local_rank == 0:
+    if global_rank == 0:
         print("Gradient checkpointing enabled")
 
 # Before DDP initialization, cast problematic tensors
@@ -311,7 +315,7 @@ for name, buf in model.named_buffers():
         buf.data = buf.data.to(torch.int64)
 
 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+model = DDP(model, device_ids=[local_rank], find_unused_parameters=True, broadcast_buffers=False)
 
 # Set up AMP
 amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
@@ -319,17 +323,17 @@ use_amp = args.amp
 # GradScaler only needed for float16 (bfloat16 has same exponent range as fp32)
 use_grad_scaler = use_amp and args.amp_dtype == "float16"
 grad_scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
-if local_rank == 0 and use_amp:
+if global_rank == 0 and use_amp:
     print(f"AMP enabled with dtype={args.amp_dtype}, GradScaler={'on' if use_grad_scaler else 'off'}")
 
-if local_rank == 0:
+if global_rank == 0:
     print(model)
 total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-if local_rank == 0:
+if global_rank == 0:
     print(f"Total model parameters: {total_params}")
 args.model_parameters = total_params
 
-if local_rank == 0:
+if global_rank == 0:
     wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
 
 output_path = os.path.join(args.out_dir, args.dataset, args.task)
@@ -338,7 +342,7 @@ os.makedirs(output_path, exist_ok=True)
 world_size = dist.get_world_size()
 # Scale max_steps_per_epoch by world_size so total data seen per epoch is constant
 args.max_steps_per_epoch = max(1, args.max_steps_per_epoch // world_size)
-if local_rank == 0 and world_size > 1:
+if global_rank == 0 and world_size > 1:
     print(f"Scaled max_steps_per_epoch to {args.max_steps_per_epoch} ({world_size} GPUs)")
 base_lr = args.lr * world_size
 optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
@@ -358,8 +362,8 @@ def train_supervised(epoch) -> float:
 
     train_sampler.set_epoch(epoch)
 
-    # Enable VQ accumulation mode if gradient accumulation is active and model has global layers
-    use_vq_accum = accum_steps > 1 and args.gt_conv_type != "local"
+    # Enable VQ accumulation mode for gradient accumulation OR multi-GPU (to sync codebook)
+    use_vq_accum = (accum_steps > 1 or world_size > 1) and args.gt_conv_type != "local"
     if use_vq_accum:
         model.module.set_vq_accumulate(True)
         model.module.start_vq_accumulation()
@@ -429,7 +433,7 @@ def train_supervised(epoch) -> float:
         loss_value = loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
         gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
         # Only rank 0 logs training metrics.
-        if local_rank == 0:
+        if global_rank == 0:
             wandb.log({"train_loss": loss_value,
                        "global_step": global_step,
                        "lr": optimizer.param_groups[0]["lr"],
@@ -459,7 +463,7 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     pred_list = []
     idx_list = []
     
-    for batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
+    for batch in tqdm(loader, desc=desc, disable=(global_rank != 0)):
         neighbor_types = batch["neighbor_types"].to(device)
         node_indices = batch["node_indices"].to(device)
         neighbor_hops = batch["neighbor_hops"].to(device)
@@ -496,10 +500,10 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     local_idxs  = np.concatenate(idx_list,  axis=0) if idx_list  else np.array([])
 
     # Gather on rank 0
-    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    gathered = [None for _ in range(world_size)] if global_rank == 0 else None
     dist.gather_object((local_idxs, local_preds), object_gather_list=gathered, dst=0)
 
-    if local_rank == 0:
+    if global_rank == 0:
         all_preds = np.full((len(loader.dataset),), -100.0)
         for i in range(world_size):
             g_idx, g_pred = gathered[i]
@@ -524,7 +528,7 @@ if args.train_stage == "finetune":
         
         # Run evaluation on the validation set.
         val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
-        if local_rank == 0:
+        if global_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
             wandb.log({
@@ -541,7 +545,7 @@ if args.train_stage == "finetune":
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
         dist.barrier()
 
-    if local_rank == 0 and state_dict is not None:
+    if global_rank == 0 and state_dict is not None:
         model.module.load_state_dict(state_dict)
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
@@ -553,7 +557,7 @@ if args.train_stage == "finetune":
     final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
     final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
 
-    if local_rank == 0:
+    if global_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
         print(f"Best Val metrics: {val_metrics}")
 
@@ -568,7 +572,7 @@ if args.train_stage == "finetune":
         with open(file_path, "w") as f:
             json.dump(best_metrics_dict, f, indent=4)
     
-    if local_rank == 0:
+    if global_rank == 0:
         print(f"[{args.train_stage.capitalize()} Stage] Training complete. No supervised evaluation performed.")
 
 
