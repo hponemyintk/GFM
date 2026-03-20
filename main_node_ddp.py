@@ -109,11 +109,10 @@ torch.autograd.set_detect_anomaly(args.debug)
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
-# local_rank = args.local_rank
 local_rank = int(os.environ["LOCAL_RANK"])
 device = torch.device("cuda", local_rank)
 torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", timeout=timedelta(hours=24), device_id=device)
 
 # Only the main process (rank 0) initializes wandb and prints logs.
 if local_rank == 0:
@@ -217,7 +216,7 @@ loader_train = DataLoader(
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
     pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None)
+)
 
 val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
 loader_val = DataLoader(
@@ -227,8 +226,7 @@ loader_val = DataLoader(
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None
+    pin_memory=True
 )
 
 test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
@@ -239,8 +237,7 @@ loader_test = DataLoader(
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
-    pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None
+    pin_memory=True
 )
 
 
