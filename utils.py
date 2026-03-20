@@ -7,7 +7,6 @@ from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import h5py
-import gc
 
 import torch
 import torch.nn as nn
@@ -23,7 +22,7 @@ from relbench.modeling.graph import get_node_train_table_input
 from collections import defaultdict
 
 GLOBAL_ADJ = None
-GLOBAL_ALL_NODES = None
+GLOBAL_ALL_NODES = None       # (node_type_counts, total_nodes) for compact fallback
 GLOBAL_TIME_ARRAYS = None
 GLOBAL_NODE_TYPES = None    # list of str, e.g. ["user", "product", ...]
 GLOBAL_TYPE_TO_IDX = None   # {"user": 0, "product": 1, ...}
@@ -34,6 +33,7 @@ class GloveTextEmbedding:
             self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
         
         def __call__(self, sentences: List[str]) -> Tensor:
+            sentences = [str(s) if not isinstance(s, str) else s for s in sentences]
             return torch.from_numpy(self.model.encode(sentences))
 
 def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
@@ -57,62 +57,120 @@ def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
 def build_adjacency_csr(hetero_data, undirected: bool = True):
     """
     Build adjacency in CSR (Compressed Sparse Row) format using numpy arrays.
+    Fully vectorized — no per-element Python loops.
 
     Returns:
         {node_type: {"nbr_types": np.int8, "nbr_indices": np.int32, "offsets": np.int64}}
     """
     type_to_idx = {nt: i for i, nt in enumerate(hetero_data.node_types)}
 
-    # Pass 1: collect edges into per-node lists (temporary)
-    temp = {
-        nt: [[] for _ in range(hetero_data[nt].num_nodes)]
-        for nt in hetero_data.node_types
-    }
+    # Collect all edges per source node type as numpy arrays
+    # Each entry: (source_node_id, nbr_type_id, nbr_node_id)
+    edge_arrays = {nt: [] for nt in hetero_data.node_types}
 
     for edge_type in hetero_data.edge_types:
         src_type, _, dst_type = edge_type
         if 'edge_index' not in hetero_data[edge_type]:
             continue
         ei = hetero_data[edge_type].edge_index
-        src_arr = ei[0].numpy()
-        dst_arr = ei[1].numpy()
+        src_arr = ei[0].numpy().astype(np.int32)
+        dst_arr = ei[1].numpy().astype(np.int32)
+        n_edges = len(src_arr)
         dst_type_id = type_to_idx[dst_type]
         src_type_id = type_to_idx[src_type]
 
-        for s, d in zip(src_arr, dst_arr):
-            temp[src_type][int(s)].append((dst_type_id, int(d)))
-            if undirected:
-                temp[dst_type][int(d)].append((src_type_id, int(s)))
+        # Forward edges: src_type[s] -> (dst_type_id, d)
+        fwd = np.empty((n_edges, 3), dtype=np.int64)
+        fwd[:, 0] = src_arr
+        fwd[:, 1] = dst_type_id
+        fwd[:, 2] = dst_arr
+        edge_arrays[src_type].append(fwd)
 
-    # Pass 2: deduplicate and pack into contiguous numpy arrays
+        if undirected:
+            rev = np.empty((n_edges, 3), dtype=np.int64)
+            rev[:, 0] = dst_arr
+            rev[:, 1] = src_type_id
+            rev[:, 2] = src_arr
+            edge_arrays[dst_type].append(rev)
+
+    # Build CSR per node type using vectorized numpy ops
     csr = {}
     for nt in hetero_data.node_types:
         num_nodes = hetero_data[nt].num_nodes
-        node_lists = temp[nt]
 
+        if not edge_arrays[nt]:
+            # No edges for this type
+            csr[nt] = {
+                "nbr_types": np.empty(0, dtype=np.int8),
+                "nbr_indices": np.empty(0, dtype=np.int32),
+                "offsets": np.zeros(num_nodes + 1, dtype=np.int64),
+            }
+            continue
+
+        all_edges = np.concatenate(edge_arrays[nt])  # (E, 3): [node_id, nbr_type, nbr_idx]
+
+        # Deduplicate using composite keys
+        # key = node_id * stride1 + nbr_type * stride2 + nbr_idx
+        max_nbr_idx = int(all_edges[:, 2].max()) + 1 if len(all_edges) > 0 else 1
+        max_nbr_type = int(all_edges[:, 1].max()) + 1 if len(all_edges) > 0 else 1
+        stride2 = np.int64(max_nbr_idx)
+        stride1 = np.int64(max_nbr_type) * stride2
+
+        keys = all_edges[:, 0] * stride1 + all_edges[:, 1] * stride2 + all_edges[:, 2]
+        _, unique_idx = np.unique(keys, return_index=True)
+        all_edges = all_edges[unique_idx]
+
+        # Sort by node_id for CSR grouping
+        sort_idx = np.argsort(all_edges[:, 0], kind='stable')
+        all_edges = all_edges[sort_idx]
+
+        # Build offsets
+        node_ids = all_edges[:, 0].astype(np.int64)
         offsets = np.zeros(num_nodes + 1, dtype=np.int64)
-        # Deduplicate per node
-        deduped = [list(set(node_lists[i])) for i in range(num_nodes)]
-        for i in range(num_nodes):
-            offsets[i + 1] = offsets[i] + len(deduped[i])
-
-        total = int(offsets[-1])
-        nbr_types = np.empty(total, dtype=np.int8)
-        nbr_indices = np.empty(total, dtype=np.int32)
-
-        for i in range(num_nodes):
-            start = int(offsets[i])
-            for j, (tid, nid) in enumerate(deduped[i]):
-                nbr_types[start + j] = tid
-                nbr_indices[start + j] = nid
+        if len(node_ids) > 0:
+            unique_nodes, counts = np.unique(node_ids, return_counts=True)
+            np.add.at(offsets, unique_nodes.astype(np.int64) + 1, counts)
+            np.cumsum(offsets, out=offsets)
 
         csr[nt] = {
-            "nbr_types": nbr_types,
-            "nbr_indices": nbr_indices,
+            "nbr_types": all_edges[:, 1].astype(np.int8),
+            "nbr_indices": all_edges[:, 2].astype(np.int32),
             "offsets": offsets,
         }
 
     return csr
+
+
+def _build_all_nodes_compact(data):
+    """Build compact fallback representation: ([(type_str, count), ...], total_nodes)."""
+    node_type_counts = [(nt, data[nt].num_nodes) for nt in data.node_types]
+    total = sum(c for _, c in node_type_counts)
+    return (node_type_counts, total)
+
+
+def _sample_fallback_nodes(all_nodes_compact, k, rng=random):
+    """
+    Sample k nodes uniformly from the compact all_nodes representation.
+    all_nodes_compact: (node_type_counts, total_nodes) where node_type_counts
+                       is a list of (type_str, count) pairs.
+    Uses the provided rng for random state compatibility.
+    """
+    node_type_counts, total_nodes = all_nodes_compact
+    if k <= total_nodes:
+        indices = rng.sample(range(total_nodes), k)
+    else:
+        indices = rng.choices(range(total_nodes), k=k)
+
+    # Map flat indices to (type_str, local_idx) via cumulative counts
+    result = []
+    for idx in indices:
+        remaining = idx
+        for (nt, count) in node_type_counts:
+            if remaining < count:
+                result.append((nt, remaining))
+                break
+            remaining -= count
+    return result
 
 
 def init_worker_globals(adj, all_nodes, node_types=None, time_arrays=None):
@@ -263,46 +321,84 @@ def gather_1_and_2_hop_vectorized(
     for k in range(len(n1_types)):
         n1_set.add((int(n1_types[k]), int(n1_indices[k])))
 
-    # --- 2-hop ---
+    # --- 2-hop: batch CSR lookups by neighbor type ---
     n2_connecting = defaultdict(set)  # (type_str, idx) -> set of connecting 1-hop (type_str, idx)
     seed_key = (type_to_idx[node_type], node_idx)
 
-    for k in range(len(n1_types)):
-        nbr_tid = int(n1_types[k])
-        nbr_idx = int(n1_indices[k])
-        nbr_type_str = idx_to_type[nbr_tid]
-
+    # Pre-compute all CSR offsets for 1-hop neighbors, grouped by type
+    for tid in np.unique(n1_types):
+        type_mask = n1_types == tid
+        nbr_type_str = idx_to_type[int(tid)]
+        nbr_indices_of_type = n1_indices[type_mask]
         csr_nbr = csr_adj[nbr_type_str]
-        s2 = int(csr_nbr["offsets"][nbr_idx])
-        e2 = int(csr_nbr["offsets"][nbr_idx + 1])
-        n2_t = csr_nbr["nbr_types"][s2:e2]
-        n2_i = csr_nbr["nbr_indices"][s2:e2]
 
-        # Cap if too many
-        if len(n2_t) > max_2hop_threshold:
-            sel2 = np.random.choice(len(n2_t), max_2hop_threshold, replace=False)
-            n2_t = n2_t[sel2]
-            n2_i = n2_i[sel2]
+        # Batch offset lookups for all neighbors of this type
+        starts = csr_nbr["offsets"][nbr_indices_of_type].astype(np.int64)
+        ends = csr_nbr["offsets"][nbr_indices_of_type + 1].astype(np.int64)
+        degrees = ends - starts
 
-        # Vectorized temporal filter
-        mask2 = np.ones(len(n2_t), dtype=bool)
-        for tid2 in np.unique(n2_t):
+        # Collect all 2-hop candidates with connecting labels
+        all_n2_t = []
+        all_n2_i = []
+        all_connecting_k = []  # index into nbr_indices_of_type
+
+        for local_k in range(len(nbr_indices_of_type)):
+            s2, e2 = int(starts[local_k]), int(ends[local_k])
+            deg = int(degrees[local_k])
+            if deg == 0:
+                continue
+            n2_t = csr_nbr["nbr_types"][s2:e2]
+            n2_i = csr_nbr["nbr_indices"][s2:e2]
+
+            # Cap if too many
+            if deg > max_2hop_threshold:
+                sel2 = np.random.choice(deg, max_2hop_threshold, replace=False)
+                n2_t = n2_t[sel2]
+                n2_i = n2_i[sel2]
+
+            all_n2_t.append(n2_t)
+            all_n2_i.append(n2_i)
+            all_connecting_k.append(np.full(len(n2_t), local_k, dtype=np.int32))
+
+        if not all_n2_t:
+            continue
+
+        # Concatenate all 2-hop candidates for this neighbor type
+        cat_n2_t = np.concatenate(all_n2_t)
+        cat_n2_i = np.concatenate(all_n2_i)
+        cat_conn_k = np.concatenate(all_connecting_k)
+
+        # Vectorized temporal filter on the entire batch
+        tmask = np.ones(len(cat_n2_t), dtype=bool)
+        for tid2 in np.unique(cat_n2_t):
             t_str2 = idx_to_type[int(tid2)]
             if t_str2 in time_arrays:
-                tm = n2_t == tid2
-                mask2[tm] = time_arrays[t_str2][n2_i[tm]] <= seed_time
-        n2_t = n2_t[mask2]
-        n2_i = n2_i[mask2]
+                tm = cat_n2_t == tid2
+                tmask[tm] = time_arrays[t_str2][cat_n2_i[tm]] <= seed_time
+        cat_n2_t = cat_n2_t[tmask]
+        cat_n2_i = cat_n2_i[tmask]
+        cat_conn_k = cat_conn_k[tmask]
 
-        connecting_1hop_str = (nbr_type_str, nbr_idx)
-        for j in range(len(n2_t)):
-            key = (int(n2_t[j]), int(n2_i[j]))
-            # Skip seed node and 1-hop nodes
-            if key == seed_key:
-                continue
-            if key in n1_set:
-                continue
-            n2_connecting[(idx_to_type[key[0]], key[1])].add(connecting_1hop_str)
+        # Vectorized seed/1-hop exclusion using composite keys
+        candidate_keys = cat_n2_t.astype(np.int64) * np.int64(2**31) + cat_n2_i.astype(np.int64)
+        seed_ck = np.int64(seed_key[0]) * np.int64(2**31) + np.int64(seed_key[1])
+
+        # Build 1-hop composite key array for exclusion
+        n1_ck = n1_types.astype(np.int64) * np.int64(2**31) + n1_indices.astype(np.int64)
+        n1_ck_set = set(n1_ck.tolist())
+        n1_ck_set.add(int(seed_ck))
+
+        # Vectorized exclusion: remove seed and 1-hop nodes
+        exclude_mask = np.array([int(ck) not in n1_ck_set for ck in candidate_keys], dtype=bool)
+        cat_n2_t = cat_n2_t[exclude_mask]
+        cat_n2_i = cat_n2_i[exclude_mask]
+        cat_conn_k = cat_conn_k[exclude_mask]
+
+        # Build n2_connecting dict from filtered results
+        for j in range(len(cat_n2_t)):
+            n2_key_str = idx_to_type[int(cat_n2_t[j])]
+            connecting_nbr_idx = int(nbr_indices_of_type[cat_conn_k[j]])
+            n2_connecting[(n2_key_str, int(cat_n2_i[j]))].add((nbr_type_str, connecting_nbr_idx))
 
     # --- Build output ---
     results = []
@@ -334,25 +430,30 @@ def _process_one_seed(args):
     perform local nodes expansions up to K, apply fallback if necessary,
     then return a final list of neighbor tokens.
 
+    Accepts 5-element tuple: (K, seed_node_type, seed_node_idx, seed_time, seed_val)
+    or 6-element tuple: (K, seed_node_type, seed_node_idx, seed_time, seed_val, row_idx)
+
     Uses GLOBAL_ADJ (CSR), GLOBAL_NODE_TYPES, GLOBAL_TIME_ARRAYS, GLOBAL_ALL_NODES
     set via init_worker_globals — no pickling of heavy objects per task.
     """
     global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
     global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
 
-    (K, seed_node_type, seed_node_idx, seed_time, seed_val) = args
+    if len(args) == 6:
+        (K, seed_node_type, seed_node_idx, seed_time, seed_val, row_idx) = args
+    else:
+        (K, seed_node_type, seed_node_idx, seed_time, seed_val) = args
+        row_idx = None
     random.seed(seed_val)
 
     # 1. gather 1-hop and 2-hop — use vectorized path if CSR available
     if GLOBAL_TIME_ARRAYS is not None and isinstance(GLOBAL_ADJ, dict) and \
        len(GLOBAL_ADJ) > 0 and "offsets" in next(iter(GLOBAL_ADJ.values())):
-        # CSR path — uses lightweight globals, no HeteroData needed
         T_hat = gather_1_and_2_hop_vectorized(
             GLOBAL_ADJ, GLOBAL_TIME_ARRAYS, GLOBAL_TYPE_TO_IDX, GLOBAL_NODE_TYPES,
             seed_node_type, seed_node_idx, seed_time
         )
     else:
-        # Legacy path (old dict-of-sets adjacency) — requires GLOBAL_NODE_TYPES
         raise RuntimeError(
             "Legacy dict-of-sets adjacency path is no longer supported in workers. "
             "Use build_adjacency_csr() to create CSR adjacency before spawning workers."
@@ -375,10 +476,7 @@ def _process_one_seed(args):
         chosen_neighbors = random.choices(combined_neighbors, k=K_minus_1)
     else:
         # fallback from GLOBAL_ALL_NODES
-        if K_minus_1 <= len(GLOBAL_ALL_NODES):
-            fallback = random.sample(GLOBAL_ALL_NODES, K_minus_1)
-        else:
-            fallback = random.choices(GLOBAL_ALL_NODES, k=K_minus_1)
+        fallback = _sample_fallback_nodes(GLOBAL_ALL_NODES, K_minus_1, rng=random)
         chosen_neighbors = []
         time_arrays = GLOBAL_TIME_ARRAYS or {}
         for (ft, fi) in fallback:
@@ -402,31 +500,40 @@ def _process_one_seed(args):
         rest = random.sample(rest, len(rest))
         final_tokens = [first] + rest
 
-    # build adjacency among these K nodes using CSR
+    # build adjacency among these K nodes using CSR + vectorized membership
     local_map = {}
     for j, (t_str, i, hop, t_val, c1hops) in enumerate(final_tokens):
         local_map[(t_str, i)] = j
 
     edges = []
     adj = GLOBAL_ADJ
-    is_csr = isinstance(adj, dict) and len(adj) > 0 and "offsets" in next(iter(adj.values()))
-    if is_csr:
-        idx_to_type = GLOBAL_IDX_TO_TYPE
+    idx_to_type = GLOBAL_IDX_TO_TYPE
+    type_to_idx = GLOBAL_TYPE_TO_IDX
+
+    # Build composite key lookup for vectorized membership testing
+    local_composite = {}  # composite_key -> local_j
+    for (t_str, i), j in local_map.items():
+        ck = (np.int64(type_to_idx[t_str]) << 32) | np.int64(i)
+        local_composite[int(ck)] = j
+    local_ck_array = np.array(list(local_composite.keys()), dtype=np.int64)
 
     for j_src, (t_str, i, hop, t_val, c1hops) in enumerate(final_tokens):
-        if is_csr:
-            csr_nt = adj[t_str]
-            s = int(csr_nt["offsets"][i])
-            e = int(csr_nt["offsets"][i + 1])
-            for k in range(s, e):
-                nbr_t = idx_to_type[int(csr_nt["nbr_types"][k])]
-                nbr_i = int(csr_nt["nbr_indices"][k])
-                if (nbr_t, nbr_i) in local_map:
-                    edges.append((j_src, local_map[(nbr_t, nbr_i)]))
-        else:
-            for (nbr_t, nbr_i) in adj[t_str][i]:
-                if (nbr_t, nbr_i) in local_map:
-                    edges.append((j_src, local_map[(nbr_t, nbr_i)]))
+        csr_nt = adj[t_str]
+        s = int(csr_nt["offsets"][i])
+        e = int(csr_nt["offsets"][i + 1])
+        if s == e:
+            continue
+
+        nbr_types_arr = csr_nt["nbr_types"][s:e]
+        nbr_indices_arr = csr_nt["nbr_indices"][s:e]
+
+        # Vectorized composite keys for all neighbors
+        nbr_ck = (nbr_types_arr.astype(np.int64) << 32) | nbr_indices_arr.astype(np.int64)
+
+        # Vectorized membership test
+        mask = np.isin(nbr_ck, local_ck_array)
+        for ck in nbr_ck[mask]:
+            edges.append((j_src, local_composite[int(ck)]))
 
     if len(edges) == 0:
         edge_index = np.zeros((2, 0), dtype=np.int32)
@@ -434,6 +541,8 @@ def _process_one_seed(args):
         arr = np.array(edges, dtype=np.int32)
         edge_index = arr.T  # shape [2, E]
 
+    if row_idx is not None:
+        return (row_idx, seed_node_type, seed_node_idx, final_tokens, edge_index)
     return (seed_node_type, seed_node_idx, final_tokens, edge_index)
 
 
@@ -463,9 +572,12 @@ def local_nodes_hetero(
         seed_val = hash((seed_node_type, node_idx, seed_t, K)) & 0xffffffff
         tasks.append((K, seed_node_type, node_idx, seed_t, seed_val))
 
+    _nw = num_workers or (getattr(pool, '_processes', None) if pool else None) or cpu_count()
+    chunksize = max(1, len(tasks) // (_nw * 4))
+
     if pool is not None:
         # Reuse existing pool (globals already initialized)
-        results = pool.map(_process_one_seed, tasks)
+        results = pool.map(_process_one_seed, tasks, chunksize=chunksize)
     else:
         # Legacy: create a pool on the fly (for backward compat)
         global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
@@ -475,11 +587,8 @@ def local_nodes_hetero(
             GLOBAL_ADJ = build_adjacency_csr(data, undirected=undirected)
 
         if GLOBAL_ALL_NODES is None:
-            all_nodes = []
-            for nt in data.node_types:
-                for i in range(data[nt].num_nodes):
-                    all_nodes.append((nt, i))
-            GLOBAL_ALL_NODES = all_nodes
+            all_nodes_compact = _build_all_nodes_compact(data)
+            GLOBAL_ALL_NODES = all_nodes_compact
 
         if GLOBAL_TIME_ARRAYS is None:
             GLOBAL_TIME_ARRAYS = {}
@@ -496,12 +605,13 @@ def local_nodes_hetero(
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
 
         ctx = get_context("fork")
+        chunksize = max(1, len(tasks) // (num_workers * 4))
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
             initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, node_types, GLOBAL_TIME_ARRAYS)
         ) as p:
-            results = p.map(_process_one_seed, tasks)
+            results = p.map(_process_one_seed, tasks, chunksize=chunksize)
 
     # Build the final dictionary S
     S = {seed_node_type: {}}
@@ -571,7 +681,8 @@ class RelGTTokens(Dataset):
                 self._precompute_sampling()
             # Barrier: non-rank-0 processes wait for rank 0 to finish writing
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                device_id = int(os.environ.get("LOCAL_RANK", 0))
+                torch.distributed.barrier(device_ids=[device_id])
                 if rank != 0 and not os.path.exists(self.precomputed_path):
                     raise RuntimeError(
                         f"Rank {rank}: HDF5 file not found after barrier: {self.precomputed_path}"
@@ -644,16 +755,16 @@ class RelGTTokens(Dataset):
 
     def _precompute_sampling(self):
         """
-        Run neighbor sampling in chunks and store expansions in HDF5.
+        Run neighbor sampling and store expansions in HDF5.
 
-        Key optimizations vs. original:
+        Key optimizations:
         - CSR adjacency instead of dict-of-sets (less memory, faster pickle)
         - Pre-extracted numpy time arrays (vectorized temporal filtering)
-        - Single Pool created ONCE, reused across all chunks
+        - All tasks submitted at once via imap_unordered (no chunk loop)
         - data/adj/time_arrays passed via init_worker_globals, NOT per-task
+        - Atomic HDF5 write: writes to temp file, renames on success
         """
         total = len(self.node_idxs)
-        chunk_size = 10000
         data_cpu = self.data.to("cpu")
         t_total_start = time.time()
 
@@ -665,10 +776,7 @@ class RelGTTokens(Dataset):
             if hasattr(data_cpu[nt], "time"):
                 time_arrays[nt] = data_cpu[nt].time.numpy()
 
-        all_nodes = []
-        for nt in data_cpu.node_types:
-            for i in range(data_cpu[nt].num_nodes):
-                all_nodes.append((nt, i))
+        all_nodes_compact = _build_all_nodes_compact(data_cpu)
 
         print(f"[{self.split}] CSR adjacency built in {time.time() - t_csr_start:.1f}s")
 
@@ -676,90 +784,82 @@ class RelGTTokens(Dataset):
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, total))
 
+        # Build ALL tasks at once with row_idx
+        all_tasks = []
+        for i, node_idx_t in enumerate(self.node_idxs):
+            node_idx = node_idx_t.item()
+            seed_t = self.time[i].item() if self.time is not None else 0.0
+            seed_val = hash((self.node_type, node_idx, seed_t, self.K)) & 0xffffffff
+            all_tasks.append((self.K, self.node_type, node_idx, seed_t, seed_val, i))
+
+        chunksize = max(1, total // (num_workers * 4))
+
         print(f"[{self.split}] Starting sampling: {total} seeds, K={self.K}, {num_workers} workers")
         t_sample_start = time.time()
 
-        with h5py.File(self.precomputed_path, 'w') as hf:
-            datasets = self._create_datasets(hf, total)
+        # Allocate full numpy arrays for streaming results
+        all_types = np.zeros((total, self.K), dtype=np.int16)
+        all_indices = np.zeros((total, self.K), dtype=np.int32)
+        all_hops = np.zeros((total, self.K), dtype=np.int8)
+        all_times = np.zeros((total, self.K), dtype=np.float32)
+        adjacency_all = [None] * total
 
-            adjacency_all = [None] * total
+        t_pool_start = time.time()
+        node_types = list(data_cpu.node_types)
+        ctx = get_context("fork")
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=init_worker_globals,
+            initargs=(csr_adj, all_nodes_compact, node_types, time_arrays)
+        ) as pool:
+            print(f"[{self.split}] Pool created in {time.time() - t_pool_start:.1f}s")
 
-            # Use spawn context — safe after CUDA init (DDP sets up CUDA before this)
-            t_pool_start = time.time()
-            node_types = list(data_cpu.node_types)
-            ctx = get_context("fork")
-            with ctx.Pool(
-                processes=num_workers,
-                initializer=init_worker_globals,
-                initargs=(csr_adj, all_nodes, node_types, time_arrays)
-            ) as pool:
-                print(f"[{self.split}] Pool created in {time.time() - t_pool_start:.1f}s")
+            for result in tqdm(
+                pool.imap_unordered(_process_one_seed, all_tasks, chunksize=chunksize),
+                total=total,
+                desc=f"Precomputing '{self.split}'"
+            ):
+                row_idx, nt, idx, final_tokens, edge_index = result
+                for j, (t_str, nbr_loc_idx, hop, t_val, c1hops) in enumerate(final_tokens):
+                    all_types[row_idx, j] = self.node_type_to_index[t_str]
+                    all_indices[row_idx, j] = nbr_loc_idx
+                    all_hops[row_idx, j] = hop
+                    all_times[row_idx, j] = t_val
+                adjacency_all[row_idx] = edge_index
 
-                with tqdm(total=total, desc=f"Precomputing '{self.split}'") as pbar:
-                    for start_idx in range(0, total, chunk_size):
-                        end_idx = min(start_idx + chunk_size, total)
-                        size_chunk = end_idx - start_idx
+        # Atomic write: write to temp file first, then rename
+        tmp_path = self.precomputed_path + f".tmp.{os.getpid()}"
+        try:
+            with h5py.File(tmp_path, 'w') as hf:
+                hf.create_dataset("types", data=all_types)
+                hf.create_dataset("indices", data=all_indices)
+                hf.create_dataset("hops", data=all_hops)
+                hf.create_dataset("times", data=all_times)
 
-                        chunk_node_idxs = self.node_idxs[start_idx:end_idx]
-                        chunk_times = None
-                        if self.time is not None:
-                            chunk_times = self.time[start_idx:end_idx]
+                # Compute edge offsets and write edges
+                edge_counts = np.array(
+                    [e.shape[1] if e is not None else 0 for e in adjacency_all],
+                    dtype=np.uint64
+                )
+                offsets = np.zeros(total + 1, dtype=np.uint64)
+                np.cumsum(edge_counts, out=offsets[1:])
 
-                        # Reuse the pool — no re-pickling of adj/data
-                        S_chunk = local_nodes_hetero(
-                            data=data_cpu,
-                            K=self.K,
-                            table_input_nodes=(self.node_type, chunk_node_idxs),
-                            table_input_time=chunk_times,
-                            undirected=self.undirected,
-                            num_workers=num_workers,
-                            pool=pool,
-                        )
+                total_edges = int(offsets[-1])
+                edges_dset = hf.create_dataset("edges", shape=(2, total_edges), dtype='int16')
+                for i in range(total):
+                    e_arr = adjacency_all[i]
+                    start = int(offsets[i])
+                    end_ = int(offsets[i + 1])
+                    if e_arr is not None and e_arr.size > 0:
+                        edges_dset[:, start:end_] = e_arr
 
-                        # arrays to fill
-                        c_types = np.zeros((size_chunk, self.K), dtype=np.int16)
-                        c_indices = np.zeros((size_chunk, self.K), dtype=np.int32)
-                        c_hops = np.zeros((size_chunk, self.K), dtype=np.int8)
-                        c_times = np.zeros((size_chunk, self.K), dtype=np.float32)
+                hf.create_dataset("edges_offsets", data=offsets)
 
-                        for i, node_id in enumerate(chunk_node_idxs):
-                            final_nodes, edge_index = S_chunk[self.node_type][int(node_id)]
-                            for j, (t_str, nbr_loc_idx, hop, t_val, c1hops) in enumerate(final_nodes):
-                                c_types[i, j] = self.node_type_to_index[t_str]
-                                c_indices[i, j] = nbr_loc_idx
-                                c_hops[i, j] = hop
-                                c_times[i, j] = t_val
-                            adjacency_all[start_idx + i] = edge_index
-
-                        datasets["types"][start_idx:end_idx] = c_types
-                        datasets["indices"][start_idx:end_idx] = c_indices
-                        datasets["hops"][start_idx:end_idx] = c_hops
-                        datasets["times"][start_idx:end_idx] = c_times
-
-                        pbar.update(size_chunk)
-
-                        del S_chunk
-                        gc.collect()
-
-            # store adjacency in "edges" + "edges_offsets"
-            offsets = np.zeros(total+1, dtype=np.uint64)
-            for i in range(total):
-                if adjacency_all[i] is not None:
-                    E_i = adjacency_all[i].shape[1]  # [2, E]
-                else:
-                    E_i = 0
-                offsets[i+1] = offsets[i] + E_i
-
-            total_edges = offsets[-1]
-            edges_dset = hf.create_dataset("edges", shape=(2, total_edges), dtype='int16')
-            for i in range(total):
-                e_arr = adjacency_all[i]
-                start = offsets[i]
-                end_ = offsets[i+1]
-                if e_arr is not None and e_arr.size > 0:
-                    edges_dset[:, start:end_] = e_arr
-
-            hf.create_dataset("edges_offsets", data=offsets)
+            os.rename(tmp_path, self.precomputed_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
 
         elapsed = time.time() - t_total_start
         mins, secs = divmod(elapsed, 60)

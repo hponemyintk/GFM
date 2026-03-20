@@ -104,7 +104,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from utils import build_adjacency_hetero, build_adjacency_csr, init_worker_globals
+from utils import build_adjacency_hetero, build_adjacency_csr, init_worker_globals, _build_all_nodes_compact
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -223,16 +223,13 @@ def worker_globals_small(small_hetero):
     """Initialize worker globals with CSR adjacency + time arrays for small_hetero."""
     import utils
     csr_adj = build_adjacency_csr(small_hetero, undirected=True)
-    all_nodes = []
-    for nt in small_hetero.node_types:
-        for i in range(small_hetero[nt].num_nodes):
-            all_nodes.append((nt, i))
+    all_nodes_compact = _build_all_nodes_compact(small_hetero)
     time_arrays = {}
     for nt in small_hetero.node_types:
         if hasattr(small_hetero[nt], "time"):
             time_arrays[nt] = small_hetero[nt].time.numpy()
     node_types = list(small_hetero.node_types)
-    init_worker_globals(csr_adj, all_nodes, node_types=node_types, time_arrays=time_arrays)
+    init_worker_globals(csr_adj, all_nodes_compact, node_types=node_types, time_arrays=time_arrays)
     yield
     init_worker_globals(None, None)
     utils.GLOBAL_TIME_ARRAYS = None
@@ -246,16 +243,13 @@ def worker_globals_csr(small_hetero):
     """Initialize worker globals with CSR adjacency + time arrays (new path)."""
     import utils
     csr_adj = build_adjacency_csr(small_hetero, undirected=True)
-    all_nodes = []
-    for nt in small_hetero.node_types:
-        for i in range(small_hetero[nt].num_nodes):
-            all_nodes.append((nt, i))
+    all_nodes_compact = _build_all_nodes_compact(small_hetero)
     time_arrays = {}
     for nt in small_hetero.node_types:
         if hasattr(small_hetero[nt], "time"):
             time_arrays[nt] = small_hetero[nt].time.numpy()
     node_types = list(small_hetero.node_types)
-    init_worker_globals(csr_adj, all_nodes, node_types=node_types, time_arrays=time_arrays)
+    init_worker_globals(csr_adj, all_nodes_compact, node_types=node_types, time_arrays=time_arrays)
     yield
     init_worker_globals(None, None)
     utils.GLOBAL_TIME_ARRAYS = None
