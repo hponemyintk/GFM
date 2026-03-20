@@ -15,7 +15,7 @@ BASE_PORT=29100
 datasets=("rel-amazon" "rel-amazon" "rel-amazon" "rel-amazon" "rel-stack" "rel-stack" "rel-stack" "rel-hm" "rel-hm")
 tasks=("user-churn" "item-churn" "user-ltv" "item-ltv" "user-engagement" "user-badge" "post-votes" "user-churn" "item-sales")
 dropouts_per=(0.3 0.3 0.3 0.3 0.3 0.3 0.3 0.3)
-bs_per=(1024 1024 1024 1024 1024 1024 1024 1024 1024)
+bs_per=(512 512 512 512 512 512 512 512 512)
 max_steps_per=(500 500 500 500 500 500 500 500 500)
 epochs_per=(10 10 10 10 10 10 10 10 10)
 
@@ -107,6 +107,8 @@ launch_experiment() {
         --warmup_steps 10 \
         --ff_dropout "${dropout}" \
         --attn_dropout "${dropout}" \
+        --amp --amp_dtype bfloat16 \
+        --gradient_accumulation_steps 2 \
         --run_name "${run_name}" \
         --out_dir "${out_dir}" &
 

@@ -219,9 +219,12 @@ class NeighborTfsEncoder(nn.Module):
         N = len(flat_batch_idx)  # total flattened neighbors
         device = neighbor_types.device
 
-        # Pre-allocate an [N, channels] buffer 
+        # Determine dtype for buffers (match autocast dtype if active)
+        buf_dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else torch.float32
+
+        # Pre-allocate an [N, channels] buffer
         # (Even if N==0, this works fine: shape is [0, channels].)
-        encoded_flat_tensor = torch.zeros((N, self.channels), device=device)
+        encoded_flat_tensor = torch.zeros((N, self.channels), device=device, dtype=buf_dtype)
 
         # 1) Encode in one shot per node type
         for t_int, big_tf in grouped_tfs.items():
@@ -229,15 +232,15 @@ class NeighborTfsEncoder(nn.Module):
             encoder = self.encoders[node_type_str]
 
             big_tf = big_tf.to(device=device)
-            
+
             for stype, tensor in big_tf.feat_dict.items():
                 if isinstance(tensor, torch.Tensor):
                     big_tf.feat_dict[stype] = torch.nan_to_num(
                         tensor, nan=0.0, posinf=1e6, neginf=-1e6
                     )
-            
+
             # assert torch.isfinite(big_tf.feat_dict[torch_frame.numerical]).all(), f"NaN/Inf in the raw big_tf for {node_type_str}?"
-            
+
             out_t = encoder(big_tf)  # shape: [num_rows, channels] or [num_rows, 1, channels]
             if out_t.dim() == 3 and out_t.shape[1] == 1:
                 out_t = out_t.squeeze(1)  # => [num_rows, channels]
@@ -248,8 +251,8 @@ class NeighborTfsEncoder(nn.Module):
             encoded_flat_tensor[idx_tensor] = out_t
 
         # 2) Scatter [N, channels] -> [B, K, channels]
-        output = torch.zeros((B, K, self.channels), device=device)
-        
+        output = torch.zeros((B, K, self.channels), device=device, dtype=buf_dtype)
+
         indices_i = torch.tensor(flat_batch_idx, dtype=torch.long, device=device)
         indices_j = torch.tensor(flat_nbr_idx,   dtype=torch.long, device=device)
         output[indices_i, indices_j] = encoded_flat_tensor

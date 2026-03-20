@@ -9,11 +9,13 @@ export PATH=~/miniforge3/bin:$PATH
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate gt
 
-DATASET="${1:-rel-hm}"
-TASK="${2:-user-churn}"
+DATASET="${1:-rel-f1}"
+TASK="${2:-driver-top3}"
+# DATASET="${1:-rel-hm}"
+# TASK="${2:-user-churn}"
 BATCH_SIZE="${3:-32}"
 EPOCHS="${4:-10}"
-NUM_GPUS="${5:-1}"
+NUM_GPUS="${5:-8}"
 
 LOG_DIR="logs"
 mkdir -p "${LOG_DIR}"
@@ -40,6 +42,7 @@ torchrun \
     --max_steps_per_epoch 3000 \
     --num_workers 2 \
     --epochs "${EPOCHS}" \
+    --amp --amp_dtype bfloat16 \
     --lr 0.0001 \
     --warmup_steps 100 \
     --ff_dropout 0.3 \

@@ -48,6 +48,7 @@ class RelGTLayer(nn.Module):
         self.num_centroids = num_centroids
         self._alpha = None
         self.sample_node_len = sample_node_len
+        self.vq_accumulate = False
 
         self.local_module = LocalModule(
             seq_len=self.sample_node_len,
@@ -145,7 +146,10 @@ class RelGTLayer(nn.Module):
 
         # Update the centroids
         if self.training:
-            x_idx = self.vq.update(q_x)
+            if self.vq_accumulate:
+                x_idx = self.vq.accumulate(q_x)
+            else:
+                x_idx = self.vq.update(q_x)
             self.c_idx[batch_idx] = x_idx.squeeze().to(torch.long)
 
         return out
@@ -281,7 +285,25 @@ class RelGT(torch.nn.Module):
 
         self.head.reset_parameters()
 
-    def forward(self, 
+    def set_vq_accumulate(self, enable):
+        """Enable/disable VQ accumulation mode on all global layers."""
+        for conv in self.convs:
+            if conv.conv_type != "local":
+                conv.vq_accumulate = enable
+
+    def start_vq_accumulation(self):
+        """Reset VQ accumulation buffers on all global layers."""
+        for conv in self.convs:
+            if conv.conv_type != "local":
+                conv.vq.start_accumulation()
+
+    def flush_vq_accumulation(self):
+        """Apply one EMA update from accumulated VQ statistics on all global layers."""
+        for conv in self.convs:
+            if conv.conv_type != "local":
+                conv.vq.flush_accumulation()
+
+    def forward(self,
                 neighbor_types,
                 node_indices,
                 neighbor_hops,

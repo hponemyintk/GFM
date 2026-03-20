@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import copy
 import json
 import math
@@ -34,8 +35,6 @@ from relbench.tasks import get_task
 # within this project
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
-
-torch.autograd.set_detect_anomaly(True)
 
 ############################
 # 1. Parse arguments
@@ -78,10 +77,30 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+# Debug flag (replaces always-on detect_anomaly)
+parser.add_argument("--debug", action="store_true", default=False,
+                    help="Enable autograd anomaly detection (adds memory/perf overhead)")
+# AMP (Automatic Mixed Precision)
+parser.add_argument("--amp", action="store_true", default=False,
+                    help="Enable automatic mixed precision training")
+parser.add_argument("--no_amp", action="store_true", default=False,
+                    help="Explicitly disable AMP")
+parser.add_argument("--amp_dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"],
+                    help="AMP dtype (bfloat16 for A100+, float16 for older GPUs)")
+# Gradient accumulation
+parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                    help="Number of micro-batches to accumulate before optimizer step")
+# Gradient checkpointing
+parser.add_argument("--gradient_checkpointing", action="store_true", default=False,
+                    help="Enable gradient checkpointing to reduce memory at cost of compute")
 
 args = parser.parse_args()
 if args.sampling_workers is None:
     args.sampling_workers = max(1, min(32, os.cpu_count() - 1))
+if args.no_amp:
+    args.amp = False
+
+torch.autograd.set_detect_anomaly(args.debug)
 
 ############################
 # 2. Initialize DDP and set device
@@ -230,7 +249,7 @@ model = RelGT(
     num_nodes=data["train"].data.num_nodes,
     max_neighbor_hop=data["train"].max_neighbor_hop,
     node_type_map=data["train"].node_type_to_index,
-    col_names_dict={node_type: data["train"].data[node_type].tf.col_names_dict 
+    col_names_dict={node_type: data["train"].data[node_type].tf.col_names_dict
                     for node_type in data["train"].data.node_types},
     col_stats_dict=col_stats_dict,
     local_num_layers=args.num_layers,
@@ -248,6 +267,13 @@ model = RelGT(
     args=args,
 ).to(device)
 
+# Enable gradient checkpointing if requested (before DDP wrapping)
+if args.gradient_checkpointing:
+    for conv in model.convs:
+        conv.local_module.gradient_checkpointing = True
+    if local_rank == 0:
+        print("Gradient checkpointing enabled")
+
 # Before DDP initialization, cast problematic tensors
 for name, param in model.named_parameters():
     if param.dtype == torch.int16:
@@ -259,6 +285,15 @@ for name, buf in model.named_buffers():
 
 model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
 model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+
+# Set up AMP
+amp_dtype = torch.bfloat16 if args.amp_dtype == "bfloat16" else torch.float16
+use_amp = args.amp
+# GradScaler only needed for float16 (bfloat16 has same exponent range as fp32)
+use_grad_scaler = use_amp and args.amp_dtype == "float16"
+grad_scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
+if local_rank == 0 and use_amp:
+    print(f"AMP enabled with dtype={args.amp_dtype}, GradScaler={'on' if use_grad_scaler else 'off'}")
 
 if local_rank == 0:
     print(model)
@@ -274,6 +309,10 @@ output_path = os.path.join(args.out_dir, args.dataset, args.task)
 os.makedirs(output_path, exist_ok=True)
 
 world_size = dist.get_world_size()
+# Scale max_steps_per_epoch by world_size so total data seen per epoch is constant
+args.max_steps_per_epoch = max(1, args.max_steps_per_epoch // world_size)
+if local_rank == 0 and world_size > 1:
+    print(f"Scaled max_steps_per_epoch to {args.max_steps_per_epoch} ({world_size} GPUs)")
 base_lr = args.lr * world_size
 optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
@@ -282,14 +321,24 @@ global_step = 0
 ############################
 # 7. Training and Evaluation Loops
 ############################
+accum_steps = args.gradient_accumulation_steps
+
 def train_supervised(epoch) -> float:
     global global_step
     model.train()
     loss_accum = count_accum = 0
     total_steps = min(len(loader_dict["train"]), args.max_steps_per_epoch)
-    
+
     train_sampler.set_epoch(epoch)
-    
+
+    # Enable VQ accumulation mode if gradient accumulation is active and model has global layers
+    use_vq_accum = accum_steps > 1 and args.gt_conv_type != "local"
+    if use_vq_accum:
+        model.module.set_vq_accumulate(True)
+        model.module.start_vq_accumulation()
+
+    optimizer.zero_grad()
+
     for step, batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1):
         # Move tensors to the proper device.
         neighbor_types = batch["neighbor_types"].to(device)
@@ -307,23 +356,50 @@ def train_supervised(epoch) -> float:
         }
         labels = batch["labels"].to(device)
 
-        optimizer.zero_grad()
-        pred = model(
-            neighbor_types,
-            node_indices,
-            neighbor_hops,
-            neighbor_times,
-            grouped_tf_dict,
-            edge_index=edge_index,
-            batch=batch_vec
-        )
-        pred = pred.view(-1) if pred.size(1) == 1 else pred        
-        loss = loss_fn(pred.float(), labels)
-        loss.backward()
-        clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # Skip DDP allreduce on non-accumulation steps
+        is_accumulation_step = (step % accum_steps != 0)
+        sync_context = model.no_sync() if is_accumulation_step and accum_steps > 1 else contextlib.nullcontext()
 
-        loss_value = loss.detach().item()
+        with sync_context:
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                pred = model(
+                    neighbor_types,
+                    node_indices,
+                    neighbor_hops,
+                    neighbor_times,
+                    grouped_tf_dict,
+                    edge_index=edge_index,
+                    batch=batch_vec
+                )
+                pred = pred.view(-1) if pred.size(1) == 1 else pred
+                loss = loss_fn(pred.float(), labels)
+                if accum_steps > 1:
+                    loss = loss / accum_steps
+
+            grad_scaler.scale(loss).backward()
+
+        # Optimizer step on accumulation boundary
+        if not is_accumulation_step or step >= total_steps:
+            grad_scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Sync and flush VQ accumulation across GPUs
+            if use_vq_accum:
+                if world_size > 1:
+                    for conv in model.module.convs:
+                        if conv.conv_type != "local":
+                            if conv.vq._accum_cluster_counts is not None:
+                                dist.all_reduce(conv.vq._accum_cluster_counts)
+                                dist.all_reduce(conv.vq._accum_dw)
+                model.module.flush_vq_accumulation()
+                model.module.start_vq_accumulation()
+
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            optimizer.zero_grad()
+
+        # Report unscaled loss for logging
+        loss_value = loss.detach().item() * (accum_steps if accum_steps > 1 else 1)
         gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
         # Only rank 0 logs training metrics.
         if local_rank == 0:
@@ -340,6 +416,10 @@ def train_supervised(epoch) -> float:
 
         if step >= args.max_steps_per_epoch:
             break
+
+    # Disable VQ accumulation mode after epoch
+    if use_vq_accum:
+        model.module.set_vq_accumulate(False)
 
     return loss_accum / count_accum if count_accum > 0 else float('inf')
 
@@ -366,21 +446,22 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
             'flat_batch_idx': batch['flat_batch_idx'],
             'flat_nbr_idx': batch['flat_nbr_idx']
         }
-        pred = eval_model(
-            neighbor_types,
-            node_indices,
-            neighbor_hops,
-            neighbor_times,
-            grouped_tf_dict,
-            edge_index=edge_index,
-            batch=batch_vec
-        )
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+            pred = eval_model(
+                neighbor_types,
+                node_indices,
+                neighbor_hops,
+                neighbor_times,
+                grouped_tf_dict,
+                edge_index=edge_index,
+                batch=batch_vec
+            )
         if task.task_type == TaskType.REGRESSION:
             pred = torch.clamp(pred, clamp_min, clamp_max)
         if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
             pred = torch.sigmoid(pred)
         pred = pred.view(-1) if pred.size(1) == 1 else pred
-        pred_list.append(pred.detach().cpu().numpy())
+        pred_list.append(pred.detach().float().cpu().numpy())
         idx_list.append(batch["global_idx"].cpu().numpy())
     
     # Concatenate local predictions & indices
