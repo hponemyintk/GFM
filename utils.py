@@ -605,7 +605,7 @@ def local_nodes_hetero(
         if num_workers is None:
             num_workers = max(1, min(cpu_count() - 1, len(tasks)))
 
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         chunksize = max(1, len(tasks) // (num_workers * 4))
         with ctx.Pool(
             processes=num_workers,
@@ -812,7 +812,7 @@ class RelGTTokens(Dataset):
 
         t_pool_start = time.time()
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
@@ -928,7 +928,7 @@ class RelGTTokens(Dataset):
         shard_adjacency = [None] * shard_size
 
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
