@@ -812,7 +812,10 @@ class RelGTTokens(Dataset):
 
         t_pool_start = time.time()
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        # Use forkserver to avoid SIGBUS from fork-after-CUDA.
+        # Workers are numpy-only so forkserver is safe; the startup cost
+        # (re-importing modules) is acceptable for one-time precomputation.
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
@@ -911,7 +914,8 @@ class RelGTTokens(Dataset):
 
         num_workers = self.num_workers
         if num_workers is None:
-            num_workers = max(1, min(cpu_count() - 1, shard_size))
+            # Scale workers per rank to avoid oversubscribing CPUs
+            num_workers = max(1, min(32, cpu_count() // max(world_size, 1)))
 
         chunksize = max(1, shard_size // (num_workers * 4))
 
@@ -928,7 +932,8 @@ class RelGTTokens(Dataset):
         shard_adjacency = [None] * shard_size
 
         node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
+        # Use forkserver to avoid SIGBUS from fork-after-CUDA.
+        ctx = get_context("forkserver")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
