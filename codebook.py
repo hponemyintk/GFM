@@ -1,6 +1,7 @@
 from re import X
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 
@@ -104,3 +105,14 @@ class VectorQuantizerEMA(nn.Module):
             self._embedding_output.data = self._embedding * running_std + running_mean
 
         return encoding_indices
+
+    def sync_centroids(self):
+        """Synchronize centroid buffers across all DDP ranks by averaging."""
+        if not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+        for buf in [self._ema_cluster_size, self._ema_w, self._embedding, self._embedding_output]:
+            dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
+            buf.data /= world_size

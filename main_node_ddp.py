@@ -286,7 +286,8 @@ def train_supervised(epoch) -> float:
     global global_step
     model.train()
     loss_accum = count_accum = 0
-    total_steps = min(len(loader_dict["train"]), args.max_steps_per_epoch)
+    adjusted_max_steps = max(1, args.max_steps_per_epoch // world_size)
+    total_steps = min(len(loader_dict["train"]), adjusted_max_steps)
     
     train_sampler.set_epoch(epoch)
     
@@ -338,7 +339,7 @@ def train_supervised(epoch) -> float:
         count_accum += pred.size(0)
         global_step += 1
 
-        if step >= args.max_steps_per_epoch:
+        if step >= adjusted_max_steps:
             break
 
     return loss_accum / count_accum if count_accum > 0 else float('inf')
