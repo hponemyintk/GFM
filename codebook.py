@@ -86,9 +86,20 @@ class VectorQuantizerEMA(nn.Module):
 
         # Use EMA to update the embedding vectors
         if self.training:
+            encodings_sum = torch.sum(encodings, 0)
+            dw = torch.matmul(encodings.t(), inputs_normalized)
+
+            # Sync raw statistics across DDP ranks before EMA update
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.all_reduce(encodings_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(dw, op=dist.ReduceOp.SUM)
+                world_size = dist.get_world_size()
+                encodings_sum = encodings_sum / world_size
+                dw = dw / world_size
+
             self._ema_cluster_size.data = self._ema_cluster_size * self._decay + (
                 1 - self._decay
-            ) * torch.sum(encodings, 0)
+            ) * encodings_sum
 
             # Laplace smoothing of the cluster size
             n = torch.sum(self._ema_cluster_size.data)
@@ -96,7 +107,6 @@ class VectorQuantizerEMA(nn.Module):
                 (self._ema_cluster_size + 1e-5) / (n + self._num_embeddings * 1e-5) * n
             )
 
-            dw = torch.matmul(encodings.t(), inputs_normalized)
             self._ema_w.data = self._ema_w * self._decay + (1 - self._decay) * dw
             self._embedding.data = self._ema_w / self._ema_cluster_size.unsqueeze(1)
 
@@ -105,14 +115,3 @@ class VectorQuantizerEMA(nn.Module):
             self._embedding_output.data = self._embedding * running_std + running_mean
 
         return encoding_indices
-
-    def sync_centroids(self):
-        """Synchronize centroid buffers across all DDP ranks by averaging."""
-        if not dist.is_initialized():
-            return
-        world_size = dist.get_world_size()
-        if world_size <= 1:
-            return
-        for buf in [self._ema_cluster_size, self._ema_w, self._embedding, self._embedding_output]:
-            dist.all_reduce(buf.data, op=dist.ReduceOp.SUM)
-            buf.data /= world_size

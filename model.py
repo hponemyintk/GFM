@@ -147,7 +147,6 @@ class RelGTLayer(nn.Module):
         if self.training:
             x_idx = self.vq.update(q_x)
             self.c_idx[batch_idx] = x_idx.squeeze().to(torch.long)
-            self.vq.sync_centroids()
 
         return out
 
