@@ -4,9 +4,13 @@ from contextlib import nullcontext
 import json
 import math
 import os
+from datetime import timedelta
 from pathlib import Path
 from typing import Dict
-import wandb
+if os.environ.get('WANDB_API_KEY'):
+    from c1_aiml_aem import wandb
+else:
+    import wandb
 
 import numpy as np
 import torch
@@ -89,7 +93,7 @@ if args.sampling_workers is None:
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl")
+dist.init_process_group(backend="nccl", timeout=timedelta(hours=24))
 # local_rank = args.local_rank
 local_rank = int(os.environ["LOCAL_RANK"])
 device = torch.device("cuda", local_rank)
@@ -121,38 +125,63 @@ gpu_handle = init_gpu_utilization(local_rank)
 ############################
 # 3. Load dataset, task, and prepare data
 ############################
-dataset: Dataset = get_dataset(args.dataset, download=True)
-task: EntityTask = get_task(args.dataset, args.task, download=True)
+# Only rank 0 downloads/caches to avoid race conditions that cause segfaults.
+if local_rank == 0:
+    dataset: Dataset = get_dataset(args.dataset, download=True)
+    task: EntityTask = get_task(args.dataset, args.task, download=True)
 
-stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
-try:
+    stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
+    try:
+        with open(stypes_cache_path, "r") as f:
+            col_to_stype_dict = json.load(f)
+        for table, col_to_stype in col_to_stype_dict.items():
+            for col, stype_str in col_to_stype.items():
+                col_to_stype[col] = stype(stype_str)
+    except FileNotFoundError:
+        col_to_stype_dict = get_stype_proposal(dataset.get_db())
+        Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(stypes_cache_path, "w") as f:
+            json.dump(col_to_stype_dict, f, indent=2, default=str)
+
+    data, col_stats_dict = make_pkey_fkey_graph(
+        dataset.get_db(),
+        col_to_stype_dict=col_to_stype_dict,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
+        ),
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+    )
+
+dist.barrier()
+
+# Non-rank-0 processes load from cache after rank 0 has finished downloading.
+if local_rank != 0:
+    dataset: Dataset = get_dataset(args.dataset, download=True)
+    task: EntityTask = get_task(args.dataset, args.task, download=True)
+
+    stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
     with open(stypes_cache_path, "r") as f:
         col_to_stype_dict = json.load(f)
     for table, col_to_stype in col_to_stype_dict.items():
         for col, stype_str in col_to_stype.items():
             col_to_stype[col] = stype(stype_str)
-except FileNotFoundError:
-    col_to_stype_dict = get_stype_proposal(dataset.get_db())
-    Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(stypes_cache_path, "w") as f:
-        json.dump(col_to_stype_dict, f, indent=2, default=str)
 
-data, col_stats_dict = make_pkey_fkey_graph(
-    dataset.get_db(),
-    col_to_stype_dict=col_to_stype_dict,
-    text_embedder_cfg=TextEmbedderConfig(
-        text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
-    ),
-    cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
-)
+    data, col_stats_dict = make_pkey_fkey_graph(
+        dataset.get_db(),
+        col_to_stype_dict=col_to_stype_dict,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
+        ),
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+    )
 
 data = {
     split: RelGTTokens(
-        data=data, 
+        data=data,
         task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
+        K=args.num_neighbors,
+        split=split,
+        undirected=True,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
         num_workers=args.sampling_workers,
