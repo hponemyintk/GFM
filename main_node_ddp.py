@@ -374,6 +374,9 @@ def train_supervised(epoch) -> float:
     optimizer.zero_grad()
 
     for step, batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train"), start=1):
+        # Enrich with TensorFrame features (must run in main process)
+        batch = data["train"].enrich_batch(batch)
+
         # Move tensors to the proper device.
         neighbor_types = batch["neighbor_types"].to(device)
         node_indices = batch["node_indices"].to(device)
@@ -458,22 +461,26 @@ def train_supervised(epoch) -> float:
     return loss_accum / count_accum if count_accum > 0 else float('inf')
 
 @torch.no_grad()
-def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
+def test(loader: DataLoader, eval_model, epoch, desc, dataset_obj=None) -> np.ndarray:
     if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
         loader.sampler.set_epoch(epoch)
-        
+
     eval_model.eval()
     pred_list = []
     idx_list = []
-    
+
     for batch in tqdm(loader, desc=desc, disable=(global_rank != 0)):
+        # Enrich with TensorFrame features (must run in main process)
+        if dataset_obj is not None:
+            batch = dataset_obj.enrich_batch(batch)
+
         neighbor_types = batch["neighbor_types"].to(device)
         node_indices = batch["node_indices"].to(device)
         neighbor_hops = batch["neighbor_hops"].to(device)
         neighbor_times = batch["neighbor_times"].to(device)
         edge_index = batch["edge_index"].to(device)
         batch_vec = batch["batch"].to(device)
-        
+
         grouped_tf_dict = {
             'grouped_tfs': batch['grouped_tfs'],
             'grouped_indices': batch['grouped_indices'],
@@ -530,7 +537,7 @@ if args.train_stage == "finetune":
         eval_model = model.module  # get the underlying model
         
         # Run evaluation on the validation set.
-        val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
+        val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val", dataset_obj=data["val"])
         if global_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
@@ -557,8 +564,8 @@ if args.train_stage == "finetune":
     dist.barrier()
 
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val", dataset_obj=data["val"])
+    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test", dataset_obj=data["test"])
 
     if global_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
@@ -582,4 +589,7 @@ if args.train_stage == "finetune":
 ############################
 # 8. Cleanup
 ############################
+# Explicitly shut down DataLoader workers before destroying the process group
+# to avoid leaked semaphore warnings.
+del loader_train, loader_val, loader_test, loader_dict
 dist.destroy_process_group()

@@ -664,12 +664,13 @@ class RelGTTokens(Dataset):
         
         self.max_neighbor_hop = 2 + 1  # 2 for hop neighbors + 1 for random fallback
 
-        # Create global index mappings for (type_id, local_id)
+        # Create global index mappings using compact offset array
+        # instead of per-node dicts (avoids pickling millions of entries)
         self._create_global_mappings()
 
         # HDF5 path
         self.precomputed_path = self._construct_precomputed_path()
-        
+
         self.train_stage = train_stage
 
         if self.precompute:
@@ -693,36 +694,34 @@ class RelGTTokens(Dataset):
                         f"Rank {rank}: HDF5 file not found after precomputation: "
                         f"{self.precomputed_path}"
                     )
+            # Cache HDF5 data in memory so __getitem__ doesn't open the file
+            # per call (avoids h5py issues with spawn workers and is much faster)
+            self._load_hdf5_into_memory()
 
     def _create_global_mappings(self):
         """
-        Create a dictionary that maps (type_idx, local_idx) -> global_idx, 
-        and the reverse.
+        Build a compact offset array for (type_idx, local_idx) -> global_idx
+        mapping.  O(num_types) storage instead of O(num_nodes) dicts, which
+        avoids pickling millions of entries when sending the Dataset to
+        DataLoader spawn workers.
         """
-        self.type_local_to_global = {}
-        self.global_to_type_local = {}
-        
-        global_index = 0
-        for type_idx, node_type in self.index_to_node_type.items():
+        num_types = len(self.index_to_node_type)
+        # _global_offsets[type_idx] = cumulative count of nodes before this type
+        self._global_offsets = np.zeros(num_types + 1, dtype=np.int64)
+        for type_idx in range(num_types):
+            node_type = self.index_to_node_type[type_idx]
             if 'x' in self.data[node_type]:
-                num_nodes = self.data[node_type]['x'].size(0)
+                n = self.data[node_type]['x'].size(0)
             else:
-                num_nodes = self.data[node_type].num_nodes
-
-            for local_idx in range(num_nodes):
-                key = (type_idx, local_idx)
-                self.type_local_to_global[key] = global_index
-                self.global_to_type_local[global_index] = key
-                global_index += 1
+                n = self.data[node_type].num_nodes
+            self._global_offsets[type_idx + 1] = self._global_offsets[type_idx] + n
 
     def get_global_index(self, type_idxs: List[int], local_idxs: List[int]) -> List[int]:
         """
-        Convert each (type_idx, local_idx) to a global ID for downstream usage.
+        Convert each (type_idx, local_idx) to a global ID via offset arithmetic.
         """
-        out = []
-        for t_i, l_i in zip(type_idxs, local_idxs):
-            out.append(self.type_local_to_global[(t_i, l_i)])
-        return out
+        return [int(self._global_offsets[t_i]) + l_i
+                for t_i, l_i in zip(type_idxs, local_idxs)]
 
     def _construct_precomputed_path(self) -> str:
         if not self.precomputed_dir:
@@ -734,6 +733,42 @@ class RelGTTokens(Dataset):
         )
         os.makedirs(os.path.dirname(path), exist_ok=True)
         return path
+
+    def __getstate__(self):
+        """Control what gets pickled for DataLoader spawn workers.
+
+        Exclude heavy objects (HeteroData, task, table) that are only needed
+        in the main process (for enrich_batch).  Workers only need the cached
+        numpy arrays, target tensor, and lightweight metadata.
+        """
+        state = self.__dict__.copy()
+        # These are only needed in the main process (enrich_batch / precompute)
+        for key in ("data", "task", "table", "table_input"):
+            state.pop(key, None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Mark main-process-only attributes as unavailable in workers
+        self.data = None
+        self.task = None
+        self.table = None
+        self.table_input = None
+
+    def _load_hdf5_into_memory(self):
+        """Load precomputed HDF5 datasets into numpy arrays in memory.
+
+        This avoids opening/closing the HDF5 file on every __getitem__ call,
+        which is both slow and problematic with spawn-based DataLoader workers
+        (h5py file handles cannot be pickled).
+        """
+        with h5py.File(self.precomputed_path, 'r') as hf:
+            self._cached_types = hf["types"][:]      # [N, K] int16
+            self._cached_indices = hf["indices"][:]   # [N, K] int32
+            self._cached_hops = hf["hops"][:]         # [N, K] int8
+            self._cached_times = hf["times"][:]       # [N, K] float32
+            self._cached_edges = hf["edges"][:]       # [2, total_edges] int16
+            self._cached_edge_offsets = hf["edges_offsets"][:]  # [N+1] uint64
 
     def __len__(self):
         return len(self.node_idxs)
@@ -1071,48 +1106,47 @@ class RelGTTokens(Dataset):
 
     def __getitem__(self, idx: int):
         """
-        Retrieve samples from HDF5 (row=idx) and the label from self.target[idx].
+        Retrieve samples from cached numpy arrays and the label from self.target[idx].
+
+        TensorFrame lookup is deferred to collate() which runs in the main
+        process — this keeps the per-worker pickle payload small (no self.data).
         """
-        with h5py.File(self.precomputed_path, 'r') as hf:
-            sample = {
-                "types": torch.from_numpy(hf["types"][idx]).long(),         # [K]
-                "indices": torch.from_numpy(hf["indices"][idx]).long(),     # [K]
-                "hops": torch.from_numpy(hf["hops"][idx]).long(),           # [K]
-                "times": torch.from_numpy(hf["times"][idx]),         # [K]
-            }
-            offsets = hf["edges_offsets"]
-            edges_dset = hf["edges"]
-            start = offsets[idx]
-            end_ = offsets[idx+1]
-            if start == end_:
-                eidx = torch.zeros((2, 0), dtype=torch.long)
-            else:
-                edge_np = edges_dset[:, start:end_]
-                eidx = torch.from_numpy(edge_np).long()
-            sample["edge_index"] = eidx
+        sample = {
+            "types": torch.from_numpy(self._cached_types[idx].copy()).long(),
+            "indices": torch.from_numpy(self._cached_indices[idx].copy()).long(),
+            "hops": torch.from_numpy(self._cached_hops[idx].copy()).long(),
+            "times": torch.from_numpy(self._cached_times[idx].copy()).float(),
+        }
+        start = int(self._cached_edge_offsets[idx])
+        end_ = int(self._cached_edge_offsets[idx + 1])
+        if start == end_:
+            eidx = torch.zeros((2, 0), dtype=torch.long)
+        else:
+            eidx = torch.from_numpy(self._cached_edges[:, start:end_].copy()).long()
+        sample["edge_index"] = eidx
 
         # retrieve label from self.target
         label = self.target[idx] if self.target is not None else None
-        
+
         # needed for global module
         sample["first_type"] = sample["types"][0].item()
         sample["first_index"] = sample["indices"][0].item()
 
-        sample["tfs"] = [
-            self.data[self.index_to_node_type[t.item()]].tf[i.item()]
-            for t, i in zip(sample["types"], sample["indices"])
-        ]
-        
         # store the "global index" for ordering
-        # 'idx' is the local index within this split, but effectively
-        # it's a stable ID for the sample's row 
         # used during evaluation/test to match predictions to the original table
         sample["global_idx"] = idx
         return sample, label
 
     def collate(self, batch: List[Tuple[dict, Optional[torch.Tensor]]]):
-        samples, labels = zip(*batch)  
-        
+        """Collate samples into a batch.
+
+        This method is intentionally lightweight — it only stacks tensors and
+        builds edge indices.  TensorFrame grouping (which requires self.data)
+        is deferred to ``enrich_batch()`` so that DataLoader *workers* never
+        need to pickle the full HeteroData graph.
+        """
+        samples, labels = zip(*batch)
+
         neighbor_types = torch.stack([s["types"] for s in samples], dim=0)  # [B, K]
         neighbor_indices = torch.stack([s["indices"] for s in samples], dim=0)
         neighbor_hops = torch.stack([s["hops"] for s in samples], dim=0)
@@ -1122,7 +1156,7 @@ class RelGTTokens(Dataset):
             "neighbor_types": neighbor_types,
             "neighbor_indices": neighbor_indices,
             "neighbor_hops": neighbor_hops,
-            "neighbor_times": neighbor_times
+            "neighbor_times": neighbor_times,
         }
 
         # labels if available
@@ -1132,76 +1166,76 @@ class RelGTTokens(Dataset):
             out["labels"] = None
 
         # global node indices for the seed node (the first token)
-        # needed for global module
         first_types = [s["first_type"] for s in samples]
         first_indices = [s["first_index"] for s in samples]
         out["node_indices"] = torch.tensor(
             self.get_global_index(first_types, first_indices),
-            dtype=torch.long
+            dtype=torch.long,
         )
 
-        B, K = neighbor_types.shape
-        grouped_tfs = {}
-        grouped_positions = {}
-        for t_id in range(len(self.node_types)):
-            # For each possible type, find which neighbors are that type
-            mask = (neighbor_types == t_id)
-            if not mask.any():
-                continue
-            
-            local_idxs = neighbor_indices[mask]  # 1D, length = #neighbors-of-this-type
-            type_str = self.index_to_node_type[t_id]
+        global_idxs = torch.tensor(
+            [s["global_idx"] for s in samples], dtype=torch.long
+        )
+        out["global_idx"] = global_idxs
 
-            # an offset for each [b, k]
-            # 'torch.nonzero(mask, as_tuple=False)' gives shape [N, 2] with (b, k)
-            offsets_list = []
-            positions_2d = torch.nonzero(mask, as_tuple=False)
-            for (b, k) in positions_2d.tolist():
-                offset = b * K + k   # Flatten (b, k) into one integer
-                offsets_list.append(offset)
-
-            grouped_tfs[t_id] = self.data[type_str].tf[local_idxs]
-            grouped_positions[t_id] = offsets_list
-
-        flat_batch_idx = torch.arange(B).unsqueeze(1).expand(B, K).reshape(-1).tolist()
-        flat_nbr_idx = torch.arange(K).repeat(B).tolist()
-        
-        global_idxs = [s["global_idx"] for s in samples]
-        global_idxs = torch.tensor(global_idxs, dtype=torch.long)
-
-        out.update({
-            "grouped_tfs": grouped_tfs,
-            "grouped_indices": grouped_positions,
-            "flat_batch_idx": flat_batch_idx,
-            "flat_nbr_idx": flat_nbr_idx,
-            "global_idx": global_idxs,
-        })
-        
-        # handling for subgraph adjs for each sample in a batch
+        # --- subgraph edge batching ---
         batched_edges = []
         batch_vec = []
         node_offset = 0
 
         for i, sample in enumerate(samples):
             eidx = sample["edge_index"]  # shape [2, E_i]
-            K_i = sample["types"].size(0)  # # of nodes in this subgraph
+            K_i = sample["types"].size(0)
 
-            # shift
-            shifted = eidx + node_offset
-            batched_edges.append(shifted)
-
-            # fill 'batch' vector
-            sub_batch = torch.full((K_i,), i, dtype=torch.long)
-            batch_vec.append(sub_batch)
-
+            batched_edges.append(eidx + node_offset)
+            batch_vec.append(torch.full((K_i,), i, dtype=torch.long))
             node_offset += K_i
 
-        edge_index = torch.cat(batched_edges, dim=1) if batched_edges else torch.zeros((2,0), dtype=torch.long)
-        batch_out = torch.cat(batch_vec, dim=0) if batch_vec else torch.zeros((0,), dtype=torch.long)
-
-        out.update({
-            "edge_index": edge_index,  # shape [2, total_E]
-            "batch": batch_out         # shape [total_nodes]
-        })
+        out["edge_index"] = (
+            torch.cat(batched_edges, dim=1) if batched_edges
+            else torch.zeros((2, 0), dtype=torch.long)
+        )
+        out["batch"] = (
+            torch.cat(batch_vec, dim=0) if batch_vec
+            else torch.zeros((0,), dtype=torch.long)
+        )
 
         return out
+
+    def enrich_batch(self, batch: dict) -> dict:
+        """Add TensorFrame features to a collated batch.
+
+        Must be called in the **main process** (after the DataLoader returns
+        the batch) so that self.data is available without pickling it to
+        workers.
+        """
+        neighbor_types = batch["neighbor_types"]
+        neighbor_indices = batch["neighbor_indices"]
+        B, K = neighbor_types.shape
+
+        grouped_tfs = {}
+        grouped_positions = {}
+        for t_id in range(len(self.node_types)):
+            mask = (neighbor_types == t_id)
+            if not mask.any():
+                continue
+
+            local_idxs = neighbor_indices[mask]
+            type_str = self.index_to_node_type[t_id]
+
+            positions_2d = torch.nonzero(mask, as_tuple=False)
+            offsets_list = (positions_2d[:, 0] * K + positions_2d[:, 1]).tolist()
+
+            grouped_tfs[t_id] = self.data[type_str].tf[local_idxs]
+            grouped_positions[t_id] = offsets_list
+
+        flat_batch_idx = torch.arange(B).unsqueeze(1).expand(B, K).reshape(-1).tolist()
+        flat_nbr_idx = torch.arange(K).repeat(B).tolist()
+
+        batch.update({
+            "grouped_tfs": grouped_tfs,
+            "grouped_indices": grouped_positions,
+            "flat_batch_idx": flat_batch_idx,
+            "flat_nbr_idx": flat_nbr_idx,
+        })
+        return batch
