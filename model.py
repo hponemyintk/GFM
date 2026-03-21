@@ -48,7 +48,6 @@ class RelGTLayer(nn.Module):
         self.num_centroids = num_centroids
         self._alpha = None
         self.sample_node_len = sample_node_len
-        self.vq_accumulate = False
 
         self.local_module = LocalModule(
             seq_len=self.sample_node_len,
@@ -136,7 +135,7 @@ class RelGTLayer(nn.Module):
         centroid_count = torch.zeros(self.num_centroids, dtype=torch.long).to(x.device)
         centroid_count[c.to(torch.long)] = c_count
 
-        dots = dots + torch.log(centroid_count.float().clamp(min=1).view(1, 1, -1))
+        dots = dots + torch.log(centroid_count.view(1, 1, -1))
 
         attn = self.attn_fn(dots, dim=-1)
         attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
@@ -146,10 +145,7 @@ class RelGTLayer(nn.Module):
 
         # Update the centroids
         if self.training:
-            if self.vq_accumulate:
-                x_idx = self.vq.accumulate(q_x)
-            else:
-                x_idx = self.vq.update(q_x)
+            x_idx = self.vq.update(q_x)
             self.c_idx[batch_idx] = x_idx.squeeze().to(torch.long)
 
         return out
@@ -285,25 +281,7 @@ class RelGT(torch.nn.Module):
 
         self.head.reset_parameters()
 
-    def set_vq_accumulate(self, enable):
-        """Enable/disable VQ accumulation mode on all global layers."""
-        for conv in self.convs:
-            if conv.conv_type != "local":
-                conv.vq_accumulate = enable
-
-    def start_vq_accumulation(self):
-        """Reset VQ accumulation buffers on all global layers."""
-        for conv in self.convs:
-            if conv.conv_type != "local":
-                conv.vq.start_accumulation()
-
-    def flush_vq_accumulation(self):
-        """Apply one EMA update from accumulated VQ statistics on all global layers."""
-        for conv in self.convs:
-            if conv.conv_type != "local":
-                conv.vq.flush_accumulation()
-
-    def forward(self,
+    def forward(self, 
                 neighbor_types,
                 node_indices,
                 neighbor_hops,

@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Run script for single-GPU training (tested on RTX 5070 12GB)
-# Usage: ./run.sh [dataset] [task] [batch_size] [epochs] [num_gpus]
-# Examples:
-#   ./run.sh rel-f1 driver-position 32 10       # single GPU
-#   ./run.sh rel-amazon user-churn 32 10 4      # 4 GPUs
+# Run script for single RTX 5070 (12GB VRAM)
+# Model size kept at 512 channels, batch size reduced to fit in memory
 
 export PATH=~/miniforge3/bin:$PATH
 source ~/miniforge3/etc/profile.d/conda.sh
@@ -11,22 +8,20 @@ conda activate gt
 
 DATASET="${1:-rel-f1}"
 TASK="${2:-driver-top3}"
-# DATASET="${1:-rel-hm}"
-# TASK="${2:-user-churn}"
 BATCH_SIZE="${3:-32}"
 EPOCHS="${4:-10}"
-NUM_GPUS="${5:-1}"
 
 LOG_DIR="logs"
 mkdir -p "${LOG_DIR}"
-LOG_FILE="${LOG_DIR}/${DATASET}_${TASK}_bs${BATCH_SIZE}_gpu${NUM_GPUS}_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/${DATASET}_${TASK}_bs${BATCH_SIZE}_$(date +%Y%m%d_%H%M%S).log"
 
-echo "Running: dataset=$DATASET task=$TASK batch_size=$BATCH_SIZE epochs=$EPOCHS gpus=$NUM_GPUS"
+echo "Running: dataset=$DATASET task=$TASK batch_size=$BATCH_SIZE epochs=$EPOCHS"
 echo "Logging to: $LOG_FILE"
 
 WANDB_MODE="${WANDB_MODE:-disabled}" \
+CUDA_VISIBLE_DEVICES=0 \
 torchrun \
-    --nproc_per_node="${NUM_GPUS}" \
+    --nproc_per_node=1 \
     --master_port=29500 \
     main_node_ddp.py \
     --dataset "${DATASET}" \
@@ -40,9 +35,8 @@ torchrun \
     --channels 512 \
     --num_centroids 4096 \
     --max_steps_per_epoch 3000 \
-    --num_workers 2 \
+    --num_workers 8 \
     --epochs "${EPOCHS}" \
-    --amp --amp_dtype bfloat16 \
     --lr 0.0001 \
     --warmup_steps 100 \
     --ff_dropout 0.3 \

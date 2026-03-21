@@ -3,7 +3,6 @@ import math
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 class LocalModule(nn.Module):
     def __init__(
@@ -47,8 +46,7 @@ class LocalModule(nn.Module):
         self.final_ln = nn.LayerNorm(hidden_dim)
 
         self.attn_layer = nn.Linear(2 * hidden_dim, 1)
-        self.gradient_checkpointing = False
-
+        
     def reset_parameters(self):
         self.att_embeddings_nope.reset_parameters()
         self.attn_layer.reset_parameters()
@@ -61,10 +59,7 @@ class LocalModule(nn.Module):
 
         # transformer encoder
         for enc_layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                tensor = checkpoint(enc_layer, tensor, use_reentrant=False)
-            else:
-                tensor = enc_layer(tensor)
+            tensor = enc_layer(tensor)
 
         output = self.final_ln(tensor)
         
@@ -91,7 +86,7 @@ class LocalModule(nn.Module):
         neighbor_tensor = neighbor_tensor * layer_atten
         neighbor_tensor = torch.sum(neighbor_tensor, dim=1, keepdim=True)
 
-        output = (node_tensor + neighbor_tensor).squeeze(1)
+        output = (node_tensor + neighbor_tensor).squeeze()
 
         return output
 
