@@ -673,25 +673,20 @@ class RelGTTokens(Dataset):
         self.train_stage = train_stage
 
         if self.precompute:
+            # DDP safety: only rank 0 precomputes, others wait
             rank = int(os.environ.get("RANK", 0))
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
             if os.path.exists(self.precomputed_path):
                 print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
-            elif world_size > 1 and torch.distributed.is_initialized():
-                # All ranks participate in distributed precomputation
-                print(f"[{self.split}] Rank {rank}: distributed precomputation (K={self.K})...")
-                self._precompute_sampling_distributed()
-            else:
-                # Single-GPU: original path
+            elif rank == 0:
                 print(f"[{self.split}] Precomputing neighbor sampling (K={self.K})...")
                 self._precompute_sampling()
-            # Final sync so all ranks see the HDF5 before proceeding
+            # Barrier: non-rank-0 processes wait for rank 0 to finish writing
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-                if not os.path.exists(self.precomputed_path):
+                device_id = int(os.environ.get("LOCAL_RANK", 0))
+                torch.distributed.barrier(device_ids=[device_id])
+                if rank != 0 and not os.path.exists(self.precomputed_path):
                     raise RuntimeError(
-                        f"Rank {rank}: HDF5 file not found after precomputation: "
-                        f"{self.precomputed_path}"
+                        f"Rank {rank}: HDF5 file not found after barrier: {self.precomputed_path}"
                     )
 
     def _create_global_mappings(self):
@@ -872,197 +867,6 @@ class RelGTTokens(Dataset):
         hrs, mins = divmod(mins, 60)
         print(f"[{self.split}] Sampling complete: {total} seeds in {int(hrs)}h {int(mins)}m {secs:.1f}s "
               f"(sampling: {time.time() - t_sample_start:.1f}s)")
-
-    def _precompute_sampling_distributed(self):
-        """
-        Distributed precomputation: each rank computes its shard of seeds,
-        writes to a temp .npz file, then rank 0 merges all shards into
-        the final HDF5.
-        """
-        import torch.distributed as dist
-
-        rank = int(os.environ.get("RANK", 0))
-        world_size = int(os.environ.get("WORLD_SIZE", 1))
-
-        total = len(self.node_idxs)
-        data_cpu = self.data.to("cpu")
-        t_total_start = time.time()
-
-        # All ranks build CSR adjacency (CPU work, fast)
-        t_csr_start = time.time()
-        csr_adj = build_adjacency_csr(data_cpu, undirected=self.undirected)
-        time_arrays = {}
-        for nt in data_cpu.node_types:
-            if hasattr(data_cpu[nt], "time"):
-                time_arrays[nt] = data_cpu[nt].time.numpy().copy()
-        all_nodes_compact = _build_all_nodes_compact(data_cpu)
-        print(f"[{self.split}] Rank {rank}: CSR built in {time.time() - t_csr_start:.1f}s")
-
-        # Build all tasks, then take this rank's shard
-        all_tasks = []
-        for i, node_idx_t in enumerate(self.node_idxs):
-            node_idx = node_idx_t.item()
-            seed_t = self.time[i].item() if self.time is not None else 0.0
-            seed_val = hash((self.node_type, node_idx, seed_t, self.K)) & 0xffffffff
-            all_tasks.append((self.K, self.node_type, node_idx, seed_t, seed_val, i))
-
-        my_tasks = all_tasks[rank::world_size]
-        shard_size = len(my_tasks)
-
-        num_workers = self.num_workers
-        if num_workers is None:
-            num_workers = max(1, min(cpu_count() - 1, shard_size))
-
-        chunksize = max(1, shard_size // (num_workers * 4))
-
-        print(f"[{self.split}] Rank {rank}: sampling {shard_size}/{total} seeds, "
-              f"K={self.K}, {num_workers} workers")
-        t_sample_start = time.time()
-
-        # Allocate shard arrays
-        shard_types = np.zeros((shard_size, self.K), dtype=np.int16)
-        shard_indices = np.zeros((shard_size, self.K), dtype=np.int32)
-        shard_hops = np.zeros((shard_size, self.K), dtype=np.int8)
-        shard_times = np.zeros((shard_size, self.K), dtype=np.float32)
-        shard_row_idxs = np.zeros(shard_size, dtype=np.int64)
-        shard_adjacency = [None] * shard_size
-
-        node_types = list(data_cpu.node_types)
-        ctx = get_context("fork")
-        with ctx.Pool(
-            processes=num_workers,
-            initializer=init_worker_globals,
-            initargs=(csr_adj, all_nodes_compact, node_types, time_arrays)
-        ) as pool:
-            for shard_idx, result in enumerate(tqdm(
-                pool.imap_unordered(_process_one_seed, my_tasks, chunksize=chunksize),
-                total=shard_size,
-                desc=f"Rank {rank} '{self.split}'",
-                disable=(rank != 0)
-            )):
-                row_idx, nt, idx, final_tokens, edge_index = result
-                shard_row_idxs[shard_idx] = row_idx
-                for j, (t_str, nbr_loc_idx, hop, t_val, c1hops) in enumerate(final_tokens):
-                    shard_types[shard_idx, j] = self.node_type_to_index[t_str]
-                    shard_indices[shard_idx, j] = nbr_loc_idx
-                    shard_hops[shard_idx, j] = hop
-                    shard_times[shard_idx, j] = t_val
-                shard_adjacency[shard_idx] = edge_index
-
-        print(f"[{self.split}] Rank {rank}: sampling done in "
-              f"{time.time() - t_sample_start:.1f}s")
-
-        # Pack adjacency edges into flat array with offsets
-        edge_counts = np.array(
-            [e.shape[1] if e is not None else 0 for e in shard_adjacency],
-            dtype=np.uint64
-        )
-        shard_edge_offsets = np.zeros(shard_size + 1, dtype=np.uint64)
-        np.cumsum(edge_counts, out=shard_edge_offsets[1:])
-        total_shard_edges = int(shard_edge_offsets[-1])
-
-        shard_edges = np.zeros((2, max(total_shard_edges, 1)), dtype=np.int16)
-        for i in range(shard_size):
-            e_arr = shard_adjacency[i]
-            start = int(shard_edge_offsets[i])
-            end_ = int(shard_edge_offsets[i + 1])
-            if e_arr is not None and e_arr.size > 0:
-                shard_edges[:, start:end_] = e_arr
-
-        # Write shard to temp .npz
-        shard_dir = os.path.dirname(self.precomputed_path)
-        shard_path = os.path.join(shard_dir, f".shard_{self.split}_{rank}.npz")
-        np.savez(
-            shard_path,
-            row_idxs=shard_row_idxs,
-            types=shard_types,
-            indices=shard_indices,
-            hops=shard_hops,
-            times=shard_times,
-            edges=shard_edges[:, :total_shard_edges],
-            edge_offsets=shard_edge_offsets
-        )
-        print(f"[{self.split}] Rank {rank}: shard written to {shard_path}")
-
-        # Wait for all ranks to finish writing shards
-        dist.barrier()
-
-        # Rank 0 merges all shards into the final HDF5
-        if rank == 0:
-            print(f"[{self.split}] Rank 0: merging {world_size} shards...")
-            t_merge_start = time.time()
-
-            all_types = np.zeros((total, self.K), dtype=np.int16)
-            all_indices = np.zeros((total, self.K), dtype=np.int32)
-            all_hops = np.zeros((total, self.K), dtype=np.int8)
-            all_times = np.zeros((total, self.K), dtype=np.float32)
-            all_adjacency = [None] * total
-
-            for r in range(world_size):
-                r_path = os.path.join(shard_dir, f".shard_{self.split}_{r}.npz")
-                shard = np.load(r_path)
-                r_row_idxs = shard["row_idxs"]
-                r_edges = shard["edges"]
-                r_edge_offsets = shard["edge_offsets"]
-
-                for si, row_idx in enumerate(r_row_idxs):
-                    ri = int(row_idx)
-                    all_types[ri] = shard["types"][si]
-                    all_indices[ri] = shard["indices"][si]
-                    all_hops[ri] = shard["hops"][si]
-                    all_times[ri] = shard["times"][si]
-
-                    start = int(r_edge_offsets[si])
-                    end_ = int(r_edge_offsets[si + 1])
-                    if start < end_:
-                        all_adjacency[ri] = r_edges[:, start:end_]
-
-                shard.close()
-                os.remove(r_path)
-
-            # Write final HDF5 atomically
-            tmp_path = self.precomputed_path + f".tmp.{os.getpid()}"
-            try:
-                with h5py.File(tmp_path, 'w') as hf:
-                    hf.create_dataset("types", data=all_types)
-                    hf.create_dataset("indices", data=all_indices)
-                    hf.create_dataset("hops", data=all_hops)
-                    hf.create_dataset("times", data=all_times)
-
-                    edge_counts = np.array(
-                        [e.shape[1] if e is not None else 0 for e in all_adjacency],
-                        dtype=np.uint64
-                    )
-                    offsets = np.zeros(total + 1, dtype=np.uint64)
-                    np.cumsum(edge_counts, out=offsets[1:])
-
-                    total_edges = int(offsets[-1])
-                    edges_dset = hf.create_dataset(
-                        "edges", shape=(2, total_edges), dtype='int16'
-                    )
-                    for i in range(total):
-                        e_arr = all_adjacency[i]
-                        start = int(offsets[i])
-                        end_ = int(offsets[i + 1])
-                        if e_arr is not None and e_arr.size > 0:
-                            edges_dset[:, start:end_] = e_arr
-
-                    hf.create_dataset("edges_offsets", data=offsets)
-
-                os.rename(tmp_path, self.precomputed_path)
-            except BaseException:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
-
-            print(f"[{self.split}] Merge complete in {time.time() - t_merge_start:.1f}s")
-
-        elapsed = time.time() - t_total_start
-        mins, secs = divmod(elapsed, 60)
-        hrs, mins = divmod(mins, 60)
-        if rank == 0:
-            print(f"[{self.split}] Distributed sampling complete: {total} seeds across "
-                  f"{world_size} ranks in {int(hrs)}h {int(mins)}m {secs:.1f}s")
 
     def __getitem__(self, idx: int):
         """
