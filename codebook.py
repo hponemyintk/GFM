@@ -67,6 +67,11 @@ class VectorQuantizerEMA(nn.Module):
         return self._embedding_output[:, : self._embedding_dim]
 
     def update(self, x):
+        # Force FP32 for codebook computations to keep EMA buffers precise
+        with torch.autocast("cuda", enabled=False):
+            return self._update_impl(x.float())
+
+    def _update_impl(self, x):
         inputs_normalized = self.bn(x)
         embedding_normalized = self._embedding
 
@@ -84,34 +89,35 @@ class VectorQuantizerEMA(nn.Module):
         )
         encodings.scatter_(1, encoding_indices, 1)
 
-        # Use EMA to update the embedding vectors
+        # Use EMA to update the embedding vectors (no grad needed — buffer updates only)
         if self.training:
-            encodings_sum = torch.sum(encodings, 0)
-            dw = torch.matmul(encodings.t(), inputs_normalized)
+            with torch.no_grad():
+                encodings_sum = torch.sum(encodings, 0)
+                dw = torch.matmul(encodings.t(), inputs_normalized)
 
-            # Sync raw statistics across DDP ranks before EMA update
-            if dist.is_initialized() and dist.get_world_size() > 1:
-                dist.all_reduce(encodings_sum, op=dist.ReduceOp.SUM)
-                dist.all_reduce(dw, op=dist.ReduceOp.SUM)
-                world_size = dist.get_world_size()
-                encodings_sum = encodings_sum / world_size
-                dw = dw / world_size
+                # Sync raw statistics across DDP ranks before EMA update
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    dist.all_reduce(encodings_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(dw, op=dist.ReduceOp.SUM)
+                    world_size = dist.get_world_size()
+                    encodings_sum /= world_size
+                    dw /= world_size
 
-            self._ema_cluster_size.data = self._ema_cluster_size * self._decay + (
-                1 - self._decay
-            ) * encodings_sum
+                self._ema_cluster_size.data = self._ema_cluster_size * self._decay + (
+                    1 - self._decay
+                ) * encodings_sum
 
-            # Laplace smoothing of the cluster size
-            n = torch.sum(self._ema_cluster_size.data)
-            self._ema_cluster_size.data = (
-                (self._ema_cluster_size + 1e-5) / (n + self._num_embeddings * 1e-5) * n
-            )
+                # Laplace smoothing of the cluster size
+                n = torch.sum(self._ema_cluster_size.data)
+                self._ema_cluster_size.data = (
+                    (self._ema_cluster_size + 1e-5) / (n + self._num_embeddings * 1e-5) * n
+                )
 
-            self._ema_w.data = self._ema_w * self._decay + (1 - self._decay) * dw
-            self._embedding.data = self._ema_w / self._ema_cluster_size.unsqueeze(1)
+                self._ema_w.data = self._ema_w * self._decay + (1 - self._decay) * dw
+                self._embedding.data = self._ema_w / self._ema_cluster_size.unsqueeze(1)
 
-            running_std = torch.sqrt(self.bn.running_var + 1e-5).unsqueeze(dim=0)
-            running_mean = self.bn.running_mean.unsqueeze(dim=0)
-            self._embedding_output.data = self._embedding * running_std + running_mean
+                running_std = torch.sqrt(self.bn.running_var + 1e-5).unsqueeze(dim=0)
+                running_mean = self.bn.running_mean.unsqueeze(dim=0)
+                self._embedding_output.data = self._embedding * running_std + running_mean
 
         return encoding_indices

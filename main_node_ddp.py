@@ -1,5 +1,6 @@
 import argparse
 import copy
+from contextlib import nullcontext
 import json
 import math
 import os
@@ -35,7 +36,7 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 ############################
 # 1. Parse arguments
@@ -78,6 +79,8 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+parser.add_argument("--amp", action="store_true", default=False,
+                    help="Enable BF16 mixed precision training")
 
 args = parser.parse_args()
 if args.sampling_workers is None:
@@ -309,17 +312,19 @@ def train_supervised(epoch) -> float:
         labels = batch["labels"].to(device)
 
         optimizer.zero_grad()
-        pred = model(
-            neighbor_types,
-            node_indices,
-            neighbor_hops,
-            neighbor_times,
-            grouped_tf_dict,
-            edge_index=edge_index,
-            batch=batch_vec
-        )
-        pred = pred.view(-1) if pred.size(1) == 1 else pred        
-        loss = loss_fn(pred.float(), labels)
+        amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.amp else nullcontext()
+        with amp_ctx:
+            pred = model(
+                neighbor_types,
+                node_indices,
+                neighbor_hops,
+                neighbor_times,
+                grouped_tf_dict,
+                edge_index=edge_index,
+                batch=batch_vec
+            )
+            pred = pred.view(-1) if pred.size(1) == 1 else pred
+            loss = loss_fn(pred.float(), labels)
         loss.backward()
         clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -367,21 +372,23 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
             'flat_batch_idx': batch['flat_batch_idx'],
             'flat_nbr_idx': batch['flat_nbr_idx']
         }
-        pred = eval_model(
-            neighbor_types,
-            node_indices,
-            neighbor_hops,
-            neighbor_times,
-            grouped_tf_dict,
-            edge_index=edge_index,
-            batch=batch_vec
-        )
+        amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.amp else nullcontext()
+        with amp_ctx:
+            pred = eval_model(
+                neighbor_types,
+                node_indices,
+                neighbor_hops,
+                neighbor_times,
+                grouped_tf_dict,
+                edge_index=edge_index,
+                batch=batch_vec
+            )
         if task.task_type == TaskType.REGRESSION:
             pred = torch.clamp(pred, clamp_min, clamp_max)
         if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
             pred = torch.sigmoid(pred)
         pred = pred.view(-1) if pred.size(1) == 1 else pred
-        pred_list.append(pred.detach().cpu().numpy())
+        pred_list.append(pred.detach().float().cpu().numpy())
         idx_list.append(batch["global_idx"].cpu().numpy())
     
     # Concatenate local predictions & indices

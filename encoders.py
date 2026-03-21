@@ -219,9 +219,10 @@ class NeighborTfsEncoder(nn.Module):
         N = len(flat_batch_idx)  # total flattened neighbors
         device = neighbor_types.device
 
-        # Pre-allocate an [N, channels] buffer 
+        # Pre-allocate an [N, channels] buffer
         # (Even if N==0, this works fine: shape is [0, channels].)
-        encoded_flat_tensor = torch.zeros((N, self.channels), device=device)
+        buf_dtype = torch.bfloat16 if torch.is_autocast_enabled() else torch.float32
+        encoded_flat_tensor = torch.zeros((N, self.channels), device=device, dtype=buf_dtype)
 
         # 1) Encode in one shot per node type
         for t_int, big_tf in grouped_tfs.items():
@@ -248,7 +249,7 @@ class NeighborTfsEncoder(nn.Module):
             encoded_flat_tensor[idx_tensor] = out_t
 
         # 2) Scatter [N, channels] -> [B, K, channels]
-        output = torch.zeros((B, K, self.channels), device=device)
+        output = torch.zeros((B, K, self.channels), device=device, dtype=buf_dtype)
         
         indices_i = torch.tensor(flat_batch_idx, dtype=torch.long, device=device)
         indices_j = torch.tensor(flat_nbr_idx,   dtype=torch.long, device=device)

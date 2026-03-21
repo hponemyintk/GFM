@@ -132,10 +132,10 @@ class RelGTLayer(nn.Module):
 
         c, c_count = self.c_idx.unique(return_counts=True)
 
-        centroid_count = torch.zeros(self.num_centroids, dtype=torch.long).to(x.device)
-        centroid_count[c.to(torch.long)] = c_count
+        centroid_count = torch.zeros(self.num_centroids, dtype=torch.float32, device=x.device)
+        centroid_count[c.to(torch.long)] = c_count.float()
 
-        dots = dots + torch.log(centroid_count.view(1, 1, -1))
+        dots = dots + torch.log(centroid_count.clamp(min=1).view(1, 1, -1))
 
         attn = self.attn_fn(dots, dim=-1)
         attn = F.dropout(attn, p=self.attn_dropout, training=self.training)

@@ -43,4 +43,5 @@ torchrun \
     --attn_dropout 0.3 \
     --run_name "relgt-l4-512-bs${BATCH_SIZE}" \
     --out_dir "results/relgt-l4-512-bs${BATCH_SIZE}" \
+    --amp \
     2>&1 | tee "${LOG_FILE}"
