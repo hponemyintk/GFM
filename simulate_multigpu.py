@@ -57,13 +57,7 @@ source = source.replace(
     'backend="gloo", timeout=timedelta(hours=24)',
 )
 
-# Patch 6: DataLoader multiprocessing context — use fork instead of forkserver.
-# forkserver workers re-import everything from scratch (torch, h5py, etc.) which
-# is extremely slow with multiple ranks. fork is safe here because DataLoader
-# workers only read HDF5 (no CUDA ops).
-source = source.replace(
-    'multiprocessing_context="forkserver" if args.num_workers > 0 else None,',
-    'multiprocessing_context="fork" if args.num_workers > 0 else None,',
-)
+# Patch 6 is no longer needed — main_node_ddp.py now uses spawn by default.
+# (Previously patched forkserver→spawn to avoid SIGBUS from fork-after-CUDA.)
 
 exec(compile(source, "main_node_ddp.py", "exec"))

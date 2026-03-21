@@ -217,7 +217,10 @@ loader_train = DataLoader(
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
     pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
+    # spawn avoids SIGBUS: forkserver is lazily started, so by this point
+    # CUDA is already initialized and the server inherits corrupted state.
+    # spawn starts workers from scratch with no inherited CUDA context.
+    multiprocessing_context="spawn" if args.num_workers > 0 else None,
 )
 
 val_sampler = DistributedSampler(data["val"], shuffle=False, seed=args.seed, drop_last=False)
@@ -229,7 +232,7 @@ loader_val = DataLoader(
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
     pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
+    multiprocessing_context="spawn" if args.num_workers > 0 else None,
 )
 
 test_sampler = DistributedSampler(data["test"], shuffle=False, seed=args.seed, drop_last=False)
@@ -241,7 +244,7 @@ loader_test = DataLoader(
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
     pin_memory=True,
-    multiprocessing_context="forkserver" if args.num_workers > 0 else None,
+    multiprocessing_context="spawn" if args.num_workers > 0 else None,
 )
 
 
