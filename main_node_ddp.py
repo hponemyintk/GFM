@@ -41,7 +41,6 @@ from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
 from tabpfn import TabPFNClassifier, TabPFNRegressor
-from tabpfn.constants import ModelVersion
 
 torch.autograd.set_detect_anomaly(False)
 
@@ -511,24 +510,18 @@ def tabpfn_predict_shard(ctx_features, ctx_labels, test_features, task_type, n_e
     if task_type == TaskType.MULTILABEL_CLASSIFICATION:
         predictions = []
         for col in range(ctx_labels.shape[1]):
-            clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2_5)
-            clf.device = str(device)
-            clf.n_estimators = n_estimators
+            clf = TabPFNClassifier(device=str(device), n_estimators=n_estimators)
             clf.fit(ctx_features, ctx_labels[:, col])
             pred = clf.predict_proba(test_features)
             predictions.append(pred[:, 1] if pred.shape[1] == 2 else pred)
         return np.stack(predictions, axis=1)
     elif task_type == TaskType.BINARY_CLASSIFICATION:
-        clf = TabPFNClassifier.create_default_for_version(ModelVersion.V2_5)
-        clf.device = str(device)
-        clf.n_estimators = n_estimators
+        clf = TabPFNClassifier(device=str(device), n_estimators=n_estimators)
         clf.fit(ctx_features, ctx_labels.ravel())
         pred = clf.predict_proba(test_features)
         return pred[:, 1]
     elif task_type == TaskType.REGRESSION:
-        reg = TabPFNRegressor.create_default_for_version(ModelVersion.V2_5)
-        reg.device = str(device)
-        reg.n_estimators = n_estimators
+        reg = TabPFNRegressor(device=str(device), n_estimators=n_estimators)
         reg.fit(ctx_features, ctx_labels.ravel())
         pred = reg.predict(test_features)
         if clamp_min is not None:
