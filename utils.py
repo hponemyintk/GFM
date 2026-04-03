@@ -490,6 +490,11 @@ class RelGTTokens(Dataset):
         self.train_stage = train_stage
 
         if self.precompute:
+            if self.node_embeddings is not None and os.path.exists(self.precomputed_path):
+                # Stage 2: overwrite existing samples with similarity-based resampling
+                print(f"[{self.split}] Removing existing HDF5 for resampling: {self.precomputed_path}")
+                os.remove(self.precomputed_path)
+
             if os.path.exists(self.precomputed_path):
                 print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
             else:
@@ -529,17 +534,9 @@ class RelGTTokens(Dataset):
     def _construct_precomputed_path(self) -> str:
         if not self.precomputed_dir:
             raise ValueError("must provide a 'precomputed_dir' to store expansions.")
-        if self.node_embeddings is not None:
-            # Stage 2: include sampling params hash in path to avoid cache conflicts
-            import hashlib
-            param_str = f"fk{self.w_fk}_sim{self.w_sim}_rec{self.w_recency}_t{self.temperature}"
-            param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
-            subdir = f"{self.K}_weighted_{param_hash}"
-        else:
-            subdir = str(self.K)
         path = os.path.join(
             self.precomputed_dir,
-            subdir,
+            str(self.K),
             f"{self.split}.h5"
         )
         os.makedirs(os.path.dirname(path), exist_ok=True)
