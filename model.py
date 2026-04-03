@@ -32,6 +32,8 @@ class RelGTLayer(nn.Module):
         conv_type="local",
         num_centroids=None,
         sample_node_len=100,
+        local_attn_type="cross",
+        num_latent_tokens=32,
         **kwargs,
     ):
         super(RelGTLayer, self).__init__()
@@ -56,7 +58,9 @@ class RelGTLayer(nn.Module):
             num_heads=heads,
             hidden_dim=out_channels,
             dropout_rate=ff_dropout,
-            attention_dropout_rate=attn_dropout
+            attention_dropout_rate=attn_dropout,
+            local_attn_type=local_attn_type,
+            num_latent_tokens=num_latent_tokens,
         )
         self.layer_norm_local = nn.LayerNorm(out_channels)
 
@@ -181,6 +185,8 @@ class RelGT(torch.nn.Module):
         gnn_pe_dim : int = 0,
         num_centroids: int = 4096,
         sample_node_len: int = 100,
+        local_attn_type: str = "cross",
+        num_latent_tokens: int = 32,
         args: Any = None,
     ):
         super(RelGT, self).__init__()
@@ -238,6 +244,8 @@ class RelGT(torch.nn.Module):
                     conv_type=conv_type,
                     num_centroids=num_centroids,
                     sample_node_len=sample_node_len,
+                    local_attn_type=local_attn_type,
+                    num_latent_tokens=num_latent_tokens,
                 )
             )
             h_times = 2 if conv_type == "full" else 1

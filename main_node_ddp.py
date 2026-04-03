@@ -85,6 +85,11 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Enable BF16 mixed precision training")
+parser.add_argument("--local_attn_type", type=str, default="cross", choices=["self", "cross"],
+                    help="Local attention type: 'self' for standard self-attention, "
+                         "'cross' for Perceiver-style cross-attention bottleneck")
+parser.add_argument("--num_latent_tokens", type=int, default=32,
+                    help="Number of learnable latent tokens for cross-attention")
 
 args = parser.parse_args()
 if args.sampling_workers is None:
@@ -277,6 +282,8 @@ model = RelGT(
     gnn_pe_dim=args.gnn_pe_dim,
     num_centroids=args.num_centroids,
     sample_node_len=args.num_neighbors,
+    local_attn_type=args.local_attn_type,
+    num_latent_tokens=args.num_latent_tokens,
     args=args,
 ).to(device)
 
