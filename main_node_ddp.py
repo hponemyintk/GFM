@@ -474,11 +474,12 @@ def extract_all_features(loader: DataLoader, eval_model, desc="Extracting"):
                 grouped_tf_dict, edge_index=edge_index, batch=batch_vec
             )
         features_list.append(feats.float().cpu().numpy())
-        labels_list.append(batch["labels"].cpu().numpy())
+        if batch["labels"] is not None:
+            labels_list.append(batch["labels"].cpu().numpy())
         idx_list.append(batch["global_idx"].cpu().numpy())
 
     local_feats = np.concatenate(features_list, axis=0)
-    local_labels = np.concatenate(labels_list, axis=0)
+    local_labels = np.concatenate(labels_list, axis=0) if labels_list else None
     local_idxs = np.concatenate(idx_list, axis=0)
 
     gathered = [None for _ in range(world_size)] if local_rank == 0 else None
@@ -487,18 +488,21 @@ def extract_all_features(loader: DataLoader, eval_model, desc="Extracting"):
     if local_rank == 0:
         n_samples = len(loader.dataset)
         feat_dim = local_feats.shape[1]
-        label_shape = local_labels.shape[1:] if local_labels.ndim > 1 else ()
 
         all_feats = np.zeros((n_samples, feat_dim), dtype=np.float32)
-        all_labels = np.zeros((n_samples, *label_shape), dtype=np.float32)
+        has_labels = gathered[0][2] is not None
+        if has_labels:
+            label_shape = gathered[0][2].shape[1:] if gathered[0][2].ndim > 1 else ()
+            all_labels = np.zeros((n_samples, *label_shape), dtype=np.float32)
 
         for rank_data in gathered:
             g_idx, g_feats, g_labels = rank_data
             for i, idx in enumerate(g_idx):
                 all_feats[idx] = g_feats[i]
-                all_labels[idx] = g_labels[i]
+                if has_labels:
+                    all_labels[idx] = g_labels[i]
 
-        return all_feats, all_labels
+        return all_feats, all_labels if has_labels else None
     return None, None
 
 
