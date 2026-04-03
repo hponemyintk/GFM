@@ -40,6 +40,8 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
+os.environ.setdefault("TABPFN_MODEL_VERSION", "v2")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from tabpfn import TabPFNClassifier, TabPFNRegressor
 
 torch.autograd.set_detect_anomaly(False)
