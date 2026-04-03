@@ -24,6 +24,78 @@ from collections import defaultdict
 
 GLOBAL_ADJ = None
 GLOBAL_ALL_NODES = None
+GLOBAL_NODE_EMBEDDINGS = None
+GLOBAL_W_FK = 5.0
+GLOBAL_W_SIM = 2.0
+GLOBAL_W_REC = 1.0
+GLOBAL_TEMPERATURE = 1.0
+
+def precompute_node_embeddings(
+    data: HeteroData,
+    encoder_weights_path: str,
+    node_type_map: Dict[str, int],
+    col_names_dict,
+    col_stats_dict,
+    channels: int,
+    device: str = "cuda",
+    batch_size: int = 4096,
+) -> Dict[str, np.ndarray]:
+    """
+    Load trained NeighborTfsEncoder weights from a Stage 1 checkpoint,
+    encode all nodes per type on GPU, L2-normalize, return as numpy arrays.
+
+    Returns:
+        {node_type_str: np.ndarray of shape [num_nodes, channels]} with L2-normalized rows.
+    """
+    import torch_frame
+    from encoders import NeighborTfsEncoder
+
+    encoder = NeighborTfsEncoder(
+        channels=channels,
+        node_type_map=node_type_map,
+        col_names_dict=col_names_dict,
+        col_stats_dict=col_stats_dict,
+    )
+
+    checkpoint = torch.load(encoder_weights_path, map_location="cpu")
+    tfs_keys = {k.replace("tfs_encoder.", ""): v
+                for k, v in checkpoint.items() if k.startswith("tfs_encoder.")}
+    encoder.load_state_dict(tfs_keys)
+    encoder.to(device).eval()
+
+    node_embeddings = {}
+    with torch.no_grad():
+        for node_type in data.node_types:
+            if node_type not in encoder.encoders:
+                continue
+            tf = data[node_type].tf
+            num_nodes = data[node_type].num_nodes
+            all_embs = []
+
+            for start in range(0, num_nodes, batch_size):
+                end = min(start + batch_size, num_nodes)
+                batch_tf = tf[start:end].to(device=device)
+                # Clean NaN/Inf
+                for stype_key, tensor in batch_tf.feat_dict.items():
+                    if isinstance(tensor, torch.Tensor):
+                        batch_tf.feat_dict[stype_key] = torch.nan_to_num(
+                            tensor, nan=0.0, posinf=1e6, neginf=-1e6
+                        )
+
+                out = encoder.encoders[node_type](batch_tf)
+                if out.dim() == 3:
+                    out = out.squeeze(1)
+                all_embs.append(out.cpu())
+
+            embs = torch.cat(all_embs, dim=0).numpy()  # [num_nodes, channels]
+            norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+            node_embeddings[node_type] = (embs / norms).astype(np.float32)
+
+    total_nodes = sum(v.shape[0] for v in node_embeddings.values())
+    print(f"[precompute_node_embeddings] Encoded {total_nodes} nodes "
+          f"across {len(node_embeddings)} types, dim={channels}")
+    return node_embeddings
+
 
 class GloveTextEmbedding:
         def __init__(self, device: torch.device):
@@ -38,22 +110,29 @@ def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
         for node_type in hetero_data.node_types
     }
     for edge_type in hetero_data.edge_types:
-        src_type, _, dst_type = edge_type
+        src_type, rel_name, dst_type = edge_type
         if 'edge_index' not in hetero_data[edge_type]:
             continue
         edge_index = hetero_data[edge_type].edge_index
         src_list = edge_index[0].tolist()
         dst_list = edge_index[1].tolist()
         for s, d in zip(src_list, dst_list):
-            adjacency[src_type][s].add((dst_type, d))
+            adjacency[src_type][s].add((dst_type, d, rel_name))
             if undirected:
-                adjacency[dst_type][d].add((src_type, s))
+                rev_rel = ("rev_" + rel_name) if not rel_name.startswith("rev_") else rel_name[4:]
+                adjacency[dst_type][d].add((src_type, s, rev_rel))
     return adjacency
 
-def init_worker_globals(adj, all_nodes):
-    global GLOBAL_ADJ, GLOBAL_ALL_NODES
+def init_worker_globals(adj, all_nodes, node_embeddings=None, w_fk=5.0, w_sim=2.0, w_rec=1.0, temperature=1.0):
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_NODE_EMBEDDINGS
+    global GLOBAL_W_FK, GLOBAL_W_SIM, GLOBAL_W_REC, GLOBAL_TEMPERATURE
     GLOBAL_ADJ = adj
     GLOBAL_ALL_NODES = all_nodes
+    GLOBAL_NODE_EMBEDDINGS = node_embeddings
+    GLOBAL_W_FK = w_fk
+    GLOBAL_W_SIM = w_sim
+    GLOBAL_W_REC = w_rec
+    GLOBAL_TEMPERATURE = temperature
 
 
 def gather_1_and_2_hop_with_seed_time(
@@ -64,14 +143,14 @@ def gather_1_and_2_hop_with_seed_time(
     seed_time: float,
     max_1hop_threshold: int = 5000,
     max_2hop_threshold: int = 1000
-) -> List[Tuple[str, int, int, float, Optional[set]]]:
+) -> List[Tuple[str, int, int, float, Optional[set], bool]]:
     """
     Gather 1-hop and 2-hop neighbors with time condition.
 
     Returns:
-        neighbors_with_time: List of tuples:
-            (nbr_t, nbr_i, hop, relative_time_days, None) for 1-hop
-            (nbr_t, nbr_i, hop, relative_time_days, connecting_1hop_tuple) for 2-hop
+        neighbors_with_time: List of 6-tuples:
+            (nbr_t, nbr_i, hop, relative_time_days, None, is_fk_parent) for 1-hop
+            (nbr_t, nbr_i, hop, relative_time_days, connecting_1hop_set, False) for 2-hop
     """
     # Gather 1-hop neighbors satisfying the time condition
     n1_full = adjacency[node_type][node_idx]
@@ -79,14 +158,24 @@ def gather_1_and_2_hop_with_seed_time(
         n1_full = random.sample(list(n1_full), max_1hop_threshold)
     else:
         n1_full = list(n1_full)
-        
-    n1 = set()
-    for (nbr_t, nbr_i) in n1_full:
+
+    # n1: maps (nbr_t, nbr_i) -> is_fk_parent
+    n1 = {}
+    for (nbr_t, nbr_i, rel_name) in n1_full:
         if hasattr(data[nbr_t], "time"):
             if data[nbr_t].time[nbr_i] <= seed_time:
-                n1.add((nbr_t, nbr_i))
+                is_fk = rel_name.startswith("f2p_")
+                # If already present as FK parent, keep that (don't downgrade)
+                if (nbr_t, nbr_i) in n1:
+                    n1[(nbr_t, nbr_i)] = n1[(nbr_t, nbr_i)] or is_fk
+                else:
+                    n1[(nbr_t, nbr_i)] = is_fk
         else:
-            n1.add((nbr_t, nbr_i))
+            is_fk = rel_name.startswith("f2p_")
+            if (nbr_t, nbr_i) in n1:
+                n1[(nbr_t, nbr_i)] = n1[(nbr_t, nbr_i)] or is_fk
+            else:
+                n1[(nbr_t, nbr_i)] = is_fk
 
     # Gather 2-hop neighbors satisfying the time condition
     n2 = defaultdict(set)  # Map 2-hop neighbor to set of connecting 1-hop neighbors
@@ -96,8 +185,8 @@ def gather_1_and_2_hop_with_seed_time(
             nbr2_full = random.sample(list(nbr2_full), max_2hop_threshold)
         else:
             nbr2_full = list(nbr2_full)
-            
-        for (nbr2_t, nbr2_i) in nbr2_full:
+
+        for (nbr2_t, nbr2_i, _rel) in nbr2_full:
             # Skip if we loop back to the original node
             if (nbr2_t, nbr2_i) == (node_type, node_idx):
                 continue
@@ -113,14 +202,13 @@ def gather_1_and_2_hop_with_seed_time(
     neighbors_with_time = []
 
     # Process 1-hop neighbors with hop distance 1
-    for (nbr_t, nbr_i) in n1:
+    for (nbr_t, nbr_i), is_fk_parent in n1.items():
         if hasattr(data[nbr_t], "time"):
             nbr_time = data[nbr_t].time[nbr_i].item()
             relative_time_days = (seed_time - nbr_time) / (60 * 60 * 24)
         else:
             relative_time_days = 0  # no time entities
-        # Append tuple with hop level 1 and no connecting 1-hop neighbor
-        neighbors_with_time.append((nbr_t, nbr_i, 1, relative_time_days, None))
+        neighbors_with_time.append((nbr_t, nbr_i, 1, relative_time_days, None, is_fk_parent))
 
     # Process 2-hop neighbors with hop distance 2
     for (nbr2_t, nbr2_i), connecting_1hops in n2.items():
@@ -129,8 +217,7 @@ def gather_1_and_2_hop_with_seed_time(
             relative_time_days = (seed_time - nbr2_time) / (60 * 60 * 24)
         else:
             relative_time_days = 0  # no time entities
-        # If multiple connecting 1-hop neighbors, we will handle in sampling
-        neighbors_with_time.append((nbr2_t, nbr2_i, 2, relative_time_days, connecting_1hops))
+        neighbors_with_time.append((nbr2_t, nbr2_i, 2, relative_time_days, connecting_1hops, False))
 
     return neighbors_with_time
 
@@ -139,13 +226,19 @@ def _process_one_seed(args):
     Worker function: gather neighbors for a single seed node + time,
     perform local nodes expansions up to K, apply fallback if necessary,
     then return a final list of neighbor tokens.
+
+    When GLOBAL_NODE_EMBEDDINGS is not None (Stage 2), uses three-tier
+    weighted sampling (FK parent > similarity > recency).
+    Otherwise falls back to uniform sampling (Stage 1).
     """
-    global GLOBAL_ADJ, GLOBAL_ALL_NODES
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_NODE_EMBEDDINGS
+    global GLOBAL_W_FK, GLOBAL_W_SIM, GLOBAL_W_REC, GLOBAL_TEMPERATURE
 
     (data, K, seed_node_type, seed_node_idx, seed_time, seed_val) = args
     random.seed(seed_val)
+    np_rng = np.random.RandomState(seed_val)
 
-    # 1. gather 1-hop and 2-hop
+    # 1. gather 1-hop and 2-hop (returns 6-tuples with is_fk_parent)
     T_hat = gather_1_and_2_hop_with_seed_time(
         GLOBAL_ADJ, data, seed_node_type, seed_node_idx, seed_time
     )
@@ -158,13 +251,8 @@ def _process_one_seed(args):
     two_hop_neighbors = [n for n in T_hat_list if n[2] == 2]
     combined_neighbors = one_hop_neighbors + two_hop_neighbors
 
-    # 2. If we have enough neighbors => random.sample
-    #    If not => random.choices
-    if size_th >= K_minus_1:
-        chosen_neighbors = random.sample(combined_neighbors, K_minus_1)
-    elif 0 < size_th < K_minus_1:
-        chosen_neighbors = random.choices(combined_neighbors, k=K_minus_1)
-    else:
+    # 2. Sample neighbors
+    if size_th == 0:
         # fallback from GLOBAL_ALL_NODES
         if K_minus_1 <= len(GLOBAL_ALL_NODES):
             fallback = random.sample(GLOBAL_ALL_NODES, K_minus_1)
@@ -177,21 +265,66 @@ def _process_one_seed(args):
                 rel_time = (seed_time - ft_time) / (60 * 60 * 24)
             else:
                 rel_time = 0
-            chosen_neighbors.append((ft, fi, 3, rel_time, None))
+            chosen_neighbors.append((ft, fi, 3, rel_time, None, False))
+    elif GLOBAL_NODE_EMBEDDINGS is None:
+        # Stage 1: uniform sampling (original behavior)
+        if size_th >= K_minus_1:
+            chosen_neighbors = random.sample(combined_neighbors, K_minus_1)
+        else:
+            chosen_neighbors = random.choices(combined_neighbors, k=K_minus_1)
+    else:
+        # Stage 2: three-tier weighted sampling
+        seed_emb = GLOBAL_NODE_EMBEDDINGS.get(seed_node_type)
+        seed_vec = seed_emb[seed_node_idx] if seed_emb is not None else None
 
-    # 3. Build final_tokens with subgraph adj for the seed node and its chosen neighbors
+        scores = np.zeros(size_th, dtype=np.float64)
+        for idx, (nbr_t, nbr_i, hop, rel_time, c1hops, is_fk_parent) in enumerate(combined_neighbors):
+            # Tier 1: FK parent bonus
+            fk_bonus = 1.0 if is_fk_parent else 0.0
+
+            # Tier 2: Similarity (same type only; cross-type = 0)
+            sim = 0.0
+            if seed_vec is not None and nbr_t == seed_node_type:
+                nbr_emb = GLOBAL_NODE_EMBEDDINGS.get(nbr_t)
+                if nbr_emb is not None:
+                    sim = float(np.dot(seed_vec, nbr_emb[nbr_i]))
+                    sim = max(sim, 0.0)
+
+            # Tier 3: Recency (exp decay; more recent = higher score)
+            recency = np.exp(-0.01 * rel_time) if rel_time > 0 else 1.0
+
+            scores[idx] = GLOBAL_W_FK * fk_bonus + GLOBAL_W_SIM * sim + GLOBAL_W_REC * recency
+
+        # Softmax with temperature
+        scores = scores / GLOBAL_TEMPERATURE
+        scores -= scores.max()  # numerical stability
+        weights = np.exp(scores)
+        weights_sum = weights.sum()
+        if weights_sum > 0:
+            weights /= weights_sum
+        else:
+            weights = np.ones(size_th, dtype=np.float64) / size_th
+
+        if size_th >= K_minus_1:
+            chosen_idx = np_rng.choice(size_th, size=K_minus_1, replace=False, p=weights)
+        else:
+            chosen_idx = np_rng.choice(size_th, size=K_minus_1, replace=True, p=weights)
+        chosen_neighbors = [combined_neighbors[i] for i in chosen_idx]
+
+    # 3. Build final_tokens — drop is_fk_parent (6th element) for output
     final_tokens = []
     seed_token = (seed_node_type, seed_node_idx, 0, 0.0, 0)
     final_tokens.append(seed_token)
-    final_tokens.extend(chosen_neighbors)
-    
+    for (t_str, idx, hop, t_val, c1hops, _is_fk) in chosen_neighbors:
+        final_tokens.append((t_str, idx, hop, t_val, c1hops))
+
     # randomize order except keep seed first
     if len(final_tokens) > 1:
         first = final_tokens[0]
         rest = final_tokens[1:]
         rest = random.sample(rest, len(rest))
         final_tokens = [first] + rest
-        
+
     # build adjacency among these K nodes
     local_map = {}
     for j, (t_str, i, hop, t_val, c1hops) in enumerate(final_tokens):
@@ -199,7 +332,7 @@ def _process_one_seed(args):
 
     edges = []
     for j_src, (t_str, i, hop, t_val, c1hops) in enumerate(final_tokens):
-        for (nbr_t, nbr_i) in GLOBAL_ADJ[t_str][i]:
+        for (nbr_t, nbr_i, _rel) in GLOBAL_ADJ[t_str][i]:
             if (nbr_t, nbr_i) in local_map:
                 j_dst = local_map[(nbr_t, nbr_i)]
                 edges.append((j_src, j_dst))
@@ -218,11 +351,19 @@ def local_nodes_hetero(
     table_input_nodes: tuple,
     table_input_time: torch.Tensor,
     undirected: bool = True,
-    num_workers: int = None
+    num_workers: int = None,
+    node_embeddings: Dict[str, np.ndarray] = None,
+    w_fk: float = 5.0,
+    w_sim: float = 2.0,
+    w_recency: float = 1.0,
+    temperature: float = 1.0,
 ):
     """
     Produces a dictionary S[seed_node_type][idx] for each node in `table_input_nodes[1]`.
     local neighbor sampling up to 2-hop, with fallback if needed, in parallel.
+
+    When node_embeddings is provided (Stage 2), uses three-tier weighted sampling.
+    Otherwise uses uniform sampling (Stage 1).
     """
     global GLOBAL_ADJ, GLOBAL_ALL_NODES
 
@@ -267,7 +408,8 @@ def local_nodes_hetero(
     with Pool(
         processes=num_workers,
         initializer=init_worker_globals,
-        initargs=(adjacency, all_nodes_all_types)  # pass both adjacency and fallback
+        initargs=(adjacency, all_nodes_all_types, node_embeddings,
+                  w_fk, w_sim, w_recency, temperature)
     ) as pool:
         results = pool.map(_process_one_seed, tasks)
     t_sample = time.time() - t_sample_start
@@ -279,7 +421,8 @@ def local_nodes_hetero(
 
     t_total = time.time() - t_total_start
     num_seeds = len(seed_node_idxs)
-    print(f"  [Sampling] {num_seeds} seeds | adj: {t_adj:.2f}s | "
+    sampling_mode = "weighted" if node_embeddings is not None else "uniform"
+    print(f"  [Sampling:{sampling_mode}] {num_seeds} seeds | adj: {t_adj:.2f}s | "
           f"parallel sampling: {t_sample:.2f}s | total: {t_total:.2f}s | "
           f"{num_seeds/t_total:.0f} seeds/s")
 
@@ -300,7 +443,12 @@ class RelGTTokens(Dataset):
         num_workers: int = None,
         precompute: bool = True,
         precomputed_dir: str = None,
-        train_stage: str = "finetune"
+        train_stage: str = "finetune",
+        node_embeddings: Dict[str, np.ndarray] = None,
+        w_fk: float = 5.0,
+        w_sim: float = 2.0,
+        w_recency: float = 1.0,
+        temperature: float = 1.0,
     ):
         super().__init__()
         self.data = data
@@ -311,6 +459,11 @@ class RelGTTokens(Dataset):
         self.num_workers = num_workers
         self.precompute = precompute
         self.precomputed_dir = precomputed_dir
+        self.node_embeddings = node_embeddings
+        self.w_fk = w_fk
+        self.w_sim = w_sim
+        self.w_recency = w_recency
+        self.temperature = temperature
 
         # Retrieve the table and the seeds/targets
         self.table = self.task.get_table(split=self.split)
@@ -376,9 +529,17 @@ class RelGTTokens(Dataset):
     def _construct_precomputed_path(self) -> str:
         if not self.precomputed_dir:
             raise ValueError("must provide a 'precomputed_dir' to store expansions.")
+        if self.node_embeddings is not None:
+            # Stage 2: include sampling params hash in path to avoid cache conflicts
+            import hashlib
+            param_str = f"fk{self.w_fk}_sim{self.w_sim}_rec{self.w_recency}_t{self.temperature}"
+            param_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
+            subdir = f"{self.K}_weighted_{param_hash}"
+        else:
+            subdir = str(self.K)
         path = os.path.join(
             self.precomputed_dir,
-            str(self.K),
+            subdir,
             f"{self.split}.h5"
         )
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -440,7 +601,12 @@ class RelGTTokens(Dataset):
                         table_input_nodes=(self.node_type, chunk_node_idxs),
                         table_input_time=chunk_times,
                         undirected=self.undirected,
-                        num_workers=self.num_workers
+                        num_workers=self.num_workers,
+                        node_embeddings=self.node_embeddings,
+                        w_fk=self.w_fk,
+                        w_sim=self.w_sim,
+                        w_recency=self.w_recency,
+                        temperature=self.temperature,
                     )
 
                     # arrays to fill

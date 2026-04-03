@@ -33,7 +33,7 @@ from relbench.tasks import get_task
 
 # within this project
 from model import RelGT
-from utils import GloveTextEmbedding, RelGTTokens
+from utils import GloveTextEmbedding, RelGTTokens, precompute_node_embeddings
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -75,7 +75,12 @@ parser.add_argument(
     type=str,
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
-parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune", "similarity_resample"])
+parser.add_argument("--encoder_weights_path", type=str, default=None, help="Path to Stage 1 checkpoint for loading NeighborTfsEncoder weights")
+parser.add_argument("--w_fk", type=float, default=5.0, help="Weight for FK-parent priority in weighted sampling")
+parser.add_argument("--w_sim", type=float, default=2.0, help="Weight for similarity priority in weighted sampling")
+parser.add_argument("--w_recency", type=float, default=1.0, help="Weight for recency priority in weighted sampling")
+parser.add_argument("--temperature", type=float, default=1.0, help="Softmax temperature for weighted sampling")
 
 args = parser.parse_args()
 
@@ -130,7 +135,7 @@ except FileNotFoundError:
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
-data, col_stats_dict = make_pkey_fkey_graph(
+raw_data, col_stats_dict = make_pkey_fkey_graph(
     dataset.get_db(),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
@@ -139,17 +144,42 @@ data, col_stats_dict = make_pkey_fkey_graph(
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
 
+# Stage 2: pre-compute node embeddings from Stage 1 encoder weights
+node_embeddings = None
+if args.train_stage == "similarity_resample":
+    if args.encoder_weights_path is None:
+        raise ValueError("--encoder_weights_path is required for similarity_resample stage")
+    node_type_map = {nt: idx for idx, nt in enumerate(raw_data.node_types)}
+    col_names_dict = {
+        nt: raw_data[nt].tf.col_names_dict
+        for nt in raw_data.node_types if hasattr(raw_data[nt], 'tf')
+    }
+    node_embeddings = precompute_node_embeddings(
+        data=raw_data,
+        encoder_weights_path=args.encoder_weights_path,
+        node_type_map=node_type_map,
+        col_names_dict=col_names_dict,
+        col_stats_dict=col_stats_dict,
+        channels=args.channels,
+        device=f"cuda:{local_rank}",
+    )
+
 data = {
     split: RelGTTokens(
-        data=data, 
+        data=raw_data,
         task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
+        K=args.num_neighbors,
+        split=split,
+        undirected=True,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
         num_workers=args.num_workers,
-        train_stage=args.train_stage)
+        train_stage=args.train_stage,
+        node_embeddings=node_embeddings,
+        w_fk=args.w_fk,
+        w_sim=args.w_sim,
+        w_recency=args.w_recency,
+        temperature=args.temperature)
         for split in ["train", "val", "test"]
     }
 
@@ -457,7 +487,65 @@ if args.train_stage == "finetune":
             json.dump(best_metrics_dict, f, indent=4)
     
     if local_rank == 0:
-        print(f"[{args.train_stage.capitalize()} Stage] Training complete. No supervised evaluation performed.")
+        print(f"[{args.train_stage.capitalize()} Stage] Training complete.")
+
+elif args.train_stage == "similarity_resample":
+    # Stage 2: Train with similarity-based sampled neighbors
+    best_val_metric = -math.inf if higher_is_better else math.inf
+    state_dict = None
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_supervised(epoch)
+
+        dist.barrier()
+        eval_model = model.module
+
+        val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
+        if local_rank == 0:
+            val_metrics = task.evaluate(val_pred, task.get_table("val"))
+            print(f"[Stage2] Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
+            wandb.log({
+                "epoch": epoch,
+                "epoch_train_loss": train_loss,
+                **{f"val_{k}": v for k, v in val_metrics.items()}
+            })
+
+            if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
+                not higher_is_better and val_metrics[tune_metric] <= best_val_metric
+            ):
+                best_val_metric = val_metrics[tune_metric]
+                state_dict = copy.deepcopy(model.module.state_dict())
+                torch.save(state_dict, os.path.join(output_path, "similarity_resampled.pt"))
+        dist.barrier()
+
+    if local_rank == 0 and state_dict is not None:
+        model.module.load_state_dict(state_dict)
+    for param in model.parameters():
+        dist.broadcast(param.data, src=0)
+    for buf in model.buffers():
+        dist.broadcast(buf.data, src=0)
+    dist.barrier()
+
+    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
+    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+
+    if local_rank == 0:
+        val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
+        print(f"[Stage2] Best Val metrics: {val_metrics}")
+
+        test_metrics = task.evaluate(final_test_preds)
+        print(f"[Stage2] Best Test metrics: {test_metrics}")
+
+        best_metrics_dict = {
+            "val_metrics": val_metrics,
+            "test_metrics": test_metrics
+        }
+        file_path = os.path.join(output_path, str(args.seed) + ".json")
+        with open(file_path, "w") as f:
+            json.dump(best_metrics_dict, f, indent=4)
+
+    if local_rank == 0:
+        print(f"[Similarity_Resample Stage] Training complete.")
 
 
 ############################
