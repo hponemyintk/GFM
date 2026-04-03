@@ -111,6 +111,16 @@ class RelGTLayer(nn.Module):
 
         return out
 
+    def forward_features(self, x_set, x, node_indices):
+        """Returns (local_out, global_out) separately for feature extraction."""
+        local_out = None
+        global_out = None
+        if self.conv_type in ("local", "full"):
+            local_out = self.layer_norm_local(self.local_forward(x_set))
+        if self.conv_type in ("global", "full"):
+            global_out = self.layer_norm_global(self.global_forward(x, node_indices))
+        return local_out, global_out
+
     def global_forward(self, x, batch_idx):
         d, h = self.out_channels, self.heads
         scale = 1.0 / math.sqrt(d)
@@ -310,6 +320,49 @@ class RelGT(torch.nn.Module):
         x_set = self.head(x_set)
 
         return x_set
+
+    def extract_features(self,
+                         neighbor_types,
+                         node_indices,
+                         neighbor_hops,
+                         neighbor_times,
+                         grouped_tf_dict,
+                         edge_index=None,
+                         batch=None,
+                         ):
+        """Extract intermediate features for TabPFN ICL inference.
+
+        Returns concatenation of:
+        - mixed seed token (after in_mixture MLP)
+        - local attention output
+        - global attention output
+        Shape: [B, channels * num_components]
+        """
+        neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
+        neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+        neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
+
+        cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
+        if self.ablate_idx is not None:
+            cat_list.pop(self.ablate_idx)
+        x_set = torch.cat(cat_list, dim=-1)
+        x_set = self.in_mixture(x_set)
+
+        mixed_seed = x_set[:, 0, :]  # [B, channels]
+        x = mixed_seed
+
+        for conv in self.convs:
+            local_out, global_out = conv.forward_features(x_set, x, node_indices)
+
+        features = [mixed_seed]
+        if local_out is not None:
+            features.append(local_out)
+        if global_out is not None:
+            features.append(global_out)
+
+        return torch.cat(features, dim=-1)
 
     def global_forward(self, x, pos_enc, node_indices):
         raise NotImplementedError

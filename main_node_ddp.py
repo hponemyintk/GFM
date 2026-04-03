@@ -1,5 +1,6 @@
 import argparse
 import copy
+import gc
 import json
 import math
 import os
@@ -48,7 +49,7 @@ parser.add_argument("--lr", type=float, default=0.0001)
 parser.add_argument("--warmup_steps", type=int, default=1000)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--batch_size", type=int, default=512)
-parser.add_argument("--channels", type=int, default=512)
+parser.add_argument("--channels", type=int, default=168)
 parser.add_argument("--aggr", type=str, default="sum")
 parser.add_argument("--num_layers", type=int, default=1)
 parser.add_argument("--num_heads", type=int, default=4)
@@ -76,6 +77,10 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+parser.add_argument("--tabpfn_icl", type=bool, default=True,
+                    help="Run TabPFN ICL inference after training (default: True)")
+parser.add_argument("--tabpfn_max_train_samples", type=int, default=10000,
+                    help="Max train samples for TabPFN context (downsample if exceeded)")
 
 args = parser.parse_args()
 
@@ -397,6 +402,65 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     else:
         return None
 
+@torch.no_grad()
+def extract_all_features(loader: DataLoader, eval_model, desc) -> tuple:
+    """Extract intermediate features from the model for TabPFN ICL inference."""
+    if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
+        loader.sampler.set_epoch(0)
+
+    eval_model.eval()
+    feat_list = []
+    label_list = []
+    idx_list = []
+
+    for batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
+        neighbor_types = batch["neighbor_types"].to(device)
+        node_indices = batch["node_indices"].to(device)
+        neighbor_hops = batch["neighbor_hops"].to(device)
+        neighbor_times = batch["neighbor_times"].to(device)
+        edge_index = batch["edge_index"].to(device)
+        batch_vec = batch["batch"].to(device)
+
+        grouped_tf_dict = {
+            'grouped_tfs': batch['grouped_tfs'],
+            'grouped_indices': batch['grouped_indices'],
+            'flat_batch_idx': batch['flat_batch_idx'],
+            'flat_nbr_idx': batch['flat_nbr_idx']
+        }
+        features = eval_model.extract_features(
+            neighbor_types,
+            node_indices,
+            neighbor_hops,
+            neighbor_times,
+            grouped_tf_dict,
+            edge_index=edge_index,
+            batch=batch_vec
+        )
+        feat_list.append(features.cpu().numpy())
+        label_list.append(batch["labels"].numpy())
+        idx_list.append(batch["global_idx"].numpy())
+
+    local_feats = np.concatenate(feat_list, axis=0) if feat_list else np.empty((0, 0))
+    local_labels = np.concatenate(label_list, axis=0) if label_list else np.array([])
+    local_idxs = np.concatenate(idx_list, axis=0) if idx_list else np.array([])
+
+    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    dist.gather_object((local_idxs, local_feats, local_labels), object_gather_list=gathered, dst=0)
+
+    if local_rank == 0:
+        feat_dim = gathered[0][1].shape[1] if gathered[0][1].ndim == 2 else 0
+        all_feats = np.zeros((len(loader.dataset), feat_dim))
+        all_labels = np.zeros(len(loader.dataset))
+        for i in range(world_size):
+            g_idx, g_feat, g_label = gathered[i]
+            for j, idx in enumerate(g_idx):
+                all_feats[idx] = g_feat[j]
+                all_labels[idx] = g_label[j]
+        return all_feats, all_labels
+    else:
+        return None, None
+
+
 if args.train_stage == "finetune":
     # Supervised Finetuning Stage:
     best_val_metric = -math.inf if higher_is_better else math.inf
@@ -461,7 +525,63 @@ if args.train_stage == "finetune":
             json.dump(best_metrics_dict, f, indent=4)
     
     if local_rank == 0:
-        print(f"[{args.train_stage.capitalize()} Stage] Training complete. No supervised evaluation performed.")
+        print(f"[{args.train_stage.capitalize()} Stage] Training complete.")
+
+    ############################
+    # TabPFN ICL Inference
+    ############################
+    if args.tabpfn_icl and task.task_type in (TaskType.BINARY_CLASSIFICATION, TaskType.REGRESSION):
+        if local_rank == 0:
+            print("Starting TabPFN ICL feature extraction...")
+
+        train_feats, train_labels = extract_all_features(
+            loader_dict["train"], model.module, "Extract Train Features")
+        test_feats, _ = extract_all_features(
+            loader_dict["test"], model.module, "Extract Test Features")
+
+        # Clean GPU memory
+        del model, optimizer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        if local_rank == 0:
+            from tabpfn import TabPFNClassifier, TabPFNRegressor
+
+            # Downsample train if needed
+            if len(train_feats) > args.tabpfn_max_train_samples:
+                rng = np.random.RandomState(args.seed)
+                idx = rng.choice(len(train_feats), args.tabpfn_max_train_samples, replace=False)
+                train_feats = train_feats[idx]
+                train_labels = train_labels[idx]
+                print(f"Downsampled train to {args.tabpfn_max_train_samples} samples")
+
+            print(f"TabPFN ICL: train={train_feats.shape}, test={test_feats.shape}")
+
+            if task.task_type == TaskType.BINARY_CLASSIFICATION:
+                tabpfn_model = TabPFNClassifier(device="cpu", ignore_pretraining_limits=True)
+                tabpfn_model.fit(train_feats, train_labels)
+                tabpfn_preds = tabpfn_model.predict_proba(test_feats)[:, 1]
+            elif task.task_type == TaskType.REGRESSION:
+                tabpfn_model = TabPFNRegressor(device="cpu", ignore_pretraining_limits=True)
+                tabpfn_model.fit(train_feats, train_labels)
+                tabpfn_preds = tabpfn_model.predict(test_feats)
+                tabpfn_preds = np.clip(tabpfn_preds, clamp_min, clamp_max)
+
+            tabpfn_metrics = task.evaluate(tabpfn_preds)
+            print(f"TabPFN ICL Test metrics: {tabpfn_metrics}")
+            wandb.log({f"tabpfn_test_{k}": v for k, v in tabpfn_metrics.items()})
+
+            # Append to results JSON
+            file_path = os.path.join(output_path, str(args.seed) + ".json")
+            with open(file_path, "r") as f:
+                results = json.load(f)
+            results["tabpfn_test_metrics"] = tabpfn_metrics
+            with open(file_path, "w") as f:
+                json.dump(results, f, indent=4)
+
+        dist.barrier()
+    elif args.tabpfn_icl and local_rank == 0:
+        print(f"Skipping TabPFN ICL: unsupported task type {task.task_type}")
 
 
 ############################
