@@ -40,6 +40,8 @@ from relbench.tasks import get_task
 from model import RelGT
 from utils import GloveTextEmbedding, RelGTTokens
 
+from tabpfn import TabPFNClassifier, TabPFNRegressor
+
 torch.autograd.set_detect_anomaly(False)
 
 ############################
@@ -85,6 +87,8 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Enable BF16 mixed precision training")
+parser.add_argument("--tabpfn_context_size", type=int, default=10000,
+                    help="Max training samples for TabPFN ICL context")
 
 args = parser.parse_args()
 if args.sampling_workers is None:
@@ -438,6 +442,125 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     else:
         return None
 
+############################
+# 7b. TabPFN ICL helpers
+############################
+@torch.no_grad()
+def extract_all_features(loader: DataLoader, eval_model, desc="Extracting"):
+    eval_model.eval()
+    features_list = []
+    labels_list = []
+    idx_list = []
+
+    for batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
+        neighbor_types = batch["neighbor_types"].to(device)
+        node_indices = batch["node_indices"].to(device)
+        neighbor_hops = batch["neighbor_hops"].to(device)
+        neighbor_times = batch["neighbor_times"].to(device)
+        edge_index = batch["edge_index"].to(device)
+        batch_vec = batch["batch"].to(device)
+
+        grouped_tf_dict = {
+            'grouped_tfs': batch['grouped_tfs'],
+            'grouped_indices': batch['grouped_indices'],
+            'flat_batch_idx': batch['flat_batch_idx'],
+            'flat_nbr_idx': batch['flat_nbr_idx']
+        }
+
+        amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.amp else nullcontext()
+        with amp_ctx:
+            feats = eval_model.extract_features(
+                neighbor_types, node_indices, neighbor_hops, neighbor_times,
+                grouped_tf_dict, edge_index=edge_index, batch=batch_vec
+            )
+        features_list.append(feats.float().cpu().numpy())
+        labels_list.append(batch["labels"].cpu().numpy())
+        idx_list.append(batch["global_idx"].cpu().numpy())
+
+    local_feats = np.concatenate(features_list, axis=0)
+    local_labels = np.concatenate(labels_list, axis=0)
+    local_idxs = np.concatenate(idx_list, axis=0)
+
+    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    dist.gather_object((local_idxs, local_feats, local_labels), object_gather_list=gathered, dst=0)
+
+    if local_rank == 0:
+        n_samples = len(loader.dataset)
+        feat_dim = local_feats.shape[1]
+        label_shape = local_labels.shape[1:] if local_labels.ndim > 1 else ()
+
+        all_feats = np.zeros((n_samples, feat_dim), dtype=np.float32)
+        all_labels = np.zeros((n_samples, *label_shape), dtype=np.float32)
+
+        for rank_data in gathered:
+            g_idx, g_feats, g_labels = rank_data
+            for i, idx in enumerate(g_idx):
+                all_feats[idx] = g_feats[i]
+                all_labels[idx] = g_labels[i]
+
+        return all_feats, all_labels
+    return None, None
+
+
+def tabpfn_predict_shard(ctx_features, ctx_labels, test_features, task_type, n_estimators):
+    if task_type == TaskType.MULTILABEL_CLASSIFICATION:
+        predictions = []
+        for col in range(ctx_labels.shape[1]):
+            clf = TabPFNClassifier(device=str(device), n_estimators=n_estimators)
+            clf.fit(ctx_features, ctx_labels[:, col])
+            pred = clf.predict_proba(test_features)
+            predictions.append(pred[:, 1] if pred.shape[1] == 2 else pred)
+        return np.stack(predictions, axis=1)
+    elif task_type == TaskType.BINARY_CLASSIFICATION:
+        clf = TabPFNClassifier(device=str(device), n_estimators=n_estimators)
+        clf.fit(ctx_features, ctx_labels.ravel())
+        pred = clf.predict_proba(test_features)
+        return pred[:, 1]
+    elif task_type == TaskType.REGRESSION:
+        reg = TabPFNRegressor(device=str(device), n_estimators=n_estimators)
+        reg.fit(ctx_features, ctx_labels.ravel())
+        pred = reg.predict(test_features)
+        if clamp_min is not None:
+            pred = np.clip(pred, clamp_min, clamp_max)
+        return pred
+
+
+def run_tabpfn_ddp(ctx_features, ctx_labels, all_test_features, task_type, n_estimators, desc="TabPFN"):
+    test_data = [None]
+    if local_rank == 0:
+        test_data[0] = all_test_features
+    dist.broadcast_object_list(test_data, src=0)
+    all_test = test_data[0]
+
+    n_total = len(all_test)
+    chunk_size = math.ceil(n_total / world_size)
+    start = local_rank * chunk_size
+    end = min(start + chunk_size, n_total)
+    local_test = all_test[start:end]
+
+    if local_rank == 0:
+        print(f"  {desc}: {n_total} samples, {chunk_size} per rank, n_estimators={n_estimators}")
+
+    if len(local_test) > 0:
+        local_preds = tabpfn_predict_shard(ctx_features, ctx_labels, local_test, task_type, n_estimators)
+    else:
+        local_preds = np.array([])
+
+    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    dist.gather_object((start, end, local_preds), object_gather_list=gathered, dst=0)
+
+    if local_rank == 0:
+        if local_preds.ndim > 1:
+            all_preds = np.zeros((n_total, local_preds.shape[1]), dtype=np.float32)
+        else:
+            all_preds = np.zeros(n_total, dtype=np.float32)
+        for s, e, preds in gathered:
+            if len(preds) > 0:
+                all_preds[s:e] = preds
+        return all_preds
+    return None
+
+
 if args.train_stage == "finetune":
     # Supervised Finetuning Stage:
     best_val_metric = -math.inf if higher_is_better else math.inf
@@ -502,7 +625,71 @@ if args.train_stage == "finetune":
             json.dump(best_metrics_dict, f, indent=4)
     
     if local_rank == 0:
-        print(f"[{args.train_stage.capitalize()} Stage] Training complete. No supervised evaluation performed.")
+        print(f"[{args.train_stage.capitalize()} Stage] Training complete.")
+
+    ############################
+    # TabPFN ICL Inference
+    ############################
+    if local_rank == 0:
+        print("\n--- TabPFN ICL Inference ---")
+        print("Extracting features from all splits...")
+
+    eval_model = model.module
+    train_feats, train_labels = extract_all_features(loader_dict["train"], eval_model, desc="Train features")
+    val_feats, val_labels = extract_all_features(loader_dict["val"], eval_model, desc="Val features")
+    test_feats, test_labels = extract_all_features(loader_dict["test"], eval_model, desc="Test features")
+
+    if local_rank == 0:
+        print(f"Train features: {train_feats.shape}, Val features: {val_feats.shape}, Test features: {test_feats.shape}")
+
+    # Prepare TabPFN context: rank 0 subsamples if needed, then broadcasts
+    ctx_data = [None]
+    if local_rank == 0:
+        if len(train_feats) > args.tabpfn_context_size:
+            rng = np.random.RandomState(args.seed)
+            indices = rng.choice(len(train_feats), args.tabpfn_context_size, replace=False)
+            ctx_features = train_feats[indices]
+            ctx_labels = train_labels[indices]
+            print(f"Subsampled training context: {len(train_feats)} -> {args.tabpfn_context_size}")
+        else:
+            ctx_features = train_feats
+            ctx_labels = train_labels
+        ctx_data[0] = (ctx_features, ctx_labels)
+
+    dist.broadcast_object_list(ctx_data, src=0)
+    ctx_features, ctx_labels = ctx_data[0]
+
+    n_estimators = world_size
+    if local_rank == 0:
+        print(f"TabPFN context: {ctx_features.shape[0]} samples, {ctx_features.shape[1]} features, n_estimators={n_estimators}")
+        print("Running TabPFN ICL inference...")
+
+    tabpfn_val_preds = run_tabpfn_ddp(ctx_features, ctx_labels, val_feats if local_rank == 0 else None, task.task_type, n_estimators, desc="Val")
+    tabpfn_test_preds = run_tabpfn_ddp(ctx_features, ctx_labels, test_feats if local_rank == 0 else None, task.task_type, n_estimators, desc="Test")
+
+    if local_rank == 0:
+        tabpfn_val_metrics = task.evaluate(tabpfn_val_preds, task.get_table("val"))
+        print(f"TabPFN Val metrics: {tabpfn_val_metrics}")
+
+        tabpfn_test_metrics = task.evaluate(tabpfn_test_preds)
+        print(f"TabPFN Test metrics: {tabpfn_test_metrics}")
+
+        wandb.log({
+            **{f"tabpfn_val_{k}": v for k, v in tabpfn_val_metrics.items()},
+            **{f"tabpfn_test_{k}": v for k, v in tabpfn_test_metrics.items()}
+        })
+
+        tabpfn_results = {
+            "val_metrics": tabpfn_val_metrics,
+            "test_metrics": tabpfn_test_metrics,
+            "tabpfn_context_size": len(ctx_features),
+            "tabpfn_n_estimators": n_estimators,
+            "feature_dim": ctx_features.shape[1],
+        }
+        tabpfn_file_path = os.path.join(output_path, f"tabpfn_icl_{args.seed}.json")
+        with open(tabpfn_file_path, "w") as f:
+            json.dump(tabpfn_results, f, indent=4)
+        print(f"TabPFN results saved to: {tabpfn_file_path}")
 
 
 ############################
