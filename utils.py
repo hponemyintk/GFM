@@ -27,11 +27,83 @@ GLOBAL_TIME_ARRAYS = None
 GLOBAL_NODE_TYPES = None    # list of str, e.g. ["user", "product", ...]
 GLOBAL_TYPE_TO_IDX = None   # {"user": 0, "product": 1, ...}
 GLOBAL_IDX_TO_TYPE = None   # {0: "user", 1: "product", ...}
+GLOBAL_NODE_EMBEDDINGS = None  # {node_type_str: np.ndarray} for weighted sampling
+GLOBAL_W_FK = 5.0              # Weight for FK-parent priority
+GLOBAL_W_SIM = 2.0             # Weight for similarity priority
+GLOBAL_W_REC = 1.0             # Weight for recency priority
+GLOBAL_TEMPERATURE = 1.0       # Softmax temperature for weighted sampling
+
+def precompute_node_embeddings(
+    data: HeteroData,
+    encoder_weights_path: str,
+    node_type_map: Dict[str, int],
+    col_names_dict,
+    col_stats_dict,
+    channels: int,
+    device: str = "cuda",
+    batch_size: int = 4096,
+) -> Dict[str, np.ndarray]:
+    """
+    Load trained NeighborTfsEncoder weights from a Stage 1 checkpoint,
+    encode all nodes per type on GPU, L2-normalize, return as numpy arrays.
+
+    Returns:
+        {node_type_str: np.ndarray of shape [num_nodes, channels]} with L2-normalized rows.
+    """
+    import torch_frame
+    from encoders import NeighborTfsEncoder
+
+    encoder = NeighborTfsEncoder(
+        channels=channels,
+        node_type_map=node_type_map,
+        col_names_dict=col_names_dict,
+        col_stats_dict=col_stats_dict,
+    )
+
+    checkpoint = torch.load(encoder_weights_path, map_location="cpu")
+    tfs_keys = {k.replace("tfs_encoder.", ""): v
+                for k, v in checkpoint.items() if k.startswith("tfs_encoder.")}
+    encoder.load_state_dict(tfs_keys)
+    encoder.to(device).eval()
+
+    node_embeddings = {}
+    with torch.no_grad():
+        for node_type in data.node_types:
+            if node_type not in encoder.encoders:
+                continue
+            tf = data[node_type].tf
+            num_nodes = data[node_type].num_nodes
+            all_embs = []
+
+            for start in range(0, num_nodes, batch_size):
+                end = min(start + batch_size, num_nodes)
+                batch_tf = tf[start:end].to(device=device)
+                # Clean NaN/Inf
+                for stype_key, tensor in batch_tf.feat_dict.items():
+                    if isinstance(tensor, torch.Tensor):
+                        batch_tf.feat_dict[stype_key] = torch.nan_to_num(
+                            tensor, nan=0.0, posinf=1e6, neginf=-1e6
+                        )
+
+                out = encoder.encoders[node_type](batch_tf)
+                if out.dim() == 3:
+                    out = out.squeeze(1)
+                all_embs.append(out.cpu())
+
+            embs = torch.cat(all_embs, dim=0).numpy()  # [num_nodes, channels]
+            norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+            node_embeddings[node_type] = (embs / norms).astype(np.float32)
+
+    total_nodes = sum(v.shape[0] for v in node_embeddings.values())
+    print(f"[precompute_node_embeddings] Encoded {total_nodes} nodes "
+          f"across {len(node_embeddings)} types, dim={channels}")
+    return node_embeddings
+
 
 class GloveTextEmbedding:
         def __init__(self, device: torch.device):
             self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
-        
+
         def __call__(self, sentences: List[str]) -> Tensor:
             sentences = [str(s) if not isinstance(s, str) else s for s in sentences]
             return torch.from_numpy(self.model.encode(sentences))
@@ -42,16 +114,17 @@ def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
         for node_type in hetero_data.node_types
     }
     for edge_type in hetero_data.edge_types:
-        src_type, _, dst_type = edge_type
+        src_type, rel_name, dst_type = edge_type
         if 'edge_index' not in hetero_data[edge_type]:
             continue
         edge_index = hetero_data[edge_type].edge_index
         src_list = edge_index[0].tolist()
         dst_list = edge_index[1].tolist()
         for s, d in zip(src_list, dst_list):
-            adjacency[src_type][s].add((dst_type, d))
+            adjacency[src_type][s].add((dst_type, d, rel_name))
             if undirected:
-                adjacency[dst_type][d].add((src_type, s))
+                rev_rel = ("rev_" + rel_name) if not rel_name.startswith("rev_") else rel_name[4:]
+                adjacency[dst_type][d].add((src_type, s, rev_rel))
     return adjacency
 
 def build_adjacency_csr(hetero_data, undirected: bool = True):
@@ -69,7 +142,7 @@ def build_adjacency_csr(hetero_data, undirected: bool = True):
     edge_arrays = {nt: [] for nt in hetero_data.node_types}
 
     for edge_type in hetero_data.edge_types:
-        src_type, _, dst_type = edge_type
+        src_type, rel_name, dst_type = edge_type
         if 'edge_index' not in hetero_data[edge_type]:
             continue
         ei = hetero_data[edge_type].edge_index
@@ -78,19 +151,29 @@ def build_adjacency_csr(hetero_data, undirected: bool = True):
         n_edges = len(src_arr)
         dst_type_id = type_to_idx[dst_type]
         src_type_id = type_to_idx[src_type]
+        is_fk = int(rel_name.startswith("f2p_"))
 
-        # Forward edges: src_type[s] -> (dst_type_id, d)
-        fwd = np.empty((n_edges, 3), dtype=np.int64)
+        # Forward edges: src_type[s] -> (dst_type_id, d, is_fk)
+        fwd = np.empty((n_edges, 4), dtype=np.int64)
         fwd[:, 0] = src_arr
         fwd[:, 1] = dst_type_id
         fwd[:, 2] = dst_arr
+        fwd[:, 3] = is_fk
         edge_arrays[src_type].append(fwd)
 
         if undirected:
-            rev = np.empty((n_edges, 3), dtype=np.int64)
+            # Compute reverse relation name to determine FK status
+            if rel_name.startswith("rev_"):
+                rev_rel = rel_name[4:]
+            else:
+                rev_rel = "rev_" + rel_name
+            rev_is_fk = int(rev_rel.startswith("f2p_"))
+
+            rev = np.empty((n_edges, 4), dtype=np.int64)
             rev[:, 0] = dst_arr
             rev[:, 1] = src_type_id
             rev[:, 2] = src_arr
+            rev[:, 3] = rev_is_fk
             edge_arrays[dst_type].append(rev)
 
     # Build CSR per node type using vectorized numpy ops
@@ -103,13 +186,19 @@ def build_adjacency_csr(hetero_data, undirected: bool = True):
             csr[nt] = {
                 "nbr_types": np.empty(0, dtype=np.int8),
                 "nbr_indices": np.empty(0, dtype=np.int32),
+                "nbr_is_fk": np.empty(0, dtype=np.bool_),
                 "offsets": np.zeros(num_nodes + 1, dtype=np.int64),
             }
             continue
 
-        all_edges = np.concatenate(edge_arrays[nt])  # (E, 3): [node_id, nbr_type, nbr_idx]
+        all_edges = np.concatenate(edge_arrays[nt])  # (E, 4): [node_id, nbr_type, nbr_idx, is_fk]
 
-        # Deduplicate using composite keys
+        # Sort by is_fk descending so True entries appear first before dedup
+        # This ensures dedup preserves is_fk=True when duplicates exist (OR logic)
+        sort_idx_fk = np.argsort(-all_edges[:, 3], kind='stable')
+        all_edges = all_edges[sort_idx_fk]
+
+        # Deduplicate using composite keys (columns 0-2 only, not is_fk)
         # key = node_id * stride1 + nbr_type * stride2 + nbr_idx
         max_nbr_idx = int(all_edges[:, 2].max()) + 1 if len(all_edges) > 0 else 1
         max_nbr_type = int(all_edges[:, 1].max()) + 1 if len(all_edges) > 0 else 1
@@ -135,6 +224,7 @@ def build_adjacency_csr(hetero_data, undirected: bool = True):
         csr[nt] = {
             "nbr_types": all_edges[:, 1].astype(np.int8),
             "nbr_indices": all_edges[:, 2].astype(np.int32),
+            "nbr_is_fk": all_edges[:, 3].astype(np.bool_),
             "offsets": offsets,
         }
 
@@ -173,11 +263,18 @@ def _sample_fallback_nodes(all_nodes_compact, k, rng=random):
     return result
 
 
-def init_worker_globals(adj, all_nodes, node_types=None, time_arrays=None):
+def init_worker_globals(adj, all_nodes, node_types=None, time_arrays=None,
+                        node_embeddings=None, w_fk=5.0, w_sim=2.0, w_rec=1.0, temperature=1.0):
     global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
     global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
+    global GLOBAL_NODE_EMBEDDINGS, GLOBAL_W_FK, GLOBAL_W_SIM, GLOBAL_W_REC, GLOBAL_TEMPERATURE
     GLOBAL_ADJ = adj
     GLOBAL_ALL_NODES = all_nodes
+    GLOBAL_NODE_EMBEDDINGS = node_embeddings
+    GLOBAL_W_FK = w_fk
+    GLOBAL_W_SIM = w_sim
+    GLOBAL_W_REC = w_rec
+    GLOBAL_TEMPERATURE = temperature
     if node_types is not None:
         GLOBAL_NODE_TYPES = list(node_types)
         GLOBAL_TYPE_TO_IDX = {nt: i for i, nt in enumerate(GLOBAL_NODE_TYPES)}
@@ -194,14 +291,14 @@ def gather_1_and_2_hop_with_seed_time(
     seed_time: float,
     max_1hop_threshold: int = 5000,
     max_2hop_threshold: int = 1000
-) -> List[Tuple[str, int, int, float, Optional[set]]]:
+) -> List[Tuple[str, int, int, float, Optional[set], bool]]:
     """
     Gather 1-hop and 2-hop neighbors with time condition.
 
     Returns:
-        neighbors_with_time: List of tuples:
-            (nbr_t, nbr_i, hop, relative_time_days, None) for 1-hop
-            (nbr_t, nbr_i, hop, relative_time_days, connecting_1hop_tuple) for 2-hop
+        neighbors_with_time: List of 6-tuples:
+            (nbr_t, nbr_i, hop, relative_time_days, None, is_fk_parent) for 1-hop
+            (nbr_t, nbr_i, hop, relative_time_days, connecting_1hops, False) for 2-hop
     """
     # Gather 1-hop neighbors satisfying the time condition
     n1_full = adjacency[node_type][node_idx]
@@ -209,26 +306,34 @@ def gather_1_and_2_hop_with_seed_time(
         n1_full = random.sample(list(n1_full), max_1hop_threshold)
     else:
         n1_full = list(n1_full)
-        
-    n1 = set()
-    for (nbr_t, nbr_i) in n1_full:
+
+    # n1: maps (nbr_t, nbr_i) -> is_fk_parent
+    n1 = {}
+    for (nbr_t, nbr_i, rel_name) in n1_full:
         if hasattr(data[nbr_t], "time"):
             if data[nbr_t].time[nbr_i] <= seed_time:
-                n1.add((nbr_t, nbr_i))
+                is_fk = rel_name.startswith("f2p_")
+                if (nbr_t, nbr_i) in n1:
+                    n1[(nbr_t, nbr_i)] = n1[(nbr_t, nbr_i)] or is_fk
+                else:
+                    n1[(nbr_t, nbr_i)] = is_fk
         else:
-            n1.add((nbr_t, nbr_i))
+            is_fk = rel_name.startswith("f2p_")
+            if (nbr_t, nbr_i) in n1:
+                n1[(nbr_t, nbr_i)] = n1[(nbr_t, nbr_i)] or is_fk
+            else:
+                n1[(nbr_t, nbr_i)] = is_fk
 
     # Gather 2-hop neighbors satisfying the time condition
-    n2 = defaultdict(set)  # Map 2-hop neighbor to set of connecting 1-hop neighbors
+    n2 = defaultdict(set)
     for (nbr_t, nbr_i) in n1:
         nbr2_full = adjacency[nbr_t][nbr_i]
         if len(nbr2_full) > max_2hop_threshold:
             nbr2_full = random.sample(list(nbr2_full), max_2hop_threshold)
         else:
             nbr2_full = list(nbr2_full)
-            
-        for (nbr2_t, nbr2_i) in nbr2_full:
-            # Skip if we loop back to the original node
+
+        for (nbr2_t, nbr2_i, _rel) in nbr2_full:
             if (nbr2_t, nbr2_i) == (node_type, node_idx):
                 continue
             if hasattr(data[nbr2_t], "time"):
@@ -237,30 +342,27 @@ def gather_1_and_2_hop_with_seed_time(
             else:
                 n2[(nbr2_t, nbr2_i)].add((nbr_t, nbr_i))
 
-    # Remove overlaps: ensure 2-hop neighbors are not already in 1-hop
     n2 = {k: v for k, v in n2.items() if k not in n1}
 
     neighbors_with_time = []
 
-    # Process 1-hop neighbors with hop distance 1
-    for (nbr_t, nbr_i) in n1:
+    # 1-hop: include is_fk_parent
+    for (nbr_t, nbr_i), is_fk_parent in n1.items():
         if hasattr(data[nbr_t], "time"):
             nbr_time = data[nbr_t].time[nbr_i].item()
             relative_time_days = (seed_time - nbr_time) / (60 * 60 * 24)
         else:
-            relative_time_days = 0  # no time entities
-        # Append tuple with hop level 1 and no connecting 1-hop neighbor
-        neighbors_with_time.append((nbr_t, nbr_i, 1, relative_time_days, None))
+            relative_time_days = 0
+        neighbors_with_time.append((nbr_t, nbr_i, 1, relative_time_days, None, is_fk_parent))
 
-    # Process 2-hop neighbors with hop distance 2
+    # 2-hop: is_fk_parent = False
     for (nbr2_t, nbr2_i), connecting_1hops in n2.items():
         if hasattr(data[nbr2_t], "time"):
             nbr2_time = data[nbr2_t].time[nbr2_i].item()
             relative_time_days = (seed_time - nbr2_time) / (60 * 60 * 24)
         else:
-            relative_time_days = 0  # no time entities
-        # If multiple connecting 1-hop neighbors, we will handle in sampling
-        neighbors_with_time.append((nbr2_t, nbr2_i, 2, relative_time_days, connecting_1hops))
+            relative_time_days = 0
+        neighbors_with_time.append((nbr2_t, nbr2_i, 2, relative_time_days, connecting_1hops, False))
 
     return neighbors_with_time
 
@@ -275,10 +377,12 @@ def gather_1_and_2_hop_vectorized(
     seed_time: float,
     max_1hop_threshold: int = 5000,
     max_2hop_threshold: int = 1000,
-) -> List[Tuple[str, int, int, float, Optional[set]]]:
+) -> List[Tuple[str, int, int, float, Optional[set], bool]]:
     """
     Vectorized version of gather_1_and_2_hop_with_seed_time.
     Uses CSR adjacency and pre-extracted numpy time arrays for speed.
+
+    Returns 6-tuples: (nbr_t, nbr_i, hop, rel_time_days, connecting_1hops, is_fk_parent)
 
     Args:
         csr_adj: output of build_adjacency_csr()
@@ -297,12 +401,14 @@ def gather_1_and_2_hop_vectorized(
     end = int(csr_nt["offsets"][node_idx + 1])
     n1_types = csr_nt["nbr_types"][start:end].copy()
     n1_indices = csr_nt["nbr_indices"][start:end].copy()
+    n1_is_fk = csr_nt["nbr_is_fk"][start:end].copy()
 
     # Cap if too many
     if len(n1_types) > max_1hop_threshold:
         sel = np.random.choice(len(n1_types), max_1hop_threshold, replace=False)
         n1_types = n1_types[sel]
         n1_indices = n1_indices[sel]
+        n1_is_fk = n1_is_fk[sel]
 
     # Vectorized temporal filter per unique type
     mask = np.ones(len(n1_types), dtype=bool)
@@ -315,6 +421,7 @@ def gather_1_and_2_hop_vectorized(
 
     n1_types = n1_types[mask]
     n1_indices = n1_indices[mask]
+    n1_is_fk = n1_is_fk[mask]
 
     # Build 1-hop set for fast lookup and overlap removal
     n1_set = set()
@@ -403,7 +510,7 @@ def gather_1_and_2_hop_vectorized(
     # --- Build output ---
     results = []
 
-    # 1-hop
+    # 1-hop: include is_fk_parent from CSR
     for k in range(len(n1_types)):
         nbr_type_str = idx_to_type[int(n1_types[k])]
         nbr_idx = int(n1_indices[k])
@@ -411,15 +518,15 @@ def gather_1_and_2_hop_vectorized(
             rel_time = (seed_time - float(time_arrays[nbr_type_str][nbr_idx])) / 86400.0
         else:
             rel_time = 0.0
-        results.append((nbr_type_str, nbr_idx, 1, rel_time, None))
+        results.append((nbr_type_str, nbr_idx, 1, rel_time, None, bool(n1_is_fk[k])))
 
-    # 2-hop
+    # 2-hop: is_fk_parent = False
     for (nbr2_type_str, nbr2_idx), connecting in n2_connecting.items():
         if nbr2_type_str in time_arrays:
             rel_time = (seed_time - float(time_arrays[nbr2_type_str][nbr2_idx])) / 86400.0
         else:
             rel_time = 0.0
-        results.append((nbr2_type_str, nbr2_idx, 2, rel_time, connecting))
+        results.append((nbr2_type_str, nbr2_idx, 2, rel_time, connecting, False))
 
     return results
 
@@ -460,7 +567,7 @@ def _process_one_seed(args):
             "Use build_adjacency_csr() to create CSR adjacency before spawning workers."
         )
 
-    T_hat_list = list(T_hat)
+    T_hat_list = list(T_hat)  # 6-tuples: (nbr_t, nbr_i, hop, rel_time, c1hops, is_fk_parent)
     size_th = len(T_hat_list)
     K_minus_1 = K - 1
 
@@ -469,13 +576,8 @@ def _process_one_seed(args):
     two_hop_neighbors = [n for n in T_hat_list if n[2] == 2]
     combined_neighbors = one_hop_neighbors + two_hop_neighbors
 
-    # 2. If we have enough neighbors => random.sample
-    #    If not => random.choices
-    if size_th >= K_minus_1:
-        chosen_neighbors = random.sample(combined_neighbors, K_minus_1)
-    elif 0 < size_th < K_minus_1:
-        chosen_neighbors = random.choices(combined_neighbors, k=K_minus_1)
-    else:
+    # 2. Sample neighbors: uniform (Stage 1) or weighted (Stage 2)
+    if size_th == 0:
         # fallback from GLOBAL_ALL_NODES
         fallback = _sample_fallback_nodes(GLOBAL_ALL_NODES, K_minus_1, rng=random)
         chosen_neighbors = []
@@ -486,7 +588,50 @@ def _process_one_seed(args):
                 rel_time = (seed_time - ft_time) / (60 * 60 * 24)
             else:
                 rel_time = 0
-            chosen_neighbors.append((ft, fi, 3, rel_time, None))
+            chosen_neighbors.append((ft, fi, 3, rel_time, None, False))
+    elif GLOBAL_NODE_EMBEDDINGS is None:
+        # Uniform sampling (Stage 1 / finetune)
+        if size_th >= K_minus_1:
+            chosen_neighbors = random.sample(combined_neighbors, K_minus_1)
+        else:
+            chosen_neighbors = random.choices(combined_neighbors, k=K_minus_1)
+    else:
+        # Weighted sampling (Stage 2 / similarity_resample)
+        np_rng = np.random.RandomState(seed_val % (2**32))
+        scores = np.zeros(len(combined_neighbors), dtype=np.float64)
+
+        # Get seed embedding for similarity computation
+        seed_emb = None
+        if seed_node_type in GLOBAL_NODE_EMBEDDINGS:
+            seed_emb = GLOBAL_NODE_EMBEDDINGS[seed_node_type][seed_node_idx]
+
+        for idx, (nbr_t, nbr_i, hop, rel_time_days, c1hops, is_fk_parent) in enumerate(combined_neighbors):
+            # FK parent bonus
+            fk_score = GLOBAL_W_FK * (1.0 if is_fk_parent else 0.0)
+
+            # Similarity score (same type only; cross-type defaults to 0)
+            sim_score = 0.0
+            if seed_emb is not None and nbr_t == seed_node_type and nbr_t in GLOBAL_NODE_EMBEDDINGS:
+                nbr_emb = GLOBAL_NODE_EMBEDDINGS[nbr_t][nbr_i]
+                sim_score = GLOBAL_W_SIM * float(np.dot(seed_emb, nbr_emb))
+
+            # Recency score
+            rec_score = GLOBAL_W_REC * np.exp(-0.01 * max(rel_time_days, 0))
+
+            scores[idx] = fk_score + sim_score + rec_score
+
+        # Softmax with temperature
+        scores = scores / GLOBAL_TEMPERATURE
+        scores = scores - scores.max()  # numerical stability
+        weights = np.exp(scores)
+        weights = weights / weights.sum()
+
+        replace = size_th < K_minus_1
+        chosen_indices = np_rng.choice(len(combined_neighbors), K_minus_1, replace=replace, p=weights)
+        chosen_neighbors = [combined_neighbors[i] for i in chosen_indices]
+
+    # Strip is_fk_parent (6th element) — output remains 5-tuples for downstream compatibility
+    chosen_neighbors = [(t, i, h, rt, c) for (t, i, h, rt, c, _fk) in chosen_neighbors]
 
     # 3. Build final_tokens with subgraph adj for the seed node and its chosen neighbors
     final_tokens = []
@@ -555,6 +700,11 @@ def local_nodes_hetero(
     undirected: bool = True,
     num_workers: int = None,
     pool: Pool = None,
+    node_embeddings=None,
+    w_fk: float = 5.0,
+    w_sim: float = 2.0,
+    w_recency: float = 1.0,
+    temperature: float = 1.0,
 ):
     """
     Produces a dictionary S[seed_node_type][idx] for each node in `table_input_nodes[1]`.
@@ -564,6 +714,9 @@ def local_nodes_hetero(
     """
     seed_node_type, seed_node_idxs = table_input_nodes
     assert len(seed_node_idxs) == len(table_input_time), "Mismatch in seed_node_idxs vs table_input_time"
+
+    sampling_mode = "weighted" if node_embeddings is not None else "uniform"
+    print(f"  [Sampling:{sampling_mode}] ...")
 
     # Prepare tasks — NO data object, just lightweight scalars
     tasks = []
@@ -610,7 +763,8 @@ def local_nodes_hetero(
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
-            initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, node_types, GLOBAL_TIME_ARRAYS)
+            initargs=(GLOBAL_ADJ, GLOBAL_ALL_NODES, node_types, GLOBAL_TIME_ARRAYS,
+                      node_embeddings, w_fk, w_sim, w_recency, temperature)
         ) as p:
             results = p.map(_process_one_seed, tasks, chunksize=chunksize)
 
@@ -636,7 +790,12 @@ class RelGTTokens(Dataset):
         num_workers: int = None,
         precompute: bool = True,
         precomputed_dir: str = None,
-        train_stage: str = "finetune"
+        train_stage: str = "finetune",
+        node_embeddings=None,
+        w_fk: float = 5.0,
+        w_sim: float = 2.0,
+        w_recency: float = 1.0,
+        temperature: float = 1.0,
     ):
         super().__init__()
         self.data = data
@@ -647,6 +806,11 @@ class RelGTTokens(Dataset):
         self.num_workers = num_workers
         self.precompute = precompute
         self.precomputed_dir = precomputed_dir
+        self.node_embeddings = node_embeddings
+        self.w_fk = w_fk
+        self.w_sim = w_sim
+        self.w_recency = w_recency
+        self.temperature = temperature
 
         # Retrieve the table and the seeds/targets
         self.table = self.task.get_table(split=self.split)
@@ -675,6 +839,13 @@ class RelGTTokens(Dataset):
         if self.precompute:
             # DDP safety: only rank 0 precomputes, others wait
             rank = int(os.environ.get("RANK", 0))
+
+            if self.node_embeddings is not None and os.path.exists(self.precomputed_path):
+                # Stage 2: overwrite existing samples with similarity-based resampling
+                if rank == 0:
+                    print(f"[{self.split}] Removing existing HDF5 for resampling: {self.precomputed_path}")
+                    os.remove(self.precomputed_path)
+
             if os.path.exists(self.precomputed_path):
                 print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
             elif rank == 0:
@@ -805,13 +976,17 @@ class RelGTTokens(Dataset):
         all_times = np.zeros((total, self.K), dtype=np.float32)
         adjacency_all = [None] * total
 
+        sampling_mode = "weighted" if self.node_embeddings is not None else "uniform"
+        print(f"[{self.split}] Sampling mode: {sampling_mode}")
+
         t_pool_start = time.time()
         node_types = list(data_cpu.node_types)
         ctx = get_context("fork")
         with ctx.Pool(
             processes=num_workers,
             initializer=init_worker_globals,
-            initargs=(csr_adj, all_nodes_compact, node_types, time_arrays)
+            initargs=(csr_adj, all_nodes_compact, node_types, time_arrays,
+                      self.node_embeddings, self.w_fk, self.w_sim, self.w_recency, self.temperature)
         ) as pool:
             print(f"[{self.split}] Pool created in {time.time() - t_pool_start:.1f}s")
 
