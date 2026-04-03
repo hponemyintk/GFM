@@ -150,6 +150,17 @@ class RelGTLayer(nn.Module):
 
         return out
 
+    def forward_with_intermediates(self, x_set, x, node_indices):
+        if self.conv_type != "full":
+            raise ValueError("forward_with_intermediates only supported for conv_type='full'")
+
+        out_local = self.local_forward(x_set)
+        out_global = self.global_forward(x, node_indices)
+        out_local_normed = self.layer_norm_local(out_local)
+        out_global_normed = self.layer_norm_global(out_global)
+        out = torch.cat([out_local_normed, out_global_normed], dim=1)
+        return out, out_local_normed, out_global_normed
+
     def local_forward(self, x_set, pretrain_token=False):
         return self.local_module(x_set, pretrain_token)
 
@@ -310,6 +321,36 @@ class RelGT(torch.nn.Module):
         x_set = self.head(x_set)
 
         return x_set
+
+    def extract_features(self,
+                         neighbor_types,
+                         node_indices,
+                         neighbor_hops,
+                         neighbor_times,
+                         grouped_tf_dict,
+                         edge_index=None,
+                         batch=None,
+                         ):
+        neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
+        neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+        neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
+
+        cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
+        if self.ablate_idx is not None:
+            cat_list.pop(self.ablate_idx)
+        x_set = torch.cat(cat_list, dim=-1)
+        x_set = self.in_mixture(x_set)
+
+        rep_mixture = x_set[:, 0, :]  # [B, channels]
+
+        x = x_set[:, 0, :]
+        for i, conv in enumerate(self.convs):
+            x_set, rep_local, rep_global = conv.forward_with_intermediates(x_set, x, node_indices)
+            x_set = self.ffs[i](x_set)
+
+        return torch.cat([rep_mixture, rep_local, rep_global], dim=-1)  # [B, 3*channels]
 
     def global_forward(self, x, pos_enc, node_indices):
         raise NotImplementedError
