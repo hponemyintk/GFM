@@ -482,10 +482,14 @@ if args.train_stage == "finetune":
             "val_metrics": val_metrics,
             "test_metrics": test_metrics
         }
+        wandb.log({
+            **{f"best_val_{k}": v for k, v in val_metrics.items()},
+            **{f"best_test_{k}": v for k, v in test_metrics.items()}
+        })
         file_path = os.path.join(output_path, str(args.seed) + ".json")
         with open(file_path, "w") as f:
             json.dump(best_metrics_dict, f, indent=4)
-    
+
     if local_rank == 0:
         print(f"[{args.train_stage.capitalize()} Stage] Training complete.")
 
@@ -540,6 +544,10 @@ elif args.train_stage == "similarity_resample":
             "val_metrics": val_metrics,
             "test_metrics": test_metrics
         }
+        wandb.log({
+            **{f"best_val_{k}": v for k, v in val_metrics.items()},
+            **{f"best_test_{k}": v for k, v in test_metrics.items()}
+        })
         file_path = os.path.join(output_path, str(args.seed) + ".json")
         with open(file_path, "w") as f:
             json.dump(best_metrics_dict, f, indent=4)
