@@ -210,7 +210,7 @@ loader_val = DataLoader(
     # shuffle=False,
     collate_fn=data["val"].collate,
     num_workers=args.num_workers,
-    persistent_workers=(args.num_workers > 0),
+    persistent_workers=False,     # val/test are called only once per epoch, the speed up here isn't worth the ram overhead
     pin_memory=True
 )
 
@@ -222,7 +222,7 @@ loader_test = DataLoader(
     # shuffle=False,
     collate_fn=data["test"].collate,
     num_workers=args.num_workers,
-    persistent_workers=(args.num_workers > 0),
+    persistent_workers=False,     # val/test are called only once per epoch, the speed up here isn't worth the ram overhead
     pin_memory=True
 )
 

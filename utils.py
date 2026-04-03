@@ -897,10 +897,10 @@ class RelGTTokens(Dataset):
         sample["first_type"] = sample["types"][0].item()
         sample["first_index"] = sample["indices"][0].item()
 
-        sample["tfs"] = [
-            self.data[self.index_to_node_type[t.item()]].tf[i.item()]
-            for t, i in zip(sample["types"], sample["indices"])
-        ]
+        # sample["tfs"] = [
+        #     self.data[self.index_to_node_type[t.item()]].tf[i.item()]
+        #     for t, i in zip(sample["types"], sample["indices"])
+        # ]
         
         # store the "global index" for ordering
         # 'idx' is the local index within this split, but effectively
