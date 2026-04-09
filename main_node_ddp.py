@@ -38,7 +38,11 @@ from relbench.tasks import get_task
 
 # within this project
 from model import RelGT
-from utils import GloveTextEmbedding, RelGTTokens
+from utils import (
+    GloveTextEmbedding, RelGTTokens, RelGTTokensOnline,
+    build_adjacency_csr, build_batch_edge_index_from_selected,
+)
+from pass_sampler import PASSHeteroSampler
 
 torch.autograd.set_detect_anomaly(False)
 
@@ -85,6 +89,12 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Enable BF16 mixed precision training")
+parser.add_argument("--sampler", type=str, default="random", choices=["random", "pass"],
+                    help="Sampling strategy: 'random' (default precomputed) or 'pass' (learned PASS-GNN)")
+parser.add_argument("--sample_scope", type=int, default=512,
+                    help="PASS: candidate scope size per seed node")
+parser.add_argument("--pass_hidden_dim", type=int, default=32,
+                    help="PASS: hidden dim for attention projection")
 
 args = parser.parse_args()
 if args.sampling_workers is None:
@@ -175,18 +185,39 @@ if local_rank != 0:
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
 
-data = {
-    split: RelGTTokens(
-        data=data,
-        task=task,
-        K=args.num_neighbors,
-        split=split,
-        undirected=True,
-        precompute=args.precompute,
-        precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
-        num_workers=args.sampling_workers,
-        train_stage=args.train_stage)
-        for split in ["train", "val", "test"]
+if args.sampler == "pass":
+    # PASS sampler: use scope-based online dataset
+    data = {
+        split: RelGTTokensOnline(
+            data=data,
+            task=task,
+            K=args.num_neighbors,
+            sample_scope=args.sample_scope,
+            split=split,
+            undirected=True,
+            precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
+            num_workers=args.sampling_workers,
+            train_stage=args.train_stage)
+            for split in ["train", "val", "test"]
+    }
+    # Build CSR adjacency for online edge_index construction
+    data_cpu = data["train"].data.to("cpu")
+    csr_adj = build_adjacency_csr(data_cpu, undirected=True)
+    idx_to_type = data["train"].index_to_node_type
+    type_to_idx = data["train"].node_type_to_index
+else:
+    data = {
+        split: RelGTTokens(
+            data=data,
+            task=task,
+            K=args.num_neighbors,
+            split=split,
+            undirected=True,
+            precompute=args.precompute,
+            precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
+            num_workers=args.sampling_workers,
+            train_stage=args.train_stage)
+            for split in ["train", "val", "test"]
     }
 
 ############################
@@ -307,7 +338,25 @@ os.makedirs(output_path, exist_ok=True)
 
 world_size = dist.get_world_size()
 base_lr = args.lr * world_size
-optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
+
+# PASS sampler setup
+pass_sampler = None
+if args.sampler == "pass":
+    pass_sampler = PASSHeteroSampler(
+        tfs_encoder=model.module.tfs_encoder,
+        num_types=len(data["train"].node_types),
+        embed_dim=args.channels,
+        hidden_dim=args.pass_hidden_dim,
+    ).to(device)
+    # Combined optimizer: model params + sampler's own params
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(pass_sampler.own_parameters()),
+        lr=base_lr, weight_decay=args.weight_decay
+    )
+    # Keep reference to the underlying data for encoding
+    hetero_data = data["train"].data
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
 global_step = 0
 
@@ -378,6 +427,214 @@ def train_supervised(epoch) -> float:
 
     return loss_accum / count_accum if count_accum > 0 else float('inf')
 
+
+def train_pass(epoch) -> float:
+    """Training loop with PASS learned sampling + REINFORCE."""
+    global global_step
+    model.train()
+    pass_sampler.train()
+    loss_accum = count_accum = 0
+    adjusted_max_steps = max(1, args.max_steps_per_epoch // world_size)
+    total_steps = min(len(loader_dict["train"]), adjusted_max_steps)
+    K = args.num_neighbors
+
+    train_sampler.set_epoch(epoch)
+
+    for step, scope_batch in enumerate(tqdm(loader_dict["train"], total=total_steps, desc="Train (PASS)"), start=1):
+        labels = scope_batch["labels"].to(device)
+
+        # 1. Encode candidates and seeds through shared tfs_encoder
+        amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.amp else nullcontext()
+        with amp_ctx:
+            candidate_embeds = pass_sampler.encode_candidates(scope_batch, hetero_data, device)
+            seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
+
+        # 2. PASS attention-based selection
+        scope_counts = scope_batch["scope_count"].to(device)
+        selected_idx, dist = pass_sampler(seed_embeds, candidate_embeds, scope_counts, K)
+
+        # 3. Gather selected node info from scope
+        scope_types = scope_batch["scope_types"].to(device)
+        scope_indices = scope_batch["scope_indices"].to(device)
+        scope_hops = scope_batch["scope_hops"].to(device)
+        scope_times = scope_batch["scope_times"].to(device)
+        seed_type = scope_batch["seed_type"].to(device)
+        seed_index = scope_batch["seed_index"].to(device)
+
+        selected_types = torch.gather(scope_types, 1, selected_idx)
+        selected_indices = torch.gather(scope_indices, 1, selected_idx)
+        selected_hops = torch.gather(scope_hops, 1, selected_idx)
+        selected_times = torch.gather(scope_times, 1, selected_idx)
+
+        B = seed_type.shape[0]
+
+        # 4. Prepend seed → [B, K]
+        neighbor_types = torch.cat([seed_type.unsqueeze(1), selected_types], dim=1)
+        neighbor_indices = torch.cat([seed_index.unsqueeze(1), selected_indices], dim=1)
+        neighbor_hops = torch.cat([torch.zeros(B, 1, dtype=torch.long, device=device), selected_hops], dim=1)
+        neighbor_times = torch.cat([torch.zeros(B, 1, dtype=torch.float, device=device), selected_times], dim=1)
+
+        # 5. Reuse selected K embeddings (avoid re-encoding)
+        selected_embeds = pass_sampler.selected_embeds  # [B, K-1, D]
+        seed_embed_for_tfs = seed_embeds.unsqueeze(1)    # [B, 1, D]
+        preencoded_tfs = torch.cat([seed_embed_for_tfs, selected_embeds], dim=1)  # [B, K, D]
+
+        # 6. Build edge_index on CPU
+        edge_index, batch_vec = build_batch_edge_index_from_selected(
+            neighbor_types, neighbor_indices, csr_adj, idx_to_type, type_to_idx
+        )
+        edge_index = edge_index.to(device)
+        batch_vec = batch_vec.to(device)
+
+        # 7. Compute node_indices for global module
+        first_types = neighbor_types[:, 0].cpu().tolist()
+        first_indices = neighbor_indices[:, 0].cpu().tolist()
+        node_indices = torch.tensor(
+            data["train"].get_global_index(first_types, first_indices),
+            dtype=torch.long, device=device
+        )
+
+        # 8. Forward through RelGT with pre-encoded tfs
+        optimizer.zero_grad()
+        with amp_ctx:
+            # Use forward_with_preencoded_tfs — returns x_set before head
+            x_set = model.module.forward_with_preencoded_tfs(
+                neighbor_types, node_indices, neighbor_hops, neighbor_times,
+                preencoded_tfs,
+                edge_index=edge_index, batch=batch_vec
+            )
+            x_set.retain_grad()  # capture gradient for REINFORCE
+            pred = model.module.head(x_set)
+            pred = pred.view(-1) if pred.size(1) == 1 else pred
+            task_loss = loss_fn(pred.float(), labels)
+
+        # 9. Task loss backward — captures x_set.grad for REINFORCE
+        task_loss.backward()
+
+        # 10. REINFORCE loss for sampling policy
+        if x_set.grad is not None:
+            chain_grad = x_set.grad.detach()
+            sample_loss = pass_sampler.reinforce_loss(chain_grad)
+            sample_loss.backward()
+
+        clip_grad_norm_(
+            list(model.parameters()) + list(pass_sampler.own_parameters()),
+            max_norm=1.0
+        )
+        optimizer.step()
+
+        loss_value = task_loss.detach().item()
+        gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
+        if local_rank == 0:
+            log_dict = {
+                "train_loss": loss_value,
+                "global_step": global_step,
+                "lr": optimizer.param_groups[0]["lr"],
+                "gpu_util_percent": gpu_util,
+                "gpu_mem_allocated_MB": mem_allocated,
+                "gpu_mem_reserved_MB": mem_reserved,
+            }
+            if x_set.grad is not None:
+                log_dict["sample_loss"] = sample_loss.detach().item()
+            wandb.log(log_dict)
+
+        loss_accum += loss_value * pred.size(0)
+        count_accum += pred.size(0)
+        global_step += 1
+
+        if step >= adjusted_max_steps:
+            break
+
+    return loss_accum / count_accum if count_accum > 0 else float('inf')
+
+
+@torch.no_grad()
+def test_pass(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
+    """Evaluation with PASS sampler (uses learned policy, no REINFORCE)."""
+    if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
+        loader.sampler.set_epoch(epoch)
+
+    eval_model.eval()
+    pass_sampler.eval()
+    pred_list = []
+    idx_list = []
+    K = args.num_neighbors
+    eval_data = loader.dataset
+
+    for scope_batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
+        amp_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if args.amp else nullcontext()
+        with amp_ctx:
+            candidate_embeds = pass_sampler.encode_candidates(scope_batch, hetero_data, device)
+            seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
+
+        scope_counts = scope_batch["scope_count"].to(device)
+        selected_idx, _ = pass_sampler(seed_embeds, candidate_embeds, scope_counts, K)
+
+        scope_types = scope_batch["scope_types"].to(device)
+        scope_indices = scope_batch["scope_indices"].to(device)
+        scope_hops = scope_batch["scope_hops"].to(device)
+        scope_times = scope_batch["scope_times"].to(device)
+        seed_type = scope_batch["seed_type"].to(device)
+        seed_index = scope_batch["seed_index"].to(device)
+        B = seed_type.shape[0]
+
+        selected_types = torch.gather(scope_types, 1, selected_idx)
+        selected_indices = torch.gather(scope_indices, 1, selected_idx)
+        selected_hops = torch.gather(scope_hops, 1, selected_idx)
+        selected_times = torch.gather(scope_times, 1, selected_idx)
+
+        neighbor_types = torch.cat([seed_type.unsqueeze(1), selected_types], dim=1)
+        neighbor_indices = torch.cat([seed_index.unsqueeze(1), selected_indices], dim=1)
+        neighbor_hops = torch.cat([torch.zeros(B, 1, dtype=torch.long, device=device), selected_hops], dim=1)
+        neighbor_times = torch.cat([torch.zeros(B, 1, dtype=torch.float, device=device), selected_times], dim=1)
+
+        preencoded_tfs = torch.cat([seed_embeds.unsqueeze(1), pass_sampler.selected_embeds], dim=1)
+
+        edge_index, batch_vec = build_batch_edge_index_from_selected(
+            neighbor_types, neighbor_indices, csr_adj, idx_to_type, type_to_idx
+        )
+        edge_index = edge_index.to(device)
+        batch_vec = batch_vec.to(device)
+
+        first_types = neighbor_types[:, 0].cpu().tolist()
+        first_indices = neighbor_indices[:, 0].cpu().tolist()
+        node_indices = torch.tensor(
+            eval_data.get_global_index(first_types, first_indices),
+            dtype=torch.long, device=device
+        )
+
+        with amp_ctx:
+            x_set = eval_model.forward_with_preencoded_tfs(
+                neighbor_types, node_indices, neighbor_hops, neighbor_times,
+                preencoded_tfs, edge_index=edge_index, batch=batch_vec
+            )
+            pred = eval_model.head(x_set)
+
+        if task.task_type == TaskType.REGRESSION:
+            pred = torch.clamp(pred, clamp_min, clamp_max)
+        if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
+            pred = torch.sigmoid(pred)
+        pred = pred.view(-1) if pred.size(1) == 1 else pred
+        pred_list.append(pred.detach().float().cpu().numpy())
+        idx_list.append(scope_batch["global_idx"].cpu().numpy())
+
+    local_preds = np.concatenate(pred_list, axis=0) if pred_list else np.array([])
+    local_idxs = np.concatenate(idx_list, axis=0) if idx_list else np.array([])
+
+    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    dist.gather_object((local_idxs, local_preds), object_gather_list=gathered, dst=0)
+
+    if local_rank == 0:
+        all_preds = np.full((len(loader.dataset),), -100.0)
+        for i in range(world_size):
+            g_idx, g_pred = gathered[i]
+            for idx, pred in zip(g_idx, g_pred):
+                all_preds[idx] = pred
+        return all_preds
+    else:
+        return None
+
+
 @torch.no_grad()
 def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
@@ -443,16 +700,18 @@ if args.train_stage == "finetune":
     best_val_metric = -math.inf if higher_is_better else math.inf
     state_dict = None
 
+    # Select training and eval functions based on sampler
+    _train_fn = train_pass if args.sampler == "pass" else train_supervised
+    _test_fn = test_pass if args.sampler == "pass" else test
+
     for epoch in range(1, args.epochs + 1):
-        # use supervised training loop.
-        train_loss = train_supervised(epoch)
-        # scheduler.step()
-        
+        train_loss = _train_fn(epoch)
+
         dist.barrier()
         eval_model = model.module  # get the underlying model
-        
+
         # Run evaluation on the validation set.
-        val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
+        val_pred = _test_fn(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
         if local_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
@@ -461,17 +720,21 @@ if args.train_stage == "finetune":
                 "epoch_train_loss": train_loss,
                 **{f"val_{k}": v for k, v in val_metrics.items()}
             })
-            
+
             if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
             ):
                 best_val_metric = val_metrics[tune_metric]
                 state_dict = copy.deepcopy(model.module.state_dict())
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
+                if args.sampler == "pass":
+                    torch.save(pass_sampler.state_dict(), os.path.join(output_path, "pass_sampler.pt"))
         dist.barrier()
 
     if local_rank == 0 and state_dict is not None:
         model.module.load_state_dict(state_dict)
+        if args.sampler == "pass":
+            pass_sampler.load_state_dict(torch.load(os.path.join(output_path, "pass_sampler.pt"), map_location=device))
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     for buf in model.buffers():
@@ -479,8 +742,8 @@ if args.train_stage == "finetune":
     dist.barrier()
 
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    final_val_preds = _test_fn(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
+    final_test_preds = _test_fn(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
 
     if local_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))

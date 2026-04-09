@@ -311,6 +311,42 @@ class RelGT(torch.nn.Module):
 
         return x_set
 
+    def forward_with_preencoded_tfs(
+        self,
+        neighbor_types,
+        node_indices,
+        neighbor_hops,
+        neighbor_times,
+        preencoded_tfs,
+        edge_index=None,
+        batch=None,
+    ):
+        """
+        Same as forward() but accepts pre-encoded TF embeddings [B, K, channels]
+        to skip the tfs_encoder call. Used by PASSHeteroSampler to avoid
+        double-encoding candidates.
+
+        Returns x_set BEFORE the head, so we can capture gradients for REINFORCE.
+        """
+        neighbor_tfs = self.layer_norm_tfs(preencoded_tfs)
+        neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+        neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
+
+        cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
+        if self.ablate_idx is not None:
+            cat_list.pop(self.ablate_idx)
+        x_set = torch.cat(cat_list, dim=-1)
+        x_set = self.in_mixture(x_set)
+
+        x = x_set[:, 0, :]
+        for i, conv in enumerate(self.convs):
+            x_set = conv(x_set, x, node_indices)
+            x_set = self.ffs[i](x_set)
+
+        return x_set
+
     def global_forward(self, x, pos_enc, node_indices):
         raise NotImplementedError
         x = self.fc_in(x)

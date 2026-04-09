@@ -623,6 +623,153 @@ def local_nodes_hetero(
 
 
 ########################################
+#  Scope-based worker for PASS sampler
+########################################
+
+def _process_one_seed_scope(args):
+    """
+    Worker function: gather ALL neighbors for a seed node (up to sample_scope),
+    returning the full candidate scope instead of a K-sampled subgraph.
+
+    Accepts tuple: (sample_scope, seed_node_type, seed_node_idx, seed_time, seed_val, row_idx)
+
+    Uses the same GLOBAL_* variables as _process_one_seed.
+    """
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES, GLOBAL_TIME_ARRAYS
+    global GLOBAL_NODE_TYPES, GLOBAL_TYPE_TO_IDX, GLOBAL_IDX_TO_TYPE
+
+    (sample_scope, seed_node_type, seed_node_idx, seed_time, seed_val, row_idx) = args
+    random.seed(seed_val)
+    np.random.seed(seed_val % (2**32))
+
+    # Gather 1-hop and 2-hop neighbors (same as _process_one_seed)
+    if GLOBAL_TIME_ARRAYS is not None and isinstance(GLOBAL_ADJ, dict) and \
+       len(GLOBAL_ADJ) > 0 and "offsets" in next(iter(GLOBAL_ADJ.values())):
+        T_hat = gather_1_and_2_hop_vectorized(
+            GLOBAL_ADJ, GLOBAL_TIME_ARRAYS, GLOBAL_TYPE_TO_IDX, GLOBAL_NODE_TYPES,
+            seed_node_type, seed_node_idx, seed_time
+        )
+    else:
+        raise RuntimeError(
+            "Legacy dict-of-sets adjacency path is no longer supported. "
+            "Use build_adjacency_csr() to create CSR adjacency."
+        )
+
+    T_hat_list = list(T_hat)
+    one_hop = [n for n in T_hat_list if n[2] == 1]
+    two_hop = [n for n in T_hat_list if n[2] == 2]
+    combined = one_hop + two_hop
+    actual_count = len(combined)
+
+    # Cap at sample_scope, or pad with fallback if too few
+    if actual_count >= sample_scope:
+        chosen = random.sample(combined, sample_scope)
+    elif actual_count > 0:
+        chosen = combined  # keep all, will be padded
+    else:
+        # All fallback
+        fallback = _sample_fallback_nodes(GLOBAL_ALL_NODES, sample_scope, rng=random)
+        chosen = []
+        time_arrays = GLOBAL_TIME_ARRAYS or {}
+        for (ft, fi) in fallback:
+            if ft in time_arrays:
+                ft_time = float(time_arrays[ft][fi])
+                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
+            else:
+                rel_time = 0
+            chosen.append((ft, fi, 3, rel_time, None))
+        actual_count = len(chosen)
+
+    # Build output arrays
+    scope_count = min(actual_count, sample_scope)
+    out_types = np.zeros(sample_scope, dtype=np.int16)
+    out_indices = np.zeros(sample_scope, dtype=np.int32)
+    out_hops = np.zeros(sample_scope, dtype=np.int8)
+    out_times = np.zeros(sample_scope, dtype=np.float32)
+
+    for j, (t_str, idx, hop, t_val, _) in enumerate(chosen[:sample_scope]):
+        out_types[j] = GLOBAL_TYPE_TO_IDX[t_str]
+        out_indices[j] = idx
+        out_hops[j] = hop
+        out_times[j] = t_val
+
+    seed_type_idx = GLOBAL_TYPE_TO_IDX[seed_node_type]
+    return (row_idx, seed_type_idx, seed_node_idx, seed_time,
+            scope_count, out_types, out_indices, out_hops, out_times)
+
+
+def build_batch_edge_index_from_selected(
+    neighbor_types, neighbor_indices, csr_adj, idx_to_type, type_to_idx
+):
+    """
+    Build batched edge_index from selected [B, K] nodes using CSR adjacency.
+
+    Same logic as _process_one_seed lines 504-543, but batched.
+
+    Args:
+        neighbor_types:  [B, K] int tensor — type indices
+        neighbor_indices: [B, K] int tensor — local node indices
+        csr_adj: CSR adjacency dict
+        idx_to_type: {int: str} mapping
+        type_to_idx: {str: int} mapping
+
+    Returns:
+        edge_index: [2, total_E] long tensor
+        batch_vec:  [total_nodes] long tensor
+    """
+    B, K = neighbor_types.shape
+    nt_np = neighbor_types.cpu().numpy()
+    ni_np = neighbor_indices.cpu().numpy()
+
+    all_edges = []
+    batch_vec_parts = []
+    node_offset = 0
+
+    for b in range(B):
+        # Build local composite key map for this sample
+        local_composite = {}
+        for j in range(K):
+            ck = (int(nt_np[b, j]) << 32) | int(ni_np[b, j])
+            local_composite[ck] = j
+
+        local_ck_array = np.array(list(local_composite.keys()), dtype=np.int64)
+        edges = []
+
+        for j_src in range(K):
+            t_str = idx_to_type[int(nt_np[b, j_src])]
+            i = int(ni_np[b, j_src])
+            csr_nt = csr_adj[t_str]
+            s = int(csr_nt["offsets"][i])
+            e = int(csr_nt["offsets"][i + 1])
+            if s == e:
+                continue
+
+            nbr_types_arr = csr_nt["nbr_types"][s:e]
+            nbr_indices_arr = csr_nt["nbr_indices"][s:e]
+            nbr_ck = (nbr_types_arr.astype(np.int64) << 32) | nbr_indices_arr.astype(np.int64)
+
+            mask = np.isin(nbr_ck, local_ck_array)
+            for ck in nbr_ck[mask]:
+                edges.append((j_src + node_offset, local_composite[int(ck)] + node_offset))
+
+        if edges:
+            arr = np.array(edges, dtype=np.int64)
+            all_edges.append(arr)
+
+        batch_vec_parts.append(np.full(K, b, dtype=np.int64))
+        node_offset += K
+
+    if all_edges:
+        edges_cat = np.concatenate(all_edges, axis=0)
+        edge_index = torch.from_numpy(edges_cat.T).long()
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    batch_vec = torch.from_numpy(np.concatenate(batch_vec_parts)).long()
+    return edge_index, batch_vec
+
+
+########################################
 #  The RelGTTokens dataset class
 ########################################
 class RelGTTokens(Dataset):
@@ -1002,5 +1149,240 @@ class RelGTTokens(Dataset):
             "edge_index": edge_index,  # shape [2, total_E]
             "batch": batch_out         # shape [total_nodes]
         })
+
+        return out
+
+
+########################################
+#  RelGTTokensOnline — scope-based dataset for PASS sampler
+########################################
+
+class RelGTTokensOnline(Dataset):
+    """
+    Dataset that precomputes candidate scopes (not final K selections).
+    Used with PASSHeteroSampler for learned online sampling.
+
+    Each __getitem__ returns the full scope of candidates for a seed node.
+    The actual K-selection happens in the training loop via PASSHeteroSampler.
+    """
+
+    def __init__(
+        self,
+        data,
+        task,
+        K: int,
+        sample_scope: int = 512,
+        split: str = "train",
+        undirected: bool = True,
+        num_workers: int = None,
+        precomputed_dir: str = None,
+        train_stage: str = "finetune",
+    ):
+        super().__init__()
+        self.data = data
+        self.task = task
+        self.split = split
+        self.K = K
+        self.sample_scope = sample_scope
+        self.undirected = undirected
+        self.num_workers = num_workers
+        self.precomputed_dir = precomputed_dir
+
+        # Retrieve table and seeds/targets
+        self.table = self.task.get_table(split=self.split)
+        self.table_input = get_node_train_table_input(self.table, self.task)
+        self.node_type, self.node_idxs = self.table_input.nodes
+        self.target = self.table_input.target if self.table_input.target is not None else None
+
+        self.time = getattr(self.table_input, "time", None)
+        self.transform = getattr(self.table_input, "transform", None)
+
+        # type <-> index mappings
+        self.node_types = self.data.node_types
+        self.node_type_to_index = {nt: idx for idx, nt in enumerate(self.node_types)}
+        self.index_to_node_type = {idx: nt for idx, nt in enumerate(self.node_types)}
+
+        self.max_neighbor_hop = 2 + 1
+
+        self._create_global_mappings()
+
+        # HDF5 path for scope
+        self.precomputed_path = self._construct_precomputed_path()
+
+        self.train_stage = train_stage
+
+        # Precompute scope
+        rank = int(os.environ.get("RANK", 0))
+        if os.path.exists(self.precomputed_path):
+            print(f"[{self.split}] Found existing scope HDF5 at {self.precomputed_path}")
+        elif rank == 0:
+            print(f"[{self.split}] Precomputing scope (S={self.sample_scope})...")
+            self._precompute_scope()
+
+        if torch.distributed.is_initialized():
+            device_id = int(os.environ.get("LOCAL_RANK", 0))
+            torch.distributed.barrier(device_ids=[device_id])
+            if rank != 0 and not os.path.exists(self.precomputed_path):
+                raise RuntimeError(
+                    f"Rank {rank}: scope HDF5 not found after barrier: {self.precomputed_path}"
+                )
+
+    def _create_global_mappings(self):
+        self.type_local_to_global = {}
+        self.global_to_type_local = {}
+        global_index = 0
+        for type_idx, node_type in self.index_to_node_type.items():
+            if 'x' in self.data[node_type]:
+                num_nodes = self.data[node_type]['x'].size(0)
+            else:
+                num_nodes = self.data[node_type].num_nodes
+            for local_idx in range(num_nodes):
+                key = (type_idx, local_idx)
+                self.type_local_to_global[key] = global_index
+                self.global_to_type_local[global_index] = key
+                global_index += 1
+
+    def get_global_index(self, type_idxs, local_idxs):
+        out = []
+        for t_i, l_i in zip(type_idxs, local_idxs):
+            out.append(self.type_local_to_global[(t_i, l_i)])
+        return out
+
+    def _construct_precomputed_path(self) -> str:
+        if not self.precomputed_dir:
+            raise ValueError("must provide 'precomputed_dir' to store scopes.")
+        path = os.path.join(
+            self.precomputed_dir,
+            f"scope_{self.sample_scope}",
+            f"{self.split}.h5"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def __len__(self):
+        return len(self.node_idxs)
+
+    def _precompute_scope(self):
+        """Precompute candidate scopes and store in HDF5."""
+        total = len(self.node_idxs)
+        data_cpu = self.data.to("cpu")
+        t_total_start = time.time()
+
+        csr_adj = build_adjacency_csr(data_cpu, undirected=self.undirected)
+        time_arrays = {}
+        for nt in data_cpu.node_types:
+            if hasattr(data_cpu[nt], "time"):
+                time_arrays[nt] = data_cpu[nt].time.numpy().copy()
+
+        all_nodes_compact = _build_all_nodes_compact(data_cpu)
+
+        num_workers = self.num_workers
+        if num_workers is None:
+            num_workers = max(1, min(cpu_count() - 1, total))
+
+        all_tasks = []
+        for i, node_idx_t in enumerate(self.node_idxs):
+            node_idx = node_idx_t.item()
+            seed_t = self.time[i].item() if self.time is not None else 0.0
+            seed_val = hash((self.node_type, node_idx, seed_t, self.sample_scope)) & 0xffffffff
+            all_tasks.append((self.sample_scope, self.node_type, node_idx, seed_t, seed_val, i))
+
+        chunksize = max(1, total // (num_workers * 4))
+
+        print(f"[{self.split}] Starting scope precomputation: {total} seeds, S={self.sample_scope}, {num_workers} workers")
+
+        # Allocate arrays
+        all_scope_types = np.zeros((total, self.sample_scope), dtype=np.int16)
+        all_scope_indices = np.zeros((total, self.sample_scope), dtype=np.int32)
+        all_scope_hops = np.zeros((total, self.sample_scope), dtype=np.int8)
+        all_scope_times = np.zeros((total, self.sample_scope), dtype=np.float32)
+        all_scope_counts = np.zeros(total, dtype=np.int16)
+        all_seed_types = np.zeros(total, dtype=np.int16)
+        all_seed_indices = np.zeros(total, dtype=np.int32)
+        all_seed_times = np.zeros(total, dtype=np.float32)
+
+        node_types = list(data_cpu.node_types)
+        ctx = get_context("fork")
+        with ctx.Pool(
+            processes=num_workers,
+            initializer=init_worker_globals,
+            initargs=(csr_adj, all_nodes_compact, node_types, time_arrays)
+        ) as pool:
+            for result in tqdm(
+                pool.imap_unordered(_process_one_seed_scope, all_tasks, chunksize=chunksize),
+                total=total,
+                desc=f"Precomputing scope '{self.split}'"
+            ):
+                (row_idx, seed_type_idx, seed_node_idx, seed_time,
+                 scope_count, out_types, out_indices, out_hops, out_times) = result
+
+                all_scope_types[row_idx] = out_types
+                all_scope_indices[row_idx] = out_indices
+                all_scope_hops[row_idx] = out_hops
+                all_scope_times[row_idx] = out_times
+                all_scope_counts[row_idx] = scope_count
+                all_seed_types[row_idx] = seed_type_idx
+                all_seed_indices[row_idx] = seed_node_idx
+                all_seed_times[row_idx] = seed_time
+
+        # Atomic write
+        tmp_path = self.precomputed_path + f".tmp.{os.getpid()}"
+        try:
+            with h5py.File(tmp_path, 'w') as hf:
+                hf.create_dataset("scope_types", data=all_scope_types)
+                hf.create_dataset("scope_indices", data=all_scope_indices)
+                hf.create_dataset("scope_hops", data=all_scope_hops)
+                hf.create_dataset("scope_times", data=all_scope_times)
+                hf.create_dataset("scope_counts", data=all_scope_counts)
+                hf.create_dataset("seed_types", data=all_seed_types)
+                hf.create_dataset("seed_indices", data=all_seed_indices)
+                hf.create_dataset("seed_times", data=all_seed_times)
+            os.rename(tmp_path, self.precomputed_path)
+        except BaseException:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+        elapsed = time.time() - t_total_start
+        mins, secs = divmod(elapsed, 60)
+        hrs, mins = divmod(mins, 60)
+        print(f"[{self.split}] Scope precomputation complete: {total} seeds in "
+              f"{int(hrs)}h {int(mins)}m {secs:.1f}s")
+
+    def __getitem__(self, idx: int):
+        with h5py.File(self.precomputed_path, 'r') as hf:
+            sample = {
+                "scope_types": torch.from_numpy(hf["scope_types"][idx]).long(),
+                "scope_indices": torch.from_numpy(hf["scope_indices"][idx]).long(),
+                "scope_hops": torch.from_numpy(hf["scope_hops"][idx]).long(),
+                "scope_times": torch.from_numpy(hf["scope_times"][idx]).float(),
+                "scope_count": int(hf["scope_counts"][idx]),
+                "seed_type": int(hf["seed_types"][idx]),
+                "seed_index": int(hf["seed_indices"][idx]),
+            }
+
+        label = self.target[idx] if self.target is not None else None
+        sample["global_idx"] = idx
+        return sample, label
+
+    def collate(self, batch):
+        """Stack scope data into batched tensors. No edge_index or tfs built here."""
+        samples, labels = zip(*batch)
+
+        out = {
+            "scope_types": torch.stack([s["scope_types"] for s in samples]),     # [B, S]
+            "scope_indices": torch.stack([s["scope_indices"] for s in samples]), # [B, S]
+            "scope_hops": torch.stack([s["scope_hops"] for s in samples]),       # [B, S]
+            "scope_times": torch.stack([s["scope_times"] for s in samples]),     # [B, S]
+            "scope_count": torch.tensor([s["scope_count"] for s in samples], dtype=torch.long),
+            "seed_type": torch.tensor([s["seed_type"] for s in samples], dtype=torch.long),
+            "seed_index": torch.tensor([s["seed_index"] for s in samples], dtype=torch.long),
+            "global_idx": torch.tensor([s["global_idx"] for s in samples], dtype=torch.long),
+        }
+
+        if self.target is not None:
+            out["labels"] = torch.stack(labels, dim=0)
+        else:
+            out["labels"] = None
 
         return out
