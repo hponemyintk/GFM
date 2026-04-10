@@ -495,9 +495,11 @@ def train_pass(epoch) -> float:
         )
 
         # 8. Forward through RelGT with pre-encoded tfs
+        # Note: uses model.module directly because DDP's forward would mark
+        # tfs_encoder as "unused" (it was called outside the model forward),
+        # which would break gradient sync. We manually all_reduce all gradients instead.
         optimizer.zero_grad()
         with amp_ctx:
-            # Use forward_with_preencoded_tfs — returns x_set before head
             x_set = model.module.forward_with_preencoded_tfs(
                 neighbor_types, node_indices, neighbor_hops, neighbor_times,
                 preencoded_tfs,
@@ -516,6 +518,12 @@ def train_pass(epoch) -> float:
             chain_grad = x_set.grad.detach()
             sample_loss = pass_sampler.reinforce_loss(chain_grad)
             sample_loss.backward()
+
+        # 11. Synchronize all gradients across ranks (model.module bypasses DDP hooks)
+        if world_size > 1:
+            for p in list(model.parameters()) + list(pass_sampler.own_parameters()):
+                if p.grad is not None:
+                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
 
         clip_grad_norm_(
             list(model.parameters()) + list(pass_sampler.own_parameters()),
@@ -734,11 +742,18 @@ if args.train_stage == "finetune":
     if local_rank == 0 and state_dict is not None:
         model.module.load_state_dict(state_dict)
         if args.sampler == "pass":
-            pass_sampler.load_state_dict(torch.load(os.path.join(output_path, "pass_sampler.pt"), map_location=device))
+            # Only load sampler-specific keys (tfs_encoder already loaded via model)
+            sampler_sd = torch.load(os.path.join(output_path, "pass_sampler.pt"), map_location=device)
+            own_keys = {k: v for k, v in sampler_sd.items() if not k.startswith("tfs_encoder.")}
+            pass_sampler.load_state_dict(own_keys, strict=False)
     for param in model.parameters():
         dist.broadcast(param.data, src=0)
     for buf in model.buffers():
         dist.broadcast(buf.data, src=0)
+    # Broadcast PASS sampler own params (not covered by model broadcast)
+    if args.sampler == "pass" and pass_sampler is not None:
+        for p in pass_sampler.own_parameters():
+            dist.broadcast(p.data, src=0)
     dist.barrier()
 
     # Final evaluation after finetuning:

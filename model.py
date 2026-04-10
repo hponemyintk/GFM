@@ -281,7 +281,7 @@ class RelGT(torch.nn.Module):
 
         self.head.reset_parameters()
 
-    def forward(self, 
+    def forward(self,
                 neighbor_types,
                 node_indices,
                 neighbor_hops,
@@ -290,19 +290,19 @@ class RelGT(torch.nn.Module):
                 edge_index=None,
                 batch=None,
                 ):
-        
+
         neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
         neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
         neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
         neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
         neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
-        
+
         cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
         if self.ablate_idx is not None:
             cat_list.pop(self.ablate_idx)
-        x_set = torch.cat(cat_list, dim=-1)        
+        x_set = torch.cat(cat_list, dim=-1)
         x_set = self.in_mixture(x_set)
-        
+
         x = x_set[:, 0, :] # select seed token representation
         for i, conv in enumerate(self.convs):
             x_set = conv(x_set, x, node_indices)

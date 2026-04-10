@@ -182,8 +182,10 @@ class PASSHeteroSampler(nn.Module):
         source = seed_embeds.unsqueeze(1).expand(B, S, D).reshape(B * S, D)
         target = candidate_embeds.reshape(B * S, D)
 
-        ss = torch.mm(source, self.Ws)  # [B*S, hidden_dim]
-        tt = torch.mm(target, self.Ws)  # [B*S, hidden_dim]
+        # Detach source/target so REINFORCE gradients only flow to Ws and as_,
+        # not back through tfs_encoder (paper Theorem 4.1 treats h_i, h_j as constants)
+        ss = torch.mm(source.detach(), self.Ws)  # [B*S, hidden_dim]
+        tt = torch.mm(target.detach(), self.Ws)  # [B*S, hidden_dim]
 
         # q_imp = (Ws · h_i) · (Ws · h_j)  — dot product  (paper Eq. 4)
         q_imp = torch.bmm(ss.unsqueeze(1), tt.unsqueeze(2)).squeeze(2)  # [B*S, 1]
@@ -207,6 +209,7 @@ class PASSHeteroSampler(nn.Module):
 
         # Clamp to non-negative for valid probability distribution
         q_tilde = q_tilde.clamp(min=0.0) + 1e-9
+        q_tilde = q_tilde.masked_fill(pad_mask, 0.0)  # re-zero padding after epsilon
 
         # q = q̃ / Σ_k q̃(k|i)  (paper Eq. 7) — Categorical normalizes internally
         dist = torch.distributions.Categorical(probs=q_tilde)
@@ -238,7 +241,8 @@ class PASSHeteroSampler(nn.Module):
         # log π(action) for the K-1 sampled neighbors
         logp = self.batch_dist.log_prob(self.batch_selected.T).T  # [B, K-1]
 
-        sel_embeds = self.selected_embeds  # [B, K-1, embed_dim]
+        # Detach h_j: paper treats neighbor embeddings as constants in REINFORCE
+        sel_embeds = self.selected_embeds.detach()  # [B, K-1, embed_dim]
 
         # X = log_prob * h_j, averaged over sampled neighbors  (paper Theorem 4.1)
         X = logp.unsqueeze(2) * sel_embeds  # [B, K-1, embed_dim]
