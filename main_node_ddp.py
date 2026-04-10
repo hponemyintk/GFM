@@ -89,9 +89,9 @@ parser.add_argument(
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
 parser.add_argument("--amp", action="store_true", default=False,
                     help="Enable BF16 mixed precision training")
-parser.add_argument("--sampler", type=str, default="random", choices=["random", "pass"],
+parser.add_argument("--sampler", type=str, default="pass", choices=["random", "pass"],
                     help="Sampling strategy: 'random' (default precomputed) or 'pass' (learned PASS-GNN)")
-parser.add_argument("--sample_scope", type=int, default=512,
+parser.add_argument("--sample_scope", type=int, default=1200,
                     help="PASS: candidate scope size per seed node")
 parser.add_argument("--pass_hidden_dim", type=int, default=32,
                     help="PASS: hidden dim for attention projection")
