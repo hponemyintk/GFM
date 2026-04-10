@@ -831,20 +831,14 @@ class RelGTTokens(Dataset):
         # Create global index mappings for (type_id, local_id)
         self._create_global_mappings()
 
+        self.train_stage = train_stage
+
         # HDF5 path
         self.precomputed_path = self._construct_precomputed_path()
-        
-        self.train_stage = train_stage
 
         if self.precompute:
             # DDP safety: only rank 0 precomputes, others wait
             rank = int(os.environ.get("RANK", 0))
-
-            if self.node_embeddings is not None and os.path.exists(self.precomputed_path):
-                # Stage 2: overwrite existing samples with similarity-based resampling
-                if rank == 0:
-                    print(f"[{self.split}] Removing existing HDF5 for resampling: {self.precomputed_path}")
-                    os.remove(self.precomputed_path)
 
             if os.path.exists(self.precomputed_path):
                 print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
@@ -895,6 +889,7 @@ class RelGTTokens(Dataset):
             raise ValueError("must provide a 'precomputed_dir' to store expansions.")
         path = os.path.join(
             self.precomputed_dir,
+            self.train_stage,
             str(self.K),
             f"{self.split}.h5"
         )
