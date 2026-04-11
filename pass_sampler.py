@@ -113,7 +113,7 @@ class PASSHeteroSampler(nn.Module):
                 out = out.squeeze(1)
 
             flat_positions = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(1)
-            encoded_flat[flat_positions] = out
+            encoded_flat[flat_positions] = out.to(encoded_flat.dtype)
 
         candidate_embeds = encoded_flat.reshape(B, S, self.embed_dim)
         candidate_embeds = candidate_embeds + self.type_embeddings(scope_types.to(device))
