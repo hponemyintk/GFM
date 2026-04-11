@@ -451,7 +451,7 @@ def train_pass(epoch) -> float:
 
         # 2. PASS attention-based selection
         scope_counts = scope_batch["scope_count"].to(device)
-        selected_idx, dist = pass_sampler(seed_embeds, candidate_embeds, scope_counts, K)
+        selected_idx, _dist = pass_sampler(seed_embeds, candidate_embeds, scope_counts, K)
 
         # 3. Gather selected node info from scope
         scope_types = scope_batch["scope_types"].to(device)
