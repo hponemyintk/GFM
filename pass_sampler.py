@@ -156,7 +156,7 @@ class PASSHeteroSampler(nn.Module):
             if out.dim() == 3 and out.shape[1] == 1:
                 out = out.squeeze(1)
 
-            seed_embeds[mask] = out
+            seed_embeds[mask] = out.to(seed_embeds.dtype)
 
         seed_embeds = seed_embeds + self.type_embeddings(seed_types.to(device))
         return seed_embeds
@@ -184,8 +184,9 @@ class PASSHeteroSampler(nn.Module):
 
         # Detach source/target so REINFORCE gradients only flow to Ws and as_,
         # not back through tfs_encoder (paper Theorem 4.1 treats h_i, h_j as constants)
-        ss = torch.mm(source.detach(), self.Ws)  # [B*S, hidden_dim]
-        tt = torch.mm(target.detach(), self.Ws)  # [B*S, hidden_dim]
+        # Cast to Ws dtype to avoid bfloat16 @ float32 mismatch outside autocast
+        ss = torch.mm(source.detach().to(self.Ws.dtype), self.Ws)  # [B*S, hidden_dim]
+        tt = torch.mm(target.detach().to(self.Ws.dtype), self.Ws)  # [B*S, hidden_dim]
 
         # q_imp = (Ws · h_i) · (Ws · h_j)  — dot product  (paper Eq. 4)
         q_imp = torch.bmm(ss.unsqueeze(1), tt.unsqueeze(2)).squeeze(2)  # [B*S, 1]
@@ -213,7 +214,23 @@ class PASSHeteroSampler(nn.Module):
 
         # q = q̃ / Σ_k q̃(k|i)  (paper Eq. 7) — Categorical normalizes internally
         dist = torch.distributions.Categorical(probs=q_tilde)
-        selected = dist.sample((K - 1,)).T  # [B, K-1]
+        probs = dist.probs  # normalized [B, S]
+
+        # Sample without replacement to avoid duplicate neighbors.
+        # Fall back to with-replacement only for rows with fewer valid
+        # candidates than K-1; the downstream RelGT code handles that.
+        num_select = K - 1
+        min_valid = scope_counts.min().item()
+        if min_valid >= num_select:
+            selected = torch.multinomial(probs, num_select, replacement=False)
+        else:
+            # Mixed batch: some rows need replacement, most don't
+            selected = torch.multinomial(probs, num_select, replacement=True)
+            enough = scope_counts >= num_select
+            if enough.any():
+                selected[enough] = torch.multinomial(
+                    probs[enough], num_select, replacement=False
+                )
 
         # Save for REINFORCE
         self.batch_selected = selected
