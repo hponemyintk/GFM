@@ -266,5 +266,7 @@ class PASSHeteroSampler(nn.Module):
         X = X.mean(dim=1)                   # [B, embed_dim]
 
         # Dot product with upstream gradient as reward signal
-        batch_loss = torch.bmm(loss_up.unsqueeze(1), X.unsqueeze(2))  # [B, 1, 1]
+        # Cast to float32 for consistent computation — loss_up may be
+        # bfloat16 from AMP autocast while X is float32 from the distribution
+        batch_loss = torch.bmm(loss_up.unsqueeze(1).float(), X.unsqueeze(2).float())  # [B, 1, 1]
         return batch_loss.mean()
