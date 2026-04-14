@@ -26,11 +26,16 @@ GLOBAL_ADJ = None
 GLOBAL_ALL_NODES = None
 
 class GloveTextEmbedding:
-        def __init__(self, device: torch.device):
-            self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
+    def __init__(self, device: torch.device):
+        self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
         
-        def __call__(self, sentences: List[str]) -> Tensor:
-            return torch.from_numpy(self.model.encode(sentences))
+    def __call__(self, sentences: List[str]) -> Tensor:
+        #Safely catch NaNs using numpy without crashing on valid strings
+        safe_sentences = [
+            "" if isinstance(s, float) and np.isnan(s) else str(s)
+            for s in sentences
+        ]
+        return torch.from_numpy(self.model.encode(sentences))
 
 def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
     adjacency = {

@@ -5,7 +5,12 @@ import math
 import os
 from pathlib import Path
 from typing import Dict
-import wandb
+
+# Check if WANDB_API_KEY exists and is not an empty string
+if os.environ.get("WANDB_API_KEY"):
+    from c1_aiml_aem import wandb
+else:
+    import wandb
 
 import numpy as np
 import torch
@@ -114,8 +119,8 @@ gpu_handle = init_gpu_utilization(local_rank)
 ############################
 # 3. Load dataset, task, and prepare data
 ############################
-dataset: Dataset = get_dataset(args.dataset, download=True)
-task: EntityTask = get_task(args.dataset, args.task, download=True)
+dataset: Dataset = get_dataset(args.dataset, download=False)
+task: EntityTask = get_task(args.dataset, args.task, download=False)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
 try:
