@@ -38,7 +38,14 @@ from relbench.tasks import get_task
 
 # within this project
 from model import RelGT
-from utils import GloveTextEmbedding, RelGTTokens
+from utils import (
+    GloveTextEmbedding,
+    RelGTTokens,
+    RelGTTokensOnline,
+    build_adjacency_hetero,
+    build_batch_edge_index_from_selected,
+)
+from pass_sampler import PASSHeteroSampler
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -81,6 +88,12 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+parser.add_argument("--sampler", type=str, default="pass", choices=["random", "pass"],
+                    help="Sampling strategy: 'random' (precomputed K-subgraphs) or 'pass' (learned PASS-GNN)")
+parser.add_argument("--sample_scope", type=int, default=3000,
+                    help="PASS: candidate scope size per seed node")
+parser.add_argument("--pass_hidden_dim", type=int, default=128,
+                    help="PASS: hidden dim for attention projection")
 
 args = parser.parse_args()
 
@@ -144,19 +157,39 @@ data, col_stats_dict = make_pkey_fkey_graph(
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
 
-data = {
-    split: RelGTTokens(
-        data=data, 
-        task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
-        precompute=args.precompute,
-        precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
-        num_workers=args.num_workers,
-        train_stage=args.train_stage)
-        for split in ["train", "val", "test"]
-    }
+if args.sampler == "pass":
+    data = {
+        split: RelGTTokensOnline(
+            data=data,
+            task=task,
+            K=args.num_neighbors,
+            sample_scope=args.sample_scope,
+            split=split,
+            undirected=True,
+            precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
+            num_workers=args.num_workers,
+            train_stage=args.train_stage)
+            for split in ["train", "val", "test"]
+        }
+    # Shared state used by train_pass/test_pass.
+    adjacency_online = build_adjacency_hetero(data["train"].data.to("cpu"), undirected=True)
+    idx_to_type = data["train"].index_to_node_type
+    type_to_idx = data["train"].node_type_to_index
+    hetero_data = data["train"].data
+else:
+    data = {
+        split: RelGTTokens(
+            data=data,
+            task=task,
+            K=args.num_neighbors,
+            split=split,
+            undirected=True,
+            precompute=args.precompute,
+            precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
+            num_workers=args.num_workers,
+            train_stage=args.train_stage)
+            for split in ["train", "val", "test"]
+        }
 
 ############################
 # 4. Create DataLoaders (with a DistributedSampler for training)
@@ -276,7 +309,23 @@ os.makedirs(output_path, exist_ok=True)
 
 world_size = dist.get_world_size()
 base_lr = args.lr * world_size
-optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
+
+pass_sampler = None
+if args.sampler == "pass":
+    pass_sampler = PASSHeteroSampler(
+        tfs_encoder=model.module.tfs_encoder,
+        num_types=len(data["train"].node_types),
+        embed_dim=args.channels,
+        hidden_dim=args.pass_hidden_dim,
+    ).to(device)
+    # Use own_parameters() — NOT .parameters() — to avoid double-registering
+    # the shared tfs_encoder params (already in model.parameters()).
+    optimizer = torch.optim.Adam(
+        list(model.parameters()) + list(pass_sampler.own_parameters()),
+        lr=base_lr, weight_decay=args.weight_decay,
+    )
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
 global_step = 0
 
@@ -402,21 +451,238 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
     else:
         return None
 
+
+def _pass_build_subgraph(scope_batch, selected_idx, seed_embeds):
+    """Shared helper for train_pass / test_pass.
+
+    Given a pass_sampler output (selected_idx and stored selected_embeds), and
+    the raw scope_batch, builds the [B, K] neighbor_types/indices/hops/times
+    tensors on the device, the preencoded tfs tensor, and the CPU-built
+    edge_index + batch_vec.
+    """
+    B = scope_batch["scope_types"].shape[0]
+    scope_types = scope_batch["scope_types"].to(device)
+    scope_indices = scope_batch["scope_indices"].to(device)
+    scope_hops = scope_batch["scope_hops"].to(device)
+    scope_times = scope_batch["scope_times"].to(device)
+    seed_type = scope_batch["seed_type"].to(device)
+    seed_index = scope_batch["seed_index"].to(device)
+
+    sel_types = torch.gather(scope_types, 1, selected_idx)
+    sel_indices = torch.gather(scope_indices, 1, selected_idx)
+    sel_hops = torch.gather(scope_hops, 1, selected_idx)
+    sel_times = torch.gather(scope_times, 1, selected_idx)
+
+    # Prepend the seed token at position 0.
+    neighbor_types = torch.cat([seed_type.unsqueeze(1), sel_types], dim=1)
+    neighbor_indices = torch.cat([seed_index.unsqueeze(1), sel_indices], dim=1)
+    neighbor_hops = torch.cat(
+        [torch.zeros(B, 1, dtype=sel_hops.dtype, device=device), sel_hops], dim=1
+    )
+    neighbor_times = torch.cat(
+        [torch.zeros(B, 1, dtype=sel_times.dtype, device=device), sel_times], dim=1
+    )
+
+    # Reuse the already-computed encodings — avoids a second tfs_encoder pass.
+    preencoded_tfs = torch.cat(
+        [seed_embeds.unsqueeze(1), pass_sampler.selected_embeds], dim=1
+    )
+
+    edge_index_cpu, batch_vec_cpu = build_batch_edge_index_from_selected(
+        neighbor_types, neighbor_indices, adjacency_online, idx_to_type
+    )
+    edge_index_dev = edge_index_cpu.to(device)
+    batch_vec_dev = batch_vec_cpu.to(device)
+
+    first_types = neighbor_types[:, 0].detach().cpu().tolist()
+    first_indices = neighbor_indices[:, 0].detach().cpu().tolist()
+    node_indices = torch.tensor(
+        data["train"].get_global_index(first_types, first_indices),
+        dtype=torch.long,
+        device=device,
+    )
+
+    return (
+        neighbor_types,
+        neighbor_indices,
+        neighbor_hops,
+        neighbor_times,
+        preencoded_tfs,
+        edge_index_dev,
+        batch_vec_dev,
+        node_indices,
+    )
+
+
+def train_pass(epoch) -> float:
+    global global_step
+    model.train()
+    pass_sampler.train()
+    loss_accum = count_accum = 0
+    total_steps = min(len(loader_dict["train"]), args.max_steps_per_epoch)
+
+    train_sampler.set_epoch(epoch)
+
+    for step, scope_batch in enumerate(
+        tqdm(loader_dict["train"], total=total_steps, desc="Train(PASS)"), start=1
+    ):
+        labels = scope_batch["labels"].to(device)
+
+        candidate_embeds = pass_sampler.encode_candidates(scope_batch, hetero_data, device)
+        seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
+
+        scope_counts = scope_batch["scope_count"].to(device)
+        selected_idx, _ = pass_sampler(
+            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors
+        )
+
+        (
+            neighbor_types,
+            neighbor_indices,
+            neighbor_hops,
+            neighbor_times,
+            preencoded_tfs,
+            edge_index_dev,
+            batch_vec_dev,
+            node_indices,
+        ) = _pass_build_subgraph(scope_batch, selected_idx, seed_embeds)
+
+        optimizer.zero_grad()
+        x_set = model.module.forward_with_preencoded_tfs(
+            neighbor_types,
+            node_indices,
+            neighbor_hops,
+            neighbor_times,
+            preencoded_tfs,
+            edge_index=edge_index_dev,
+            batch=batch_vec_dev,
+        )
+        x_set.retain_grad()
+        pred = model.module.head(x_set)
+        pred = pred.view(-1) if pred.size(1) == 1 else pred
+        task_loss = loss_fn(pred.float(), labels)
+        task_loss.backward()
+
+        sample_loss_val = 0.0
+        if x_set.grad is not None:
+            chain_grad = x_set.grad.detach()  # [B, D] — already 2D after convs
+            sample_loss = pass_sampler.reinforce_loss(chain_grad)
+            sample_loss.backward()
+            sample_loss_val = sample_loss.detach().item()
+
+        clip_grad_norm_(
+            list(model.parameters()) + list(pass_sampler.own_parameters()),
+            max_norm=1.0,
+        )
+        optimizer.step()
+
+        loss_value = task_loss.detach().item()
+        gpu_util, mem_allocated, mem_reserved = get_gpu_stats(gpu_handle, device)
+        if local_rank == 0:
+            wandb.log({
+                "train_loss": loss_value,
+                "sample_loss": sample_loss_val,
+                "global_step": global_step,
+                "lr": optimizer.param_groups[0]["lr"],
+                "gpu_util_percent": gpu_util,
+                "gpu_mem_allocated_MB": mem_allocated,
+                "gpu_mem_reserved_MB": mem_reserved,
+            })
+
+        loss_accum += loss_value * pred.size(0)
+        count_accum += pred.size(0)
+        global_step += 1
+
+        if step >= args.max_steps_per_epoch:
+            break
+
+    return loss_accum / count_accum if count_accum > 0 else float('inf')
+
+
+@torch.no_grad()
+def test_pass(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
+    if loader.sampler is not None and hasattr(loader.sampler, 'set_epoch'):
+        loader.sampler.set_epoch(epoch)
+
+    eval_model.eval()
+    pass_sampler.eval()
+    pred_list = []
+    idx_list = []
+
+    for scope_batch in tqdm(loader, desc=desc, disable=(local_rank != 0)):
+        candidate_embeds = pass_sampler.encode_candidates(scope_batch, hetero_data, device)
+        seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
+
+        scope_counts = scope_batch["scope_count"].to(device)
+        selected_idx, _ = pass_sampler(
+            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors
+        )
+
+        (
+            neighbor_types,
+            _,
+            neighbor_hops,
+            neighbor_times,
+            preencoded_tfs,
+            edge_index_dev,
+            batch_vec_dev,
+            node_indices,
+        ) = _pass_build_subgraph(scope_batch, selected_idx, seed_embeds)
+
+        x_set = eval_model.forward_with_preencoded_tfs(
+            neighbor_types,
+            node_indices,
+            neighbor_hops,
+            neighbor_times,
+            preencoded_tfs,
+            edge_index=edge_index_dev,
+            batch=batch_vec_dev,
+        )
+        pred = eval_model.head(x_set)
+
+        if task.task_type == TaskType.REGRESSION:
+            pred = torch.clamp(pred, clamp_min, clamp_max)
+        if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
+            pred = torch.sigmoid(pred)
+        pred = pred.view(-1) if pred.size(1) == 1 else pred
+
+        pred_list.append(pred.detach().cpu().numpy())
+        idx_list.append(scope_batch["global_idx"].cpu().numpy())
+
+    local_preds = np.concatenate(pred_list, axis=0) if pred_list else np.array([])
+    local_idxs = np.concatenate(idx_list, axis=0) if idx_list else np.array([])
+
+    gathered = [None for _ in range(world_size)] if local_rank == 0 else None
+    dist.gather_object((local_idxs, local_preds), object_gather_list=gathered, dst=0)
+
+    if local_rank == 0:
+        all_preds = np.full((len(loader.dataset),), -100.0)
+        for i in range(world_size):
+            g_idx, g_pred = gathered[i]
+            for idx, pred in zip(g_idx, g_pred):
+                all_preds[idx] = pred
+        return all_preds
+    else:
+        return None
+
+
+_train_fn = train_pass if args.sampler == "pass" else train_supervised
+_test_fn = test_pass if args.sampler == "pass" else test
+
 if args.train_stage == "finetune":
     # Supervised Finetuning Stage:
     best_val_metric = -math.inf if higher_is_better else math.inf
     state_dict = None
 
     for epoch in range(1, args.epochs + 1):
-        # use supervised training loop.
-        train_loss = train_supervised(epoch)
+        train_loss = _train_fn(epoch)
         # scheduler.step()
-        
+
         dist.barrier()
         eval_model = model.module  # get the underlying model
-        
+
         # Run evaluation on the validation set.
-        val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
+        val_pred = _test_fn(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
         if local_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
@@ -425,13 +691,18 @@ if args.train_stage == "finetune":
                 "epoch_train_loss": train_loss,
                 **{f"val_{k}": v for k, v in val_metrics.items()}
             })
-            
+
             if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric
             ):
                 best_val_metric = val_metrics[tune_metric]
                 state_dict = copy.deepcopy(model.module.state_dict())
                 torch.save(state_dict, os.path.join(output_path, "finetuned.pt"))
+                if args.sampler == "pass":
+                    torch.save(
+                        pass_sampler.state_dict(),
+                        os.path.join(output_path, "pass_sampler.pt"),
+                    )
         dist.barrier()
 
     if local_rank == 0 and state_dict is not None:
@@ -442,9 +713,18 @@ if args.train_stage == "finetune":
         dist.broadcast(buf.data, src=0)
     dist.barrier()
 
+    if args.sampler == "pass":
+        sampler_ckpt = os.path.join(output_path, "pass_sampler.pt")
+        if os.path.exists(sampler_ckpt):
+            sd = torch.load(sampler_ckpt, map_location=device)
+            # Filter out the shared tfs_encoder keys — those live in
+            # model.module and are already loaded above.
+            own_keys = {k: v for k, v in sd.items() if not k.startswith("tfs_encoder.")}
+            pass_sampler.load_state_dict(own_keys, strict=False)
+
     # Final evaluation after finetuning:
-    final_val_preds = test(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
-    final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
+    final_val_preds = _test_fn(loader_dict["val"], eval_model=model.module, epoch=0, desc="Val")
+    final_test_preds = _test_fn(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
 
     if local_rank == 0:
         val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
