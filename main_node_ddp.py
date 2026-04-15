@@ -47,7 +47,7 @@ from utils import (
 )
 from pass_sampler import PASSHeteroSampler
 
-torch.autograd.set_detect_anomaly(True)
+torch.autograd.set_detect_anomaly(False)
 
 ############################
 # 1. Parse arguments
@@ -94,6 +94,12 @@ parser.add_argument("--sample_scope", type=int, default=3000,
                     help="PASS: candidate scope size per seed node")
 parser.add_argument("--pass_hidden_dim", type=int, default=128,
                     help="PASS: hidden dim for attention projection")
+parser.add_argument("--sampler_warmup_epochs", type=int, default=0,
+                    help="PASS: epochs to train only the task model (sampler frozen at uniform init). "
+                         "Runs first, before any sampler learning.")
+parser.add_argument("--sampler_only_epochs", type=int, default=0,
+                    help="PASS: epochs to train only the sampler on a frozen task model. "
+                         "Runs after --sampler_warmup_epochs.")
 
 args = parser.parse_args()
 
@@ -132,7 +138,7 @@ gpu_handle = init_gpu_utilization(local_rank)
 ############################
 # 3. Load dataset, task, and prepare data
 ############################
-dataset: Dataset = get_dataset(args.dataset, download=False)
+dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=False)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
@@ -329,6 +335,23 @@ else:
 
 global_step = 0
 
+
+def _set_pass_phase(phase: str):
+    """Toggle requires_grad to implement the three-phase PASS schedule:
+    - 'warmup': task model trains, sampler frozen at uniform init.
+    - 'sampler_only': task model frozen, sampler trains on a stationary reward.
+    - 'joint': both train together (standard PASS regime).
+    """
+    if pass_sampler is None:
+        return
+    task_grad = phase != "sampler_only"
+    samp_grad = phase != "warmup"
+    for p in model.parameters():
+        p.requires_grad = task_grad
+    for p in pass_sampler.own_parameters():
+        p.requires_grad = samp_grad
+
+
 ############################
 # 7. Training and Evaluation Loops
 ############################
@@ -468,10 +491,16 @@ def _pass_build_subgraph(scope_batch, selected_idx, seed_embeds):
     seed_type = scope_batch["seed_type"].to(device)
     seed_index = scope_batch["seed_index"].to(device)
 
-    sel_types = torch.gather(scope_types, 1, selected_idx)
-    sel_indices = torch.gather(scope_indices, 1, selected_idx)
-    sel_hops = torch.gather(scope_hops, 1, selected_idx)
-    sel_times = torch.gather(scope_times, 1, selected_idx)
+    if selected_idx.numel() == 0:
+        sel_types = scope_types[:, :0]
+        sel_indices = scope_indices[:, :0]
+        sel_hops = scope_hops[:, :0]
+        sel_times = scope_times[:, :0]
+    else:
+        sel_types = torch.gather(scope_types, 1, selected_idx)
+        sel_indices = torch.gather(scope_indices, 1, selected_idx)
+        sel_hops = torch.gather(scope_hops, 1, selected_idx)
+        sel_times = torch.gather(scope_times, 1, selected_idx)
 
     # Prepend the seed token at position 0.
     neighbor_types = torch.cat([seed_type.unsqueeze(1), sel_types], dim=1)
@@ -514,7 +543,7 @@ def _pass_build_subgraph(scope_batch, selected_idx, seed_embeds):
     )
 
 
-def train_pass(epoch) -> float:
+def train_pass(epoch, phase: str = "joint") -> float:
     global global_step
     model.train()
     pass_sampler.train()
@@ -564,7 +593,11 @@ def train_pass(epoch) -> float:
         task_loss.backward()
 
         sample_loss_val = 0.0
-        if x_set.grad is not None:
+        if (
+            phase != "warmup"
+            and x_set.grad is not None
+            and pass_sampler.batch_dist is not None
+        ):
             chain_grad = x_set.grad.detach()  # [B, D] — already 2D after convs
             sample_loss = pass_sampler.reinforce_loss(chain_grad)
             sample_loss.backward()
@@ -674,8 +707,22 @@ if args.train_stage == "finetune":
     best_val_metric = -math.inf if higher_is_better else math.inf
     state_dict = None
 
+    warmup_end = args.sampler_warmup_epochs
+    sampler_only_end = warmup_end + args.sampler_only_epochs
     for epoch in range(1, args.epochs + 1):
-        train_loss = _train_fn(epoch)
+        if args.sampler == "pass":
+            if epoch <= warmup_end:
+                phase = "warmup"
+            elif epoch <= sampler_only_end:
+                phase = "sampler_only"
+            else:
+                phase = "joint"
+            _set_pass_phase(phase)
+            if local_rank == 0 and (epoch == 1 or epoch == warmup_end + 1 or epoch == sampler_only_end + 1):
+                print(f"[phase] epoch {epoch}: {phase}")
+            train_loss = _train_fn(epoch, phase=phase)
+        else:
+            train_loss = _train_fn(epoch)
         # scheduler.step()
 
         dist.barrier()

@@ -141,6 +141,17 @@ class PASSHeteroSampler(nn.Module):
         B, S, D = candidate_embeds.shape
         device = candidate_embeds.device
 
+        # Seed-only mode: K=1 means no neighbors are sampled at all. Short-
+        # circuit before any q_imp / Categorical work and return empty
+        # selections so callers can still build a [B, 1] subgraph from the
+        # seed alone.
+        if K - 1 <= 0:
+            empty_idx = torch.empty(B, 0, dtype=torch.long, device=device)
+            self.batch_selected = empty_idx
+            self.batch_dist = None
+            self.selected_embeds = torch.empty(B, 0, D, device=device)
+            return empty_idx, None
+
         # Detach implements Theorem 4.1 — h_i, h_j are treated as constants by
         # the REINFORCE estimator. Gradients flow only to Ws, as_, and
         # type_embeddings here.
@@ -180,8 +191,6 @@ class PASSHeteroSampler(nn.Module):
         dist = torch.distributions.Categorical(probs=probs)
 
         num_select = K - 1
-        if num_select <= 0:
-            raise ValueError(f"K must be > 1 for PASS sampling (got K={K})")
 
         # multinomial without replacement where possible; fall back to with-
         # replacement for any row that does not have num_select valid
