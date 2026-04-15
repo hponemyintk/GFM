@@ -43,7 +43,6 @@ class PASSHeteroSampler(nn.Module):
 
         # Paper Eq. 4 — single projection matrix Ws.
         self.Ws = nn.Parameter(torch.zeros(embed_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.Ws, gain=1.414)
 
         # Paper Eq. 6 — learnable 2-element attention over {importance, uniform}.
         self.as_ = nn.Parameter(torch.tensor([0.5, 0.5]))
@@ -155,18 +154,26 @@ class PASSHeteroSampler(nn.Module):
         q_imp = q_imp.reshape(B, S)
 
         scope_counts = scope_counts.to(device).long()
-        q_rand = (1.0 / scope_counts.clamp(min=1).float().unsqueeze(1)).expand(B, S)
-
-        as_w = F.softmax(self.as_, dim=0)
-        q_tilde = as_w[0] * q_imp + as_w[1] * q_rand
 
         arange_S = torch.arange(S, device=device).unsqueeze(0)
         pad_mask = arange_S >= scope_counts.unsqueeze(1)
-        q_tilde = q_tilde.masked_fill(pad_mask, 0.0)
-        q_tilde = q_tilde.clamp(min=0.0) + 1e-9
+
+        # Row-wise softmax on q_imp so the importance distribution is proper
+        # (non-negative, sums to 1) without zero-eroding negative candidates.
+        q_imp_masked = q_imp.masked_fill(pad_mask, float("-inf"))
+        q_imp_soft = F.softmax(q_imp_masked, dim=1)
+        q_imp_soft = torch.nan_to_num(q_imp_soft, nan=0.0)  # all-pad rows
+
+        # Uniform baseline over valid (non-pad) positions.
+        valid = (~pad_mask).float()
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+        q_rand = valid / denom
+
+        as_w = F.softmax(self.as_, dim=0)
+        q_tilde = as_w[0] * q_imp_soft + as_w[1] * q_rand
+        q_tilde = q_tilde.masked_fill(pad_mask, 0.0) + 1e-9
         q_tilde = q_tilde.masked_fill(pad_mask, 0.0)
 
-        # Renormalize in case all-zero rows slipped through.
         row_sums = q_tilde.sum(dim=1, keepdim=True).clamp(min=1e-9)
         probs = q_tilde / row_sums
 
