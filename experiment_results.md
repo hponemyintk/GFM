@@ -1,8 +1,11 @@
 # ogPASS vs dev-kyaw — Experiment Results
 
-Three 15-seed sweeps comparing the PASS-GNN learned sampler (`ogPASS` branch)
+Multiple 15-seed sweeps comparing the PASS-GNN learned sampler (`ogPASS` branch)
 against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 `driver-top3`. All metrics are `Best Test` snapshots selected by best val AUC.
+
+`num_neighbors` is K = total subgraph size **including the seed token**.
+K=1 means seed-only (no neighbors).
 
 ## Common config
 
@@ -19,6 +22,7 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 | **baseline_n50_ep10** | 50 | 10 | ogPASS: joint-from-step-1, original buggy sampler (Xavier `Ws`, no softmax) |
 | **fix12_n30_ep30**    | 30 | 30 | ogPASS: joint-from-step-1, fix1 (softmax q_imp) + fix2 (zero-init `Ws`) applied |
 | **warmup_n10_ep30**   | 10 | 30 | ogPASS: 3-phase schedule (10 task-warmup → 10 sampler-only on frozen task → 10 joint), K=10 |
+| **seedonly_n1_ep30**  | 1  | 30 | Seed-only ablation. PASS sampler short-circuits (`K-1=0` branch added in `pass_sampler.py`). Tests the model's tabular-prior floor with zero graph context. |
 
 ## Aggregated results (mean ± std over 15 seeds)
 
@@ -30,7 +34,9 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 | fix12_n30_ep30    | ogpass  | 0.3604 ± 0.0367 | 0.4279 ± 0.1154 | **0.7883 ± 0.0222** | **0.7430 ± 0.0551** |
 | warmup_n10_ep30   | devkyaw | **0.3940 ± 0.1050** | 0.3609 ± 0.1521 | 0.7682 ± 0.0652 | **0.7821 ± 0.0598** |
 | warmup_n10_ep30   | ogpass  | 0.3613 ± 0.0274 | **0.3650 ± 0.1644** | **0.7934 ± 0.0195** | 0.7566 ± 0.0525 |
-| warmup_n1_ep10   | devkyaw | 0.2931 ± 0.0603 | 0.2317 ± 0.1495 | 0.7269 ± 0.0605 | 0.7360 ± 0.0380 |
+| warmup_n1_ep10    | devkyaw | 0.2931 ± 0.0603 | 0.2317 ± 0.1495 | 0.7269 ± 0.0605 | 0.7360 ± 0.0380 |
+| seedonly_n1_ep30  | devkyaw | **0.3243 ± 0.0246** | 0.1711 ± 0.1739 | **0.7691 ± 0.0294** | **0.7702 ± 0.0185** |
+| seedonly_n1_ep30  | ogpass  | 0.3174 ± 0.0367 | **0.1886 ± 0.1763** | 0.7601 ± 0.0392 | 0.7421 ± 0.0409 |
 
 ### Δ (ogpass − devkyaw)
 
@@ -39,6 +45,7 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 | baseline_n50_ep10 | −0.0110 | +0.0183 | **+0.0241** | +0.0049 |
 | fix12_n30_ep30    | **−0.0460** | −0.0268 | +0.0010 | +0.0063 |
 | warmup_n10_ep30   | −0.0327 | +0.0041 | **+0.0252** | −0.0255 |
+| seedonly_n1_ep30  | −0.0069 | +0.0175 | −0.0090 | −0.0281 |
 
 ### Variance ratio (ogpass std ÷ devkyaw std — lower = ogpass more stable)
 
@@ -47,6 +54,7 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 | baseline_n50_ep10 | 0.50× | 0.87× | **0.70×** | 0.81× |
 | fix12_n30_ep30    | 0.55× | **2.10×** | 0.88× | 0.82× |
 | warmup_n10_ep30   | **0.26×** | 1.08× | **0.30×** | 0.88× |
+| seedonly_n1_ep30  | 1.49× | 1.01× | 1.33× | 2.21× |
 
 ## Per-seed tables
 
@@ -134,6 +142,48 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 | 13 | 0.3587 | 0.5204 | 0.8005 | 0.7893 |
 | 14 | 0.4076 | 0.4859 | 0.8095 | 0.7493 |
 
+### seedonly_n1_ep30
+
+#### devkyaw
+
+| seed | AP | F1 | AUC | Acc |
+|---:|---:|---:|---:|---:|
+| 0 | 0.3432 | 0.0761 | 0.7858 | 0.7658 |
+| 1 | 0.3164 | 0.0377 | 0.7816 | 0.7893 |
+| 2 | 0.3311 | 0.2915 | 0.7805 | 0.7590 |
+| 3 | 0.3194 | 0.0333 | 0.7734 | 0.7603 |
+| 4 | 0.3299 | 0.1161 | 0.7670 | 0.8113 |
+| 5 | 0.3927 | 0.5864 | 0.8280 | 0.7824 |
+| 6 | 0.3073 | 0.0535 | 0.7628 | 0.7562 |
+| 7 | 0.3416 | 0.3521 | 0.7808 | 0.7466 |
+| 8 | 0.3135 | 0.0382 | 0.7570 | 0.7920 |
+| 9 | 0.3161 | 0.0333 | 0.7694 | 0.7603 |
+| 10 | 0.2833 | 0.4103 | 0.6850 | 0.7466 |
+| 11 | 0.3278 | 0.0333 | 0.7795 | 0.7603 |
+| 12 | 0.2965 | 0.2157 | 0.7463 | 0.7796 |
+| 13 | 0.3237 | 0.0333 | 0.7732 | 0.7603 |
+| 14 | 0.3224 | 0.2559 | 0.7661 | 0.7837 |
+
+#### ogpass
+
+| seed | AP | F1 | AUC | Acc |
+|---:|---:|---:|---:|---:|
+| 0 | 0.4087 | 0.4989 | 0.8083 | 0.6763 |
+| 1 | 0.3063 | 0.0335 | 0.7668 | 0.7617 |
+| 2 | 0.3210 | 0.0414 | 0.7809 | 0.8085 |
+| 3 | 0.3332 | 0.3060 | 0.7672 | 0.7438 |
+| 4 | 0.3100 | 0.0333 | 0.7697 | 0.7603 |
+| 5 | 0.2479 | 0.2205 | 0.6607 | 0.7176 |
+| 6 | 0.3321 | 0.1070 | 0.7780 | 0.7700 |
+| 7 | 0.3139 | 0.0333 | 0.7692 | 0.7603 |
+| 8 | 0.2528 | 0.0733 | 0.6832 | 0.7562 |
+| 9 | 0.3048 | 0.2353 | 0.7548 | 0.7493 |
+| 10 | 0.3158 | 0.0333 | 0.7675 | 0.7603 |
+| 11 | 0.3190 | 0.2500 | 0.7817 | 0.7603 |
+| 12 | 0.3250 | 0.0333 | 0.7770 | 0.7603 |
+| 13 | 0.3343 | 0.5068 | 0.7949 | 0.6997 |
+| 14 | 0.3369 | 0.4225 | 0.7413 | 0.6460 |
+
 ### warmup_n10_ep30
 
 #### devkyaw
@@ -178,31 +228,84 @@ against random neighbor sampling (`dev-kyaw` branch) on `rel-f1` /
 
 ## Interpretation
 
-**Recurring pattern across all three sweeps:**
-- ogPASS wins **AUC** by a small but consistent margin (+0.0010 to +0.0252).
-- ogPASS wins on **variance** for AP and AUC, often by 2–4×.
-- ogPASS **loses AP** in every sweep (−0.011 to −0.046).
-- F1 is essentially a wash and dominated by per-seed collapses on both branches.
+### Note on the right metric for this task
+`driver-top3` is roughly 80/20 imbalanced (predicting all-negative gets
+accuracy ≈ 0.80, which is what the seed-only F1 collapses to in many seeds).
+For class-imbalanced binary classification, **Average Precision (AP)** is
+the right primary metric — threshold-free, sensitive to ranking quality on
+the *positive* class, with a random-baseline equal to the prevalence (~0.20).
+**AUROC** is a useful secondary but less sensitive on imbalanced data
+(it rewards ranking negatives correctly too). **F1** is threshold-dependent
+and noisy here. **Accuracy** is uninformative — the prior beats most models.
+RelBench itself reports AP as the canonical metric for binary node tasks.
 
-**What changed across sweeps:**
-- `fix12_n30_ep30` (3× the epochs of baseline) — devkyaw gained substantially
-  (AP 0.371 → 0.406, F1 0.392 → 0.455). ogpass barely moved (AP 0.360 → 0.360).
-  More training helped random sampling more than it helped the learned policy.
-- `warmup_n10_ep30` (PASS phase schedule + K=10) — ogpass AUC variance
-  collapsed to 0.0195 (best of any sweep), but mean AP/F1 did not improve over
-  fix12. The stationary-reward phase did not unlock a learned policy.
+Reading the Δ table through the AP lens: **ogpass loses every sweep**.
+The earlier "ogpass wins AUC" framing flattered the policy with the wrong
+metric.
+
+### The seed-only floor (n=1, ep=30)
+The K=1 ablation tells us how much of `driver-top3` is solvable from the
+seed driver's own row features alone, with zero graph context:
+- devkyaw n=1: **AP 0.324, AUC 0.769**
+- devkyaw n=30 (ep=30): AP 0.406, AUC 0.787
+
+So the *entire* graph signal — going from 0 neighbors to 29 — buys only
+**+0.082 AP / +0.018 AUC**. Most of the task's solvability is already in
+the tabular prior, which means the headroom for *any* sampler to demonstrate
+value is small.
+
+This sharpens the comparison: ogpass at K=10/30/50 sits at AP ≈ 0.36, which
+is only **+0.04 above the seed-only floor**. devkyaw at K=30/ep=30 reaches
+AP 0.406, which is **+0.08 above the floor** — twice the lift from the same
+graph budget.
+
+### Recurring pattern across all four sweeps
+- ogPASS wins **AUC** by a small margin (+0.001 to +0.025) on the K>1 sweeps.
+- ogPASS wins on **variance** for AP and AUC at K>1, often by 2–4×.
+- ogPASS **loses AP** in every K>1 sweep (−0.011 to −0.046).
+- At K=1 both branches collapse to within noise of each other (Δ AP −0.007),
+  confirming that the K>1 differences come entirely from how the two branches
+  use the candidate neighbors.
+
+### Devkyaw response curve to neighbor budget (AP, mean over 15 seeds)
+
+| K | epochs | devkyaw AP | ogpass AP |
+|---|---|---|---|
+| 1  | 30 | 0.324 | 0.317 |
+| 10 | 30 | 0.394 | 0.361 |
+| 30 | 30 | **0.406** | 0.360 |
+| 50 | 10 | 0.371 | 0.360 |
+
+Random sampling shows the expected diminishing-returns curve: gains from
+1 → 10 → 30, then a slight regression at 50 (more random neighbors past
+some point = more noise). **ogpass is flat at AP ≈ 0.36 across all
+non-trivial K.**
+
+This flatness has two possible readings:
+1. *Saturation:* PASS already pulls all the informative neighbors at K=10
+   and adding more candidates is correctly downweighted to noise.
+2. *No discrimination:* PASS is effectively sampling near-uniformly and
+   adding training noise that costs AP.
+
+The data favors reading #2: at every K, ogpass loses to devkyaw on AP. A
+truly saturating sampler should at minimum tie devkyaw at K=10 (both pick
+9 from a similar pool, PASS in theory picking the best 9). The cleanest
+test would be a smaller-K sweep (K=3 or K=5) — if PASS is discriminating,
+smaller K should let it pull *ahead* of random because each pick binds
+harder.
 
 **Conclusion to date:** the learned PASS sampler behaves as a regularizer
 (low-variance, slightly better AUC) rather than a discriminative policy
-(better AP/F1). Across +20 epochs, +1 reference-bug fix, and a 3-phase
-schedule with stationary REINFORCE rewards, ogPASS has not produced a clear
-win on the discriminative metrics that the PASS paper claims as its strength.
+(better AP). Across +20 epochs, +1 reference-bug fix, a 3-phase schedule
+with stationary REINFORCE rewards, and a seed-only floor establishing how
+small the headroom is, ogPASS has not produced a single sweep-level win
+on AP — the metric that matters for this imbalanced task.
 
 Remaining hypotheses to test (not yet run):
-1. **REINFORCE baseline (fix3)** — variance reduction on the policy gradient.
+1. **Smaller K (K=3 or K=5)** — directly tests the saturation hypothesis.
+   If PASS is discriminating, smaller K should let it beat random because
+   each pick binds harder.
+2. **REINFORCE baseline** — variance reduction on the policy gradient.
    Currently `loss_up · selected_embed` has no baseline subtraction.
-2. **Smaller K (K=5)** — at K=10 the downstream attention may still
-   compensate for any sampling errors. Forcing K smaller would make the
-   sampler's picks bind harder.
 3. **Richer `Ws`** — a single linear projection on the raw tfs embedding may
    not carry enough task-relevant signal for the importance distribution.
