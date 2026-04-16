@@ -247,7 +247,7 @@ def main():
         "--dataset-task",
         nargs="+",
         metavar="DATASET:TASK",
-        default=["rel-avito: ad-ctr"],
+        default="use_predefined_dict",
         help=(
             "One or more DATASET:TASK pairs, e.g. "
             "rel-f1:driver-top3  rel-amazon:user-churn"
@@ -255,10 +255,21 @@ def main():
     )
     args = parser.parse_args()
 
-    dataset_task_dict = defaultdict(list)
-    for pair in args.dataset_task:
-        dataset_name, task_name = [s.strip() for s in pair.split(":", 1)]
-        dataset_task_dict[dataset_name].append(task_name)
+    if args.dataset_task == 'use_predefined_dict':
+        dataset_task_dict = {
+                            "rel-f1": ["driver-position", "driver-dnf", "driver-top3"],
+                            "rel-avito": ["ad-ctr", "user-clicks", "user-visits"],
+                            "rel-event": ["user-attendance", "user-repeat", "user-ignore"],
+                            "rel-trial": ["study-adverse", "study-outcome", "site-success"],
+                            "rel-amazon": ["user-ltv", "item-ltv", "user-churn", "item-churn"],
+                            "rel-stack": ["post-votes", "user-engagement", "user-badge"],
+                            "rel-hm": ["item-sales", "user-churn"],
+                            }
+    else:
+        dataset_task_dict = defaultdict(list)
+        for pair in args.dataset_task:
+            dataset_name, task_name = [s.strip() for s in pair.split(":", 1)]
+            dataset_task_dict[dataset_name].append(task_name)
 
     results = compute_avg_2hop_neighbors(dict(dataset_task_dict))
 

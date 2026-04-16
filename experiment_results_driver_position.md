@@ -283,3 +283,30 @@ while AP and AUC were more stable.
 No regression task in RelBench combines strong graph signal, clean labels,
 and dense neighborhoods. If a regression evaluation is required, a
 synthetic benchmark with controllable graph signal would be needed.
+
+<!-- BEGIN SWEEP n50_ep20 -->
+## Sweep `n50_ep20` — K=50, epochs=20
+
+_ogPASS 3-phase: warmup=4, sampler_only=4, joint=12._
+
+### Aggregated (mean ± std over 1 seeds)
+
+| branch | mae ↓ | rmse ↓ | r2 ↑ |
+|---|---|---|---|
+| dev-kyaw (n=1) | 4.2121 ± 0.0000 | 5.1426 ± 0.0000 | 0.0259 ± 0.0000 |
+| ogPASS (n=0) | — | — | — |
+
+### Per-seed
+
+#### dev-kyaw
+
+| seed | mae | rmse | r2 |
+|---:|---:|---:|---:|
+| 0 | 4.2121 | 5.1426 | 0.0259 |
+
+#### ogPASS
+
+| seed | mae | rmse | r2 |
+|---:|---:|---:|---:|
+
+<!-- END SWEEP n50_ep20 -->
