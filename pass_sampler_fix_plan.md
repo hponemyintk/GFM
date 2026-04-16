@@ -151,9 +151,9 @@ Same setup as prior sweeps but on driver-top3 with AP as tune metric.
 
 | exp | K | epochs | PASS warmup | sampler_only | joint | baseline flag |
 |---:|---:|---:|---:|---:|---:|---|
-| A1 | 1  | 30 | 6 | 6 | 18 | --use_reinforce_baseline |
-| A2 | 10 | 30 | 6 | 6 | 18 | --use_reinforce_baseline |
-| A3 | 50 | 30 | 6 | 6 | 18 | --use_reinforce_baseline |
+| A1 | 1  | 20 | 4 | 4 | 12 | --use_reinforce_baseline |
+| A2 | 10 | 20 | 4 | 4 | 12 | --use_reinforce_baseline |
+| A3 | 50 | 20 | 4 | 4 | 12 | --use_reinforce_baseline |
 
 dev-kyaw runs remain unchanged (no sampler). The only differences from
 prior driver-top3 sweeps are:
@@ -188,10 +188,8 @@ K=10, fix12_n30_ep30 for K=30, baseline_n50_ep10 for K=50).
 ### 3d. Wall-clock estimate
 
 From prior driver-top3 runs (~40-60s/epoch at K=50, 233 steps/epoch):
-- 5 seeds × 2 branches × 30 epochs × 3 configs = 900 total epochs
-- At ~50s/epoch avg + precompute overhead: ~15-18 hours
-- Can reduce to ~10h by cutting to 20 epochs (adjust phase split to
-  4/4/12)
+- 5 seeds × 2 branches × 20 epochs × 3 configs = 600 total epochs
+- At ~50s/epoch avg + precompute overhead: ~10-12 hours
 
 ## Run order
 
