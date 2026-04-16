@@ -11,6 +11,7 @@ For each seed node the count is the number of unique nodes reachable within
 """
 
 import argparse
+import statistics
 from collections import defaultdict
 
 import numpy as np
@@ -138,16 +139,18 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
     ----------
     dataset_task_dict : dict[str, list[str]]
         Maps dataset names to lists of task names, e.g.
-        {"rel-f1": ["driver-top3"]}.
+        {"rel-avito": [" ad-ctr"]}.
     verbose : bool
 
     Returns
     -------
     results : dict
         results[dataset][task][split] = {
-            "avg_2hop_neighbors": float,
-            "std_2hop_neighbors": float,
-            "num_seeds":          int,
+            "avg_2hop_neighbors":    float,
+            "std_2hop_neighbors":    float,
+            "median_2hop_neighbors": float,
+            "mode_2hop_neighbors":   int,
+            "num_seeds":             int,
         }
     """
     results = {}
@@ -209,19 +212,24 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
                     seed_nodes_with_cutoff, adj, node_time
                 )
 
-                avg = float(np.mean(counts))
-                std = float(np.std(counts))
+                avg    = float(np.mean(counts))
+                std    = float(np.std(counts))
+                median = float(np.median(counts))
+                mode   = int(statistics.mode(counts))
 
                 results[dataset_name][task_name][split] = {
-                    "avg_2hop_neighbors": avg,
-                    "std_2hop_neighbors": std,
-                    "num_seeds":          len(seed_nodes_with_cutoff),
+                    "avg_2hop_neighbors":    avg,
+                    "std_2hop_neighbors":    std,
+                    "median_2hop_neighbors": median,
+                    "mode_2hop_neighbors":   mode,
+                    "num_seeds":             len(seed_nodes_with_cutoff),
                 }
 
                 if verbose:
                     print(
                         f"    {split:5s} | seeds: {len(seed_nodes_with_cutoff):4d} | "
-                        f"avg 2-hop neighbors: {avg:10.2f} ± {std:.2f}"
+                        f"avg: {avg:10.2f} ± {std:.2f} | "
+                        f"median: {median:.2f} | mode: {mode}"
                     )
 
     return results
@@ -239,7 +247,7 @@ def main():
         "--dataset-task",
         nargs="+",
         metavar="DATASET:TASK",
-        default=["rel-f1:driver-top3"],
+        default=["rel-avito: ad-ctr"],
         help=(
             "One or more DATASET:TASK pairs, e.g. "
             "rel-f1:driver-top3  rel-amazon:user-churn"
@@ -249,7 +257,7 @@ def main():
 
     dataset_task_dict = defaultdict(list)
     for pair in args.dataset_task:
-        dataset_name, task_name = pair.split(":", 1)
+        dataset_name, task_name = [s.strip() for s in pair.split(":", 1)]
         dataset_task_dict[dataset_name].append(task_name)
 
     results = compute_avg_2hop_neighbors(dict(dataset_task_dict))
@@ -260,14 +268,19 @@ def main():
     for dataset_name, tasks in results.items():
         for task_name, splits in tasks.items():
             print(f"\n{dataset_name} / {task_name}")
-            header = f"  {'split':<6}  {'seeds':>8}  {'avg 2-hop nbrs':>14}  {'std':>10}"
+            header = (
+                f"  {'split':<6}  {'seeds':>8}  {'avg 2-hop nbrs':>14}  "
+                f"{'std':>10}  {'median':>10}  {'mode':>8}"
+            )
             print(header)
             print("  " + "-" * (len(header) - 2))
             for split, m in splits.items():
                 print(
                     f"  {split:<6}  {m['num_seeds']:>8}  "
                     f"{m['avg_2hop_neighbors']:>14.2f}  "
-                    f"{m['std_2hop_neighbors']:>10.2f}"
+                    f"{m['std_2hop_neighbors']:>10.2f}  "
+                    f"{m['median_2hop_neighbors']:>10.2f}  "
+                    f"{m['mode_2hop_neighbors']:>8}"
                 )
 
 

@@ -122,24 +122,24 @@ and near-zero graph signal, Exp3 is unlikely to change the picture.
 
 _ogPASS 3-phase: warmup=4, sampler_only=4, joint=12._
 
-### Aggregated (mean ± std over 4 seeds)
+### Aggregated (mean ± std over 5 seeds)
 
 | branch | mae ↓ | rmse ↓ | r2 ↑ |
 |---|---|---|---|
-| dev-kyaw (n=4) | 4.2243 ± 0.2625 | 5.2233 ± 0.2777 | -0.0071 ± 0.1057 |
-| ogPASS (n=4) | 4.2028 ± 0.1306 | 5.1356 ± 0.1311 | 0.0280 ± 0.0500 |
+| dev-kyaw (n=5) | 4.1758 ± 0.2518 | 5.1788 ± 0.2603 | 0.0101 ± 0.0993 |
+| ogPASS (n=5) | 4.2490 ± 0.1532 | 5.1915 ± 0.1690 | 0.0064 ± 0.0649 |
 
 ### Δ (ogPASS − dev-kyaw)  — negative is better for mae/rmse, positive for r2
 
 | Δmae | Δrmse | Δr2 |
 |---|---|---|
-| -0.0215 | -0.0877 | +0.0351 |
+| +0.0732 | +0.0128 | -0.0037 |
 
 ### Variance ratio (ogPASS std ÷ dev-kyaw std — lower = ogPASS more stable)
 
 | mae | rmse | r2 |
 |---|---|---|
-| 0.50× | 0.47× | 0.47× |
+| 0.61× | 0.65× | 0.65× |
 
 ### Per-seed
 
@@ -151,6 +151,7 @@ _ogPASS 3-phase: warmup=4, sampler_only=4, joint=12._
 | 1 | 4.1248 | 5.1798 | 0.0117 |
 | 2 | 4.4226 | 5.3580 | -0.0575 |
 | 3 | 3.8987 | 4.8559 | 0.1314 |
+| 4 | 3.9819 | 5.0007 | 0.0789 |
 
 #### ogPASS
 
@@ -160,6 +161,7 @@ _ogPASS 3-phase: warmup=4, sampler_only=4, joint=12._
 | 1 | 4.2013 | 5.1436 | 0.0255 |
 | 2 | 4.0750 | 5.0139 | 0.0740 |
 | 3 | 4.3826 | 5.3155 | -0.0407 |
+| 4 | 4.4337 | 5.4153 | -0.0802 |
 
 <!-- END SWEEP n10_ep20 -->
 
