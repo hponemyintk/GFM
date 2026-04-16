@@ -100,6 +100,8 @@ parser.add_argument("--sampler_warmup_epochs", type=int, default=0,
 parser.add_argument("--sampler_only_epochs", type=int, default=0,
                     help="PASS: epochs to train only the sampler on a frozen task model. "
                          "Runs after --sampler_warmup_epochs.")
+parser.add_argument("--use_reinforce_baseline", action="store_true",
+                    help="PASS: enable EMA baseline for REINFORCE sampler loss (variance reduction)")
 
 args = parser.parse_args()
 
@@ -244,7 +246,7 @@ clamp_min, clamp_max = None, None
 if task.task_type == TaskType.BINARY_CLASSIFICATION:
     out_channels = 1
     loss_fn = BCEWithLogitsLoss()
-    tune_metric = "roc_auc"
+    tune_metric = "average_precision"
     higher_is_better = True
 elif task.task_type == TaskType.REGRESSION:
     out_channels = 1
@@ -323,6 +325,7 @@ if args.sampler == "pass":
         num_types=len(data["train"].node_types),
         embed_dim=args.channels,
         hidden_dim=args.pass_hidden_dim,
+        use_reinforce_baseline=args.use_reinforce_baseline,
     ).to(device)
     # Use own_parameters() — NOT .parameters() — to avoid double-registering
     # the shared tfs_encoder params (already in model.parameters()).
@@ -332,6 +335,11 @@ if args.sampler == "pass":
     )
 else:
     optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
+
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode="max" if higher_is_better else "min",
+    factor=0.5, patience=3, verbose=(local_rank == 0),
+)
 
 global_step = 0
 
@@ -723,7 +731,6 @@ if args.train_stage == "finetune":
             train_loss = _train_fn(epoch, phase=phase)
         else:
             train_loss = _train_fn(epoch)
-        # scheduler.step()
 
         dist.barrier()
         eval_model = model.module  # get the underlying model
@@ -750,6 +757,7 @@ if args.train_stage == "finetune":
                         pass_sampler.state_dict(),
                         os.path.join(output_path, "pass_sampler.pt"),
                     )
+            scheduler.step(val_metrics[tune_metric])
         dist.barrier()
 
     if local_rank == 0 and state_dict is not None:

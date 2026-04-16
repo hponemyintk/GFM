@@ -28,6 +28,7 @@ class PASSHeteroSampler(nn.Module):
         num_types: int,
         embed_dim: int,
         hidden_dim: int = 32,
+        use_reinforce_baseline: bool = False,
     ):
         super().__init__()
 
@@ -46,6 +47,12 @@ class PASSHeteroSampler(nn.Module):
 
         # Paper Eq. 6 — learnable 2-element attention over {importance, uniform}.
         self.as_ = nn.Parameter(torch.tensor([0.5, 0.5]))
+
+        # REINFORCE EMA baseline for variance reduction.
+        self.use_reinforce_baseline = use_reinforce_baseline
+        self.register_buffer('baseline_ema', torch.tensor(0.0))
+        self.register_buffer('baseline_initialized', torch.tensor(False))
+        self.baseline_momentum = 0.99
 
         # Populated in forward(), consumed by reinforce_loss().
         self.batch_selected = None
@@ -217,8 +224,11 @@ class PASSHeteroSampler(nn.Module):
         return selected, dist
 
     def reinforce_loss(self, loss_up):
-        """REINFORCE policy-gradient loss — matches LinkedIn's reference
-        (PASS-GNN/model.py:87-97).
+        """REINFORCE policy-gradient loss.
+
+        When use_reinforce_baseline is False, matches LinkedIn's reference
+        (PASS-GNN/model.py:87-97). When True, uses an EMA baseline for
+        variance reduction (standard REINFORCE with baseline).
 
         Args:
             loss_up: [B, D] gradient dL/d(seed_embed) captured via
@@ -228,9 +238,34 @@ class PASSHeteroSampler(nn.Module):
         # logp: [B, K-1]
         logp = self.batch_dist.log_prob(self.batch_selected.transpose(0, 1)).transpose(0, 1)
 
-        sel = self.selected_embeds.detach()  # [B, K-1, D]
-        X = (logp.unsqueeze(2) * sel).mean(dim=1)  # [B, D]
+        if self.use_reinforce_baseline:
+            sel = self.selected_embeds.detach()  # [B, K-1, D]
+            # Per-sample reward: how well the selected neighbors align with
+            # the task gradient direction.
+            rewards = (loss_up.unsqueeze(1) * sel).sum(dim=-1).mean(dim=1)  # [B]
 
-        # [B, 1, 1]
-        batch_loss = torch.bmm(loss_up.unsqueeze(1), X.unsqueeze(2))
-        return batch_loss.mean()
+            # Update EMA baseline
+            with torch.no_grad():
+                batch_mean = rewards.mean()
+                if not self.baseline_initialized:
+                    self.baseline_ema.copy_(batch_mean)
+                    self.baseline_initialized.fill_(True)
+                else:
+                    self.baseline_ema.mul_(self.baseline_momentum).add_(
+                        batch_mean, alpha=1 - self.baseline_momentum
+                    )
+
+            # Advantage = reward - baseline
+            advantages = rewards - self.baseline_ema  # [B]
+
+            # Policy gradient: advantage * sum of log-probs over K-1 selections
+            logp_sum = logp.sum(dim=1)  # [B]
+            sample_loss = (advantages.detach() * logp_sum).mean()
+            return sample_loss
+        else:
+            sel = self.selected_embeds.detach()  # [B, K-1, D]
+            X = (logp.unsqueeze(2) * sel).mean(dim=1)  # [B, D]
+
+            # [B, 1, 1]
+            batch_loss = torch.bmm(loss_up.unsqueeze(1), X.unsqueeze(2))
+            return batch_loss.mean()
