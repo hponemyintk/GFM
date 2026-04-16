@@ -132,7 +132,8 @@ class PASSHeteroSampler(nn.Module):
         seed_index = scope_batch["seed_index"].to(device).long()
         return self._encode_by_type(seed_type, seed_index, hetero_data, device)
 
-    def forward(self, seed_embeds, candidate_embeds, scope_counts, K):
+    def forward(self, seed_embeds, candidate_embeds, scope_counts, K,
+                scope_hops=None):
         """Sample K-1 neighbors per seed using the PASS policy.
 
         Args:
@@ -140,6 +141,8 @@ class PASSHeteroSampler(nn.Module):
             candidate_embeds: [B, S, D]
             scope_counts: [B] — number of valid (non-padding) candidates per row
             K: total subgraph size including the seed token; we sample K-1.
+            scope_hops: [B, S] optional — hop labels (1/2 = real, 3 = fallback).
+                Seeds whose entire scope is hop=3 use uniform sampling.
 
         Returns:
             selected: [B, K-1] long tensor of indices into candidate_embeds
@@ -157,7 +160,18 @@ class PASSHeteroSampler(nn.Module):
             self.batch_selected = empty_idx
             self.batch_dist = None
             self.selected_embeds = torch.empty(B, 0, D, device=device)
+            self.fallback_mask = None
             return empty_idx, None
+
+        # Identify fallback seeds (all scope entries are hop=3 random nodes).
+        if scope_hops is not None:
+            sc = scope_counts.to(device).long()
+            arange = torch.arange(S, device=device).unsqueeze(0)
+            valid_mask = arange < sc.unsqueeze(1)  # [B, S]
+            has_real = ((scope_hops != 3) & valid_mask).any(dim=1)  # [B]
+            self.fallback_mask = ~has_real  # True for seeds with only hop=3
+        else:
+            self.fallback_mask = None
 
         # Detach implements Theorem 4.1 — h_i, h_j are treated as constants by
         # the REINFORCE estimator. Gradients flow only to Ws, as_, and
@@ -189,6 +203,11 @@ class PASSHeteroSampler(nn.Module):
 
         as_w = F.softmax(self.as_, dim=0)
         q_tilde = as_w[0] * q_imp_soft + as_w[1] * q_rand
+
+        # Force pure uniform for fallback seeds (no real neighbors).
+        if self.fallback_mask is not None and self.fallback_mask.any():
+            q_tilde[self.fallback_mask] = q_rand[self.fallback_mask]
+
         q_tilde = q_tilde.masked_fill(pad_mask, 0.0) + 1e-9
         q_tilde = q_tilde.masked_fill(pad_mask, 0.0)
 
@@ -238,11 +257,23 @@ class PASSHeteroSampler(nn.Module):
         # logp: [B, K-1]
         logp = self.batch_dist.log_prob(self.batch_selected.transpose(0, 1)).transpose(0, 1)
 
+        # Exclude fallback seeds — their scope is random noise, not real
+        # neighbors, so gradients from them would only add variance.
+        real_mask = None  # [B] bool, True for seeds with real neighbors
+        if self.fallback_mask is not None and self.fallback_mask.any():
+            real_mask = ~self.fallback_mask
+            if not real_mask.any():
+                return torch.tensor(0.0, device=logp.device, requires_grad=True)
+
         if self.use_reinforce_baseline:
             sel = self.selected_embeds.detach()  # [B, K-1, D]
             # Per-sample reward: how well the selected neighbors align with
             # the task gradient direction.
             rewards = (loss_up.unsqueeze(1) * sel).sum(dim=-1).mean(dim=1)  # [B]
+
+            if real_mask is not None:
+                rewards = rewards[real_mask]
+                logp = logp[real_mask]
 
             # Update EMA baseline
             with torch.no_grad():
@@ -256,16 +287,22 @@ class PASSHeteroSampler(nn.Module):
                     )
 
             # Advantage = reward - baseline
-            advantages = rewards - self.baseline_ema  # [B]
+            advantages = rewards - self.baseline_ema  # [B'] (only real seeds)
 
             # Policy gradient: advantage * sum of log-probs over K-1 selections
-            logp_sum = logp.sum(dim=1)  # [B]
+            logp_sum = logp.sum(dim=1)  # [B']
             sample_loss = (advantages.detach() * logp_sum).mean()
             return sample_loss
         else:
             sel = self.selected_embeds.detach()  # [B, K-1, D]
-            X = (logp.unsqueeze(2) * sel).mean(dim=1)  # [B, D]
 
-            # [B, 1, 1]
+            if real_mask is not None:
+                sel = sel[real_mask]
+                logp_filtered = logp[real_mask]
+                loss_up = loss_up[real_mask]
+            else:
+                logp_filtered = logp
+
+            X = (logp_filtered.unsqueeze(2) * sel).mean(dim=1)  # [B', D]
             batch_loss = torch.bmm(loss_up.unsqueeze(1), X.unsqueeze(2))
             return batch_loss.mean()

@@ -338,7 +338,7 @@ else:
 
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer, mode="max" if higher_is_better else "min",
-    factor=0.5, patience=3, verbose=(local_rank == 0),
+    factor=0.5, patience=3,
 )
 
 global_step = 0
@@ -569,8 +569,10 @@ def train_pass(epoch, phase: str = "joint") -> float:
         seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
 
         scope_counts = scope_batch["scope_count"].to(device)
+        scope_hops = scope_batch["scope_hops"].to(device)
         selected_idx, _ = pass_sampler(
-            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors
+            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors,
+            scope_hops=scope_hops,
         )
 
         (
@@ -655,8 +657,10 @@ def test_pass(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
         seed_embeds = pass_sampler.encode_seeds(scope_batch, hetero_data, device)
 
         scope_counts = scope_batch["scope_count"].to(device)
+        scope_hops_eval = scope_batch["scope_hops"].to(device)
         selected_idx, _ = pass_sampler(
-            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors
+            seed_embeds, candidate_embeds, scope_counts, args.num_neighbors,
+            scope_hops=scope_hops_eval,
         )
 
         (
