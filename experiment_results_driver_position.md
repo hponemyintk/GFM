@@ -189,11 +189,69 @@ For a learned sampler to demonstrate value, a task needs all three:
 
 | task | RelGT % gain | label distribution | 2-hop neighborhood | verdict |
 |---|---|---|---|---|
-| rel-trial site-success | 18.4% | bimodal (0 or 1) | mean=66, **median=2**, mode=1 | dead: most nodes have ≤ 2 neighbors |
-| rel-avito ad-ctr | 15.9% | concentrated near 0 | ? | bad labels |
+| rel-trial site-success | 18.4% | bimodal (0 or 1) | mean=66, **median=2**, mode=1 | dead (see below) |
+| rel-avito ad-ctr | 15.9% | 60–70% centered at 0 | plenty | dead (see below) |
 | rel-hm item-sales | 4.3% | ? | ? | moderate signal at best |
 | rel-f1 driver-position | 2.6% | clean | plenty | too weak (confirmed above) |
 | everything else | < 2.3% | — | — | too weak |
+
+### Why site-success fails
+
+`rel-trial / site-success` has the strongest graph signal (18.4% gain)
+but two fatal problems:
+
+1. **Sparse neighborhoods.** The 2-hop neighbor distribution is
+   extremely heavy-tailed: mean = 66, **median = 2**, mode = 1. Over
+   half of all seed nodes have ≤ 2 neighbors within 2 hops. At K=10 or
+   K=50, the sampler is literally selecting from a pool of 1–2 candidates
+   for the majority of nodes — there is nothing to discriminate. The
+   18.4% graph signal comes from a small tail of hub nodes with rich
+   neighborhoods; the rest are effectively seed-only regardless of K.
+
+2. **Bimodal labels.** Regression targets cluster at 0 or 1, making this
+   effectively a soft classification problem. MAE differences between
+   models are compressed into a narrow band, reducing statistical power
+   for detecting sampler effects across seeds.
+
+Either problem alone would be survivable; together they make
+site-success unusable for sampler evaluation.
+
+### Why ad-ctr fails
+
+`rel-avito / ad-ctr` has the second-strongest graph signal (15.9% gain)
+and plenty of 2-hop neighbors, but the label distribution is degenerate:
+
+1. **60–70% of regression labels are centered at 0.** Most ads receive
+   no clicks, so the click-through rate is ~0 for the majority of the
+   dataset. A model that predicts near-zero for everything already
+   achieves good MAE (the paper's baseline is just 0.041).
+
+2. **MAE is dominated by the easy majority.** Improvements from better
+   neighbor selection only matter for the 30–40% of non-zero CTR labels.
+   But MAE averages over all samples equally, diluting the signal ~3:1.
+   Absolute MAE differences between branches would be tiny and buried
+   in seed-to-seed noise.
+
+3. **The sampler's training signal is diluted.** PASS learns from
+   task-loss gradients through `x_set.grad`. When most samples have
+   label ≈ 0, most gradient updates say "predict smaller" regardless of
+   neighbor choice. The non-zero minority carries the actual
+   neighbor-dependent signal, but it's outnumbered in the policy gradient.
+   This is the regression analogue of class imbalance — the "interesting"
+   cases are the minority, and the sampler's REINFORCE update averages
+   with uninformative zero-label gradients.
+
+4. **No AP-equivalent metric.** For imbalanced binary classification,
+   Average Precision (AP) cuts through the imbalance by focusing on
+   positive-class ranking. Regression has no standard metric that
+   isolates performance on the non-zero tail. Evaluating only on
+   non-zero samples would help but is non-standard and would need
+   justification.
+
+The 15.9% graph signal is real, but extracting a sampler signal from
+it requires cutting through the same label-imbalance problem that
+motivated leaving driver-top3 in the first place — except here without
+the AP metric to help.
 
 ### RelBench classification tasks (from paper Table 1)
 
