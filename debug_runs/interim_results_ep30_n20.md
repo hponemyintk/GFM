@@ -1,6 +1,6 @@
 # ogPASS vs dev-kyaw — Interim Results (20 seeds, 30 epochs)
 
-Generated: 2026-04-17 09:21  
+Generated: 2026-04-17 09:32  
 Dataset: `rel-f1 / driver-top3` | Tune metric: AP (higher = better)  
 Config: batch=32, layers=4, channels=512, lr=1e-4, K swept over [50,10,30,20,40,300]  
 ogPASS 3-phase schedule: warmup=6, sampler\_only=6, joint=18 epochs
@@ -11,7 +11,7 @@ ogPASS 3-phase schedule: warmup=6, sampler\_only=6, joint=18 epochs
 |---|---|---|---|---|---|---|---|
 | 50 | ✅ 40/40 | 0.4027 ± 0.0481 | 0.3758 ± 0.0388 | **-0.0268** dev-kyaw | 0.0481 | 0.0388 | 0.81× |
 | 10 | ✅ 40/40 | 0.3556 ± 0.0937 | 0.3689 ± 0.0241 | **+0.0133** ✅ ogPASS | 0.0937 | 0.0241 | 0.26× |
-| 30 | 🔄 32/40 | 0.4127 ± 0.1109 | 0.3794 ± 0.0256 | **-0.0333** dev-kyaw | 0.1109 | 0.0256 | 0.23× |
+| 30 | 🔄 34/40 | 0.4057 ± 0.1112 | 0.3811 ± 0.0258 | **-0.0245** dev-kyaw | 0.1112 | 0.0258 | 0.23× |
 | 20 | ⏳ pending | — | — | — | — | — | — |
 | 40 | ⏳ pending | — | — | — | — | — | — |
 | 300 | ⏳ pending | — | — | — | — | — | — |
@@ -86,14 +86,14 @@ Variance ratio < 1.0 = ogPASS is more stable.
 | 18 | 0.2238 | 0.3609 |
 | 19 | 0.4096 | 0.3164 |
 
-## K=30 (partial — 32/40 runs)
+## K=30 (partial — 34/40 runs)
 
 ### Val AP (best epoch) vs Test AP
 
 | branch | n | best val AP | test AP | gap |
 |---|---|---|---|---|
-| dev-kyaw | 16 | 0.4664 | 0.4127 | -0.0537 |
-| ogPASS | 16 | 0.5602 | 0.3794 | -0.1808 |
+| dev-kyaw | 17 | 0.4609 | 0.4057 | -0.0552 |
+| ogPASS | 17 | 0.5599 | 0.3811 | -0.1788 |
 
 ### Per-seed Test AP
 
@@ -115,6 +115,7 @@ Variance ratio < 1.0 = ogPASS is more stable.
 | 13 | 0.2695 | 0.3767 |
 | 14 | 0.4910 | 0.3934 |
 | 15 | 0.4841 | 0.4087 |
+| 16 | 0.2935 | 0.4087 |
 
 ## Training Curves
 
@@ -122,8 +123,11 @@ Variance ratio < 1.0 = ogPASS is more stable.
 
 ![K=10](training_curves_n10_ep30.png)
 
+![K=30 (partial)](training_curves_n30_ep30.png)
+
 **Key observations:**
-- K=10: ogPASS val AP improves continuously through joint phase — no collapse
-- K=50: ogPASS val AP drops sharply at joint phase onset, converging to dev-kyaw level
-- ogPASS consistently lower test AP than best val AP (val→test gap ~0.18 vs ~0.08 for dev-kyaw)
+- K=10: ogPASS val AP improves continuously through joint phase — no collapse, wins on test AP
+- K=50: ogPASS val AP drops sharply at joint phase onset, dev-kyaw wins on test AP
+- K=30: ogPASS more stable (low std) but dev-kyaw leading on test AP so far (partial)
+- ogPASS consistently shows larger val→test gap (~0.18) vs dev-kyaw (~0.06–0.08)
 - ogPASS has much lower variance across seeds at all K values
