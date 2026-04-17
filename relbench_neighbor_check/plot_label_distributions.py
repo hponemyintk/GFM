@@ -77,15 +77,21 @@ for dataset_name, task_names in dataset_task_dict.items():
             ax.set_ylabel("Proportion")
         else:
             all_vals = np.concatenate([l.values for l in split_labels.values()])
-            bins = np.linspace(all_vals.min(), all_vals.max(), 51)
+            bin_edges = np.linspace(all_vals.min(), all_vals.max(), 51)
+            n_splits = len(split_labels)
+            bin_width = (bin_edges[1] - bin_edges[0]) / n_splits
 
-            for split, labels in split_labels.items():
-                ax.hist(labels.values, bins=bins, density=True, alpha=0.5,
-                        color=split_colors[split], edgecolor="black", linewidth=0.3,
-                        label=f"{split} (n={len(labels):,}, std={labels.std():.2f})")
+            for i, (split, labels) in enumerate(split_labels.items()):
+                counts, _ = np.histogram(labels.values, bins=bin_edges)
+                proportions = counts / counts.sum()
+                bar_positions = bin_edges[:-1] + i * bin_width
+                ax.bar(bar_positions, proportions, width=bin_width,
+                       align="edge", color=split_colors[split],
+                       edgecolor="black", linewidth=0.3,
+                       label=f"{split} (n={len(labels):,}, std={labels.std():.2f})")
 
             ax.set_xlabel(task.target_col)
-            ax.set_ylabel("Density")
+            ax.set_ylabel("Proportion")
 
         ax.legend(fontsize=9)
         fig.tight_layout()
