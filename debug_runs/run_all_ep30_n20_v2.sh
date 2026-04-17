@@ -30,6 +30,18 @@ run_sweep() {
 
     echo "[summarize] K=${k} epochs=${EPOCHS}"
     python "$SCRIPT_DIR/summarize_dt3.py" --k "$k" --epochs "$EPOCHS"
+
+    echo "[plot] K=${k} epochs=${EPOCHS}"
+    python "$SCRIPT_DIR/plot_training_curves.py" --k "$k" --epochs "$EPOCHS"
+
+    echo "[git] committing K=${k} results [$(date)]"
+    cd /home/jedi/research_repos/GFM
+    git add \
+        debug_runs/training_curves_n${k}_ep${EPOCHS}.png \
+        experiment_results_baseline_fix.md
+    git commit -m "Add K=${k} ep${EPOCHS} results: training curves and summary (n=20 seeds)"
+    git push
+    echo "[git] pushed K=${k} [$(date)]"
 }
 
 for K in 50 10 30 20 40 300; do

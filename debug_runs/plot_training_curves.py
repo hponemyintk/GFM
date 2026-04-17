@@ -114,7 +114,7 @@ def main():
 
         ax.set_xlabel("Epoch")
         ax.set_ylabel(ylabel)
-        ax.set_xlim(1, args.epochs)
+        ax.set_xlim(0, args.epochs)
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3)
 
