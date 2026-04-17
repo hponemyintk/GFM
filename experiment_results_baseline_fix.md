@@ -465,3 +465,29 @@ _ogPASS 3-phase: warmup=6, sampler_only=6, joint=18._
 |---:|---:|---:|---:|---:|
 
 <!-- END SWEEP n40_ep30 -->
+
+<!-- BEGIN SWEEP n300_ep30 -->
+## Sweep `n300_ep30` — K=300, epochs=30
+
+_ogPASS 3-phase: warmup=6, sampler_only=6, joint=18._
+
+### Aggregated (mean ± std over 0 seeds)
+
+| branch | AP ↑ | AUC ↑ | F1 ↑ | Acc ↑ |
+|---|---|---|---|---|
+| dev-kyaw (n=0) | — | — | — | — |
+| ogPASS (n=0) | — | — | — | — |
+
+### Per-seed
+
+#### dev-kyaw
+
+| seed | AP | AUC | F1 | Acc |
+|---:|---:|---:|---:|---:|
+
+#### ogPASS
+
+| seed | AP | AUC | F1 | Acc |
+|---:|---:|---:|---:|---:|
+
+<!-- END SWEEP n300_ep30 -->
