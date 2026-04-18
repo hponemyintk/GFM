@@ -1,6 +1,6 @@
 # ogPASS vs dev-kyaw — Interim Results (20 seeds, 30 epochs)
 
-Generated: 2026-04-17 11:19 (updated with partial K=20)  
+Generated: 2026-04-17 21:30 (updated with final K=20, K=40; K=300 running)  
 Dataset: `rel-f1 / driver-top3` | Tune metric: AP (higher = better)  
 Config: batch=32, layers=4, channels=512, lr=1e-4  
 ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
@@ -14,21 +14,20 @@ ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
 | **10** | ✅ done | 0.3556 ± 0.0937 | 0.3689 ± 0.0241 | **+0.0133** ✅ | 0.0937 | 0.0241 | 0.26× |
 | **30** | ✅ done | 0.4026 ± 0.1052 | 0.3800 ± 0.0276 | **-0.0226** | 0.1052 | 0.0276 | 0.26× |
 | **50** | ✅ done | 0.4027 ± 0.0481 | 0.3758 ± 0.0388 | **-0.0268** | 0.0481 | 0.0388 | 0.81× |
-| **20** | 🔄 partial (6+6/20) | 0.3835 ± 0.0681 | 0.3763 ± 0.0239 | **-0.0073** | 0.0681 | 0.0239 | 0.35× |
-| 40 | ⏳ pending | — | — | — | — | — | — |
-| 300 | ⏳ pending | — | — | — | — | — | — |
+| **20** | ✅ done | 0.3823 ± 0.0742 | 0.3713 ± 0.0216 | **-0.0110** | 0.0742 | 0.0216 | 0.29× |
+| **40** | ✅ done | 0.4009 ± 0.0834 | 0.3762 ± 0.0269 | **-0.0247** | 0.0834 | 0.0269 | 0.32× |
+| 300 | 🔄 running (6/20) | — | — | — | — | — | — |
 
 > Variance ratio < 1.0 means ogPASS is more stable across seeds.
 
 ### Key takeaways so far
 
-- **ogPASS wins on AP only at K=10** (+0.013), where random sampling is most constrained
-- **dev-kyaw leads at K=30 and K=50** on AP, despite ogPASS having higher val AP throughout training
-- **K=20 (partial, 6+6 seeds):** near-tie, Δ=−0.007 — ogPASS best val AP much higher (0.477 vs 0.405) but test AP nearly equal; val→test gap is 0.100 for ogPASS vs 0.021 for dev-kyaw
-- **ogPASS is dramatically more stable** across seeds at all K (variance ratio 0.26–0.81×)
-- **ogPASS wins AUC at K=10 and K=30** (+0.071, +0.024), suggesting better ranking even when AP lags
-- The val→test gap for ogPASS (~0.18) is ~2× larger than dev-kyaw (~0.08),
-  indicating the sampler's learned policy overfits to the val time period
+- **ogPASS wins AP only at K=10** (+0.013); dev-kyaw leads at all larger K
+- **AP deficit grows monotonically with K:** −0.011 (K=20), −0.023 (K=30), −0.025 (K=40), −0.027 (K=50)
+- **ogPASS is dramatically more stable** across seeds at all K (AP var ratio 0.26–0.32×, except K=50 at 0.81×)
+- **ogPASS wins AUC at every K** by +0.035–0.071, suggesting better ranking even when AP lags
+- The val→test gap for ogPASS is consistently ~2× larger than dev-kyaw, indicating the sampler's learned policy overfits to the val time period
+- K=300 still running (6/20 seeds)
 
 ---
 
@@ -40,18 +39,23 @@ ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
 > ogPASS val AP rises continuously through all phases — no collapse at joint boundary.
 > Wins on both AP (+0.013) and AUC (+0.071). The learned sampler helps when K is small.
 
-### K=20 (partial — 6+6 seeds, sweep still running)
+### K=20
 ![K=20 training curves](training_curves_n20_ep30.png)
 
-> ogPASS val AP clearly higher (~0.48 vs ~0.40 dev-kyaw) yet test AP nearly tied (Δ=−0.007).
-> Val→test gap: ogPASS −0.100 vs dev-kyaw −0.021 — the overfitting pattern continues.
-> Pattern is intermediate between K=10 (ogPASS wins) and K=30/50 (dev-kyaw wins).
+> ogPASS val AP clearly higher throughout training yet test AP slightly lower (Δ=−0.011, 20 seeds).
+> AP var ratio 0.29× — ogPASS very stable. AUC: ogPASS +0.038.
 
 ### K=30
 ![K=30 training curves](training_curves_n30_ep30.png)
 
 > ogPASS val AP consistently higher throughout training (~0.50 vs ~0.38),
 > yet test AP is lower (−0.023). Clear val→test distribution mismatch amplified by the sampler.
+
+### K=40
+![K=40 training curves](training_curves_n40_ep30.png)
+
+> dev-kyaw wins on AP (Δ=−0.025). ogPASS AP var ratio 0.32×, AUC +0.036.
+> Deficit close to K=50 — the pattern has stabilised by K=40.
 
 ### K=50
 ![K=50 training curves](training_curves_n50_ep30.png)
