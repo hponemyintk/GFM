@@ -11,6 +11,7 @@ import math
 import re
 from pathlib import Path
 
+import warnings
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -26,26 +27,27 @@ COLORS = {"devkyaw": "#2196F3", "ogpass": "#FF5722"}
 MAX_SEEDS = 20
 
 RE_EPOCH = re.compile(
-    r"^Epoch:\s*(\d+),\s*Train loss:\s*([\d.]+),\s*Val metrics:.*?"
+    r"^Epoch:\s*(\d+),\s*Train loss:\s*([\d.]+),\s*(?:Train AP:\s*([\d.]+),\s*)?Val metrics:.*?"
     r"'average_precision':\s*(?:np\.float64\()?([\d.]+)\)?"
 )
 RE_PHASE = re.compile(r"^\[phase\] epoch (\d+): (\w+)")
 
 
 def parse_log(path: Path) -> dict:
-    epochs, train_loss, val_ap, phases = [], [], [], {}
+    epochs, train_loss, train_ap, val_ap, phases = [], [], [], [], {}
     with open(path) as f:
         for line in f:
             m = RE_EPOCH.match(line)
             if m:
                 epochs.append(int(m.group(1)))
                 train_loss.append(float(m.group(2)))
-                val_ap.append(float(m.group(3)))
+                train_ap.append(float(m.group(3)) if m.group(3) else float("nan"))
+                val_ap.append(float(m.group(4)))
                 continue
             m = RE_PHASE.match(line)
             if m:
                 phases[int(m.group(1))] = m.group(2)
-    return {"epochs": epochs, "train_loss": train_loss, "val_ap": val_ap, "phases": phases}
+    return {"epochs": epochs, "train_loss": train_loss, "train_ap": train_ap, "val_ap": val_ap, "phases": phases}
 
 
 def collect(k: int, epochs: int) -> dict[str, list[dict]]:
@@ -84,24 +86,12 @@ def main():
 
     data = collect(args.k, args.epochs)
     ep_axis = np.arange(1, args.epochs + 1)
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     fig.suptitle(f"Training curves — K={args.k}, epochs={args.epochs} (mean ± std across seeds)", fontsize=13)
 
-    keys = [("train_loss", "Train Loss", axes[0]), ("val_ap", "Val AP (average precision)", axes[1])]
-
-    for key, ylabel, ax in keys:
-        for slug, label in BRANCHES:
-            runs = data[slug]
-            if not runs:
-                continue
-            mean, std, count = mean_std_curves(runs, key, args.epochs)
-            n = len(runs)
-            color = COLORS[slug]
-            ax.plot(ep_axis, mean, color=color, linewidth=2, label=f"{label} (n={n})")
-            ax.fill_between(ep_axis, mean - std, mean + std, color=color, alpha=0.15)
-
-        # Draw ogPASS phase boundaries if available
+    def draw_phase_lines(ax, data):
         og_runs = data.get("ogpass", [])
         if og_runs:
             phases = og_runs[0].get("phases", {})
@@ -112,11 +102,51 @@ def main():
                     ax.axvline(ep_start, color=phase_colors[phase_name], linestyle="--",
                                linewidth=1.2, alpha=0.7, label=phase_labels.pop(phase_name, None))
 
-        ax.set_xlabel("Epoch")
-        ax.set_ylabel(ylabel)
-        ax.set_xlim(0, args.epochs)
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3)
+    # Left panel: train loss
+    ax = axes[0]
+    for slug, label in BRANCHES:
+        runs = data[slug]
+        if not runs:
+            continue
+        mean, std, _ = mean_std_curves(runs, "train_loss", args.epochs)
+        n = len(runs)
+        color = COLORS[slug]
+        ax.plot(ep_axis, mean, color=color, linewidth=2, label=f"{label} (n={n})")
+        ax.fill_between(ep_axis, mean - std, mean + std, color=color, alpha=0.15)
+    draw_phase_lines(ax, data)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Train Loss")
+    ax.set_xlim(0, args.epochs)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Right panel: val AP (solid) + train AP (dashed, if available)
+    ax = axes[1]
+    has_train_ap = False
+    for slug, label in BRANCHES:
+        runs = data[slug]
+        if not runs:
+            continue
+        color = COLORS[slug]
+        n = len(runs)
+        # Val AP — solid
+        mean, std, _ = mean_std_curves(runs, "val_ap", args.epochs)
+        ax.plot(ep_axis, mean, color=color, linewidth=2, label=f"{label} val (n={n})")
+        ax.fill_between(ep_axis, mean - std, mean + std, color=color, alpha=0.15)
+        # Train AP — dashed, only if data exists (not all NaN)
+        mean_tr, std_tr, _ = mean_std_curves(runs, "train_ap", args.epochs)
+        if not np.all(np.isnan(mean_tr)):
+            ax.plot(ep_axis, mean_tr, color=color, linewidth=1.5, linestyle="--",
+                    alpha=0.75, label=f"{label} train (n={n})")
+            ax.fill_between(ep_axis, mean_tr - std_tr, mean_tr + std_tr, color=color, alpha=0.07)
+            has_train_ap = True
+    draw_phase_lines(ax, data)
+    ap_ylabel = "AP (average precision)" if has_train_ap else "Val AP (average precision)"
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ap_ylabel)
+    ax.set_xlim(0, args.epochs)
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     out = OUT_DIR / f"training_curves_n{args.k}_ep{args.epochs}.png"

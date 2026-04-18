@@ -741,12 +741,17 @@ if args.train_stage == "finetune":
 
         # Run evaluation on the validation set.
         val_pred = _test_fn(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
+        # Run evaluation on the training set for train AP tracking.
+        train_pred = _test_fn(loader_dict["train"], eval_model=eval_model, epoch=epoch, desc="Train eval")
         if local_rank == 0:
             val_metrics = task.evaluate(val_pred, task.get_table("val"))
-            print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
+            train_metrics = task.evaluate(train_pred, task.get_table("train"))
+            train_ap = train_metrics.get("average_precision", float("nan"))
+            print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Train AP: {train_ap:.4f}, Val metrics: {val_metrics}")
             wandb.log({
                 "epoch": epoch,
                 "epoch_train_loss": train_loss,
+                "train_average_precision": train_ap,
                 **{f"val_{k}": v for k, v in val_metrics.items()}
             })
 
