@@ -1,6 +1,6 @@
 # ogPASS vs dev-kyaw — Interim Results (20 seeds, 30 epochs)
 
-Generated: 2026-04-17 21:30 (updated with final K=20, K=40; K=300 running)  
+Generated: 2026-04-17 (updated with K=300 final results; K=60/70 running)  
 Dataset: `rel-f1 / driver-top3` | Tune metric: AP (higher = better)  
 Config: batch=32, layers=4, channels=512, lr=1e-4  
 ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
@@ -16,18 +16,18 @@ ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
 | **50** | ✅ done | 0.4027 ± 0.0481 | 0.3758 ± 0.0388 | **-0.0268** | 0.0481 | 0.0388 | 0.81× |
 | **20** | ✅ done | 0.3823 ± 0.0742 | 0.3713 ± 0.0216 | **-0.0110** | 0.0742 | 0.0216 | 0.29× |
 | **40** | ✅ done | 0.4009 ± 0.0834 | 0.3762 ± 0.0269 | **-0.0247** | 0.0834 | 0.0269 | 0.32× |
-| 300 | 🔄 running (6/20) | — | — | — | — | — | — |
+| **300** | ✅ done | 0.4406 ± 0.0634 | 0.4212 ± 0.0519 | **-0.0194** | 0.0634 | 0.0519 | 0.82× |
 
 > Variance ratio < 1.0 means ogPASS is more stable across seeds.
 
-### Key takeaways so far
+### Key takeaways (K=10–300 complete)
 
 - **ogPASS wins AP only at K=10** (+0.013); dev-kyaw leads at all larger K
-- **AP deficit grows monotonically with K:** −0.011 (K=20), −0.023 (K=30), −0.025 (K=40), −0.027 (K=50)
-- **ogPASS is dramatically more stable** across seeds at all K (AP var ratio 0.26–0.32×, except K=50 at 0.81×)
-- **ogPASS wins AUC at every K** by +0.035–0.071, suggesting better ranking even when AP lags
-- The val→test gap for ogPASS is consistently ~2× larger than dev-kyaw, indicating the sampler's learned policy overfits to the val time period
-- K=300 still running (6/20 seeds)
+- **AP deficit peaks at K=50 (−0.027) then partially recovers at K=300 (−0.019):** −0.011 (K=20), −0.023 (K=30), −0.025 (K=40), −0.027 (K=50), −0.019 (K=300)
+- **ogPASS is dramatically more stable** across seeds at K=10–40 (AP var ratio 0.26–0.32×); less so at K=50/300 (0.81–0.82×)
+- **ogPASS wins AUC at every K** by +0.022–+0.072, suggesting better ranking even when AP lags
+- The val→test gap for ogPASS is consistently 2–3× larger than dev-kyaw (sampler policy overfits to val time period)
+- At K=300 the ogPASS val AP advantage grows largest (0.670 vs 0.520), yet the sampler still fails to convert to test AP
 
 ---
 
@@ -62,6 +62,13 @@ ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
 
 > ogPASS val AP spikes during warmup/sampler_only then drops sharply at joint phase onset.
 > dev-kyaw wins on test AP (−0.027). Joint training disrupts the sampler's learned policy.
+
+### K=300
+![K=300 training curves](training_curves_n300_ep30.png)
+
+> ogPASS val AP advantage is largest at K=300, yet test AP deficit partially recovers to −0.019.
+> Train AP dashed lines present for seeds 8–19 only (logging added mid-sweep).
+> ogPASS AUC +0.022, AP var ratio 0.82×.
 
 ---
 
@@ -156,6 +163,48 @@ ogPASS 3-phase: warmup=6, sampler\_only=6, joint=18 epochs (20/20/60%)
 | 17 | 0.2991 | 0.3616 | +0.0625 |
 | 18 | 0.4229 | 0.4217 | -0.0012 |
 | 19 | 0.4347 | 0.3380 | -0.0967 |
+
+### K=300
+
+![K=300 training curves](training_curves_n300_ep30.png)
+
+> ogPASS val AP advantage is largest here (0.670 vs 0.520 mean best), yet test AP still lags (−0.019).
+> Train AP dashed lines visible for seeds 8–19 (train logging added mid-sweep).
+> ogPASS AUC +0.022; AP var ratio 0.82× (less stable than at small K).
+
+#### Val AP (best epoch) vs Test AP
+
+| branch | n | best val AP | test AP | gap |
+|---|--:|--:|--:|--:|
+| dev-kyaw | 20 | 0.5199 | 0.4406 ± 0.0634 | -0.0793 |
+| ogPASS | 20 | 0.6697 | 0.4212 ± 0.0519 | -0.2485 |
+
+#### Per-seed Test AP
+
+| seed | dev-kyaw | ogPASS | Δ |
+|--:|--:|--:|--:|
+| 0 | 0.3927 | 0.3822 | -0.0105 |
+| 1 | 0.4157 | 0.3643 | -0.0514 |
+| 2 | 0.3054 | 0.4877 | +0.1823 |
+| 3 | 0.4098 | 0.3761 | -0.0337 |
+| 4 | 0.3537 | 0.4139 | +0.0602 |
+| 5 | 0.4384 | 0.4137 | -0.0247 |
+| 6 | 0.4710 | 0.4543 | -0.0167 |
+| 7 | 0.4628 | 0.4336 | -0.0292 |
+| 8 | 0.3902 | 0.3813 | -0.0089 |
+| 9 | 0.4173 | 0.4264 | +0.0091 |
+| 10 | 0.5119 | 0.4017 | -0.1102 |
+| 11 | 0.4689 | 0.3629 | -0.1060 |
+| 12 | 0.4169 | 0.3896 | -0.0273 |
+| 13 | 0.4994 | 0.3690 | -0.1304 |
+| 14 | 0.4669 | 0.4250 | -0.0419 |
+| 15 | 0.5322 | 0.4032 | -0.1290 |
+| 16 | 0.4388 | 0.4910 | +0.0522 |
+| 17 | 0.4039 | 0.5664 | +0.1625 |
+| 18 | 0.5877 | 0.4062 | -0.1815 |
+| 19 | 0.4280 | 0.4754 | +0.0474 |
+
+---
 
 ### K=50
 
