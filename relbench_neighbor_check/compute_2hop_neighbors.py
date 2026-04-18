@@ -19,8 +19,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from relbench.datasets import get_dataset
-from relbench.tasks import get_task
+from relbench.datasets import get_dataset, get_dataset_names
+from relbench.tasks import get_task, get_task_names
 
 
 # ---------------------------------------------------------------------------
@@ -205,13 +205,18 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
             if verbose:
                 print(f"\n  Task: {task_name}")
 
-            task = get_task(dataset_name, task_name, download=True)
+            try:
+                task = get_task(dataset_name, task_name, download=True)
+            except Exception as exc:
+                print(f"    [SKIP] could not load task: {exc}")
+                continue
 
             if not hasattr(task, "entity_col"):
-                raise NotImplementedError(
-                    f"Task type {type(task)} not yet supported; "
-                    "only EntityTask is handled."
+                print(
+                    f"    [SKIP] task type {type(task).__name__} not supported "
+                    "(only EntityTask); skipping."
                 )
+                continue
 
             entity_col   = task.entity_col
             entity_table = task.entity_table
@@ -221,7 +226,11 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
 
             for split in ("train", "val", "test"):
                 mask_input = split == "test"
-                table = task.get_table(split, mask_input_cols=mask_input)
+                try:
+                    table = task.get_table(split, mask_input_cols=mask_input)
+                except Exception as exc:
+                    print(f"    [SKIP] {split}: {exc}")
+                    continue
                 df = table.df.dropna(subset=[entity_col])
 
                 # One entry per task-table row; duplicates are intentionally kept.
@@ -398,11 +407,25 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compute average 2-hop neighbour count for RelBench tasks."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--all",
+        action="store_true",
+        help="Run over every dataset and task registered in relbench.",
+    )
+    mode.add_argument(
+        "--datasets",
+        nargs="+",
+        metavar="DATASET",
+        help=(
+            "Run over all tasks for the given dataset(s), e.g. "
+            "rel-f1 rel-amazon"
+        ),
+    )
+    mode.add_argument(
         "--dataset-task",
         nargs="+",
         metavar="DATASET:TASK",
-        default="use_predefined_dict",
         help=(
             "One or more DATASET:TASK pairs, e.g. "
             "rel-f1:driver-top3  rel-amazon:user-churn"
@@ -410,23 +433,33 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.dataset_task == 'use_predefined_dict':
+    if args.all:
         dataset_task_dict = {
-                            "rel-f1": ["driver-position", "driver-dnf", "driver-top3"],
-                            "rel-avito": ["ad-ctr", "user-clicks", "user-visits"],
-                            "rel-event": ["user-attendance", "user-repeat", "user-ignore"],
-                            "rel-trial": ["study-adverse", "study-outcome", "site-success"],
-                            "rel-amazon": ["user-ltv", "item-ltv", "user-churn", "item-churn"],
-                            "rel-stack": ["post-votes", "user-engagement", "user-badge"],
-                            "rel-hm": ["item-sales", "user-churn"],
-                            }
-    else:
+            ds: get_task_names(ds) for ds in get_dataset_names()
+        }
+    elif args.datasets:
+        dataset_task_dict = {
+            ds: get_task_names(ds) for ds in args.datasets
+        }
+    elif args.dataset_task:
         dataset_task_dict = defaultdict(list)
         for pair in args.dataset_task:
             dataset_name, task_name = [s.strip() for s in pair.split(":", 1)]
             dataset_task_dict[dataset_name].append(task_name)
+        dataset_task_dict = dict(dataset_task_dict)
+    else:
+        # default predefined selection
+        dataset_task_dict = {
+            "rel-f1":     ["driver-position", "driver-dnf", "driver-top3"],
+            "rel-avito":  ["ad-ctr", "user-clicks", "user-visits"],
+            "rel-event":  ["user-attendance", "user-repeat", "user-ignore"],
+            "rel-trial":  ["study-adverse", "study-outcome", "site-success"],
+            "rel-amazon": ["user-ltv", "item-ltv", "user-churn", "item-churn"],
+            "rel-stack":  ["post-votes", "user-engagement", "user-badge"],
+            "rel-hm":     ["item-sales", "user-churn"],
+        }
 
-    results = compute_avg_2hop_neighbors(dict(dataset_task_dict))
+    results = compute_avg_2hop_neighbors(dataset_task_dict)
 
     print("\n\n" + "=" * 60)
     print("SUMMARY")
