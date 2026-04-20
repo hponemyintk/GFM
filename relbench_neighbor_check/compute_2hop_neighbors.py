@@ -157,7 +157,7 @@ def count_2hop_neighbors_for_nodes(seed_nodes_with_cutoff, adj, node_time):
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
+def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True, max_seeds=None):
     """
     Compute the average number of 2-hop neighbours for seed nodes in each
     split (train / val / test) for every (dataset, task) pair.
@@ -168,6 +168,10 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
         Maps dataset names to lists of task names, e.g.
         {"rel-avito": [" ad-ctr"]}.
     verbose : bool
+    max_seeds : int or None
+        If set, randomly downsample each split to at most this many seeds
+        before running the traversal.  Useful for approximating neighbourhood
+        statistics on large datasets without paying the full O(N) cost.
 
     Returns
     -------
@@ -178,6 +182,7 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
             "median_2hop_neighbors": float,
             "mode_2hop_neighbors":   int,
             "num_seeds":             int,
+            "sampled":               bool,
         }
     """
     results = {}
@@ -244,6 +249,13 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
                     for eid, ts in zip(entity_ids, cutoff_times)
                 ]
 
+                sampled = False
+                if max_seeds is not None and len(seed_nodes_with_cutoff) > max_seeds:
+                    rng = np.random.default_rng(seed=42)
+                    idx = rng.choice(len(seed_nodes_with_cutoff), size=max_seeds, replace=False)
+                    seed_nodes_with_cutoff = [seed_nodes_with_cutoff[i] for i in idx]
+                    sampled = True
+
                 counts, hop1_counts, hop2_counts, hop1_type_per_seed, hop2_type_per_seed = \
                     count_2hop_neighbors_for_nodes(
                         seed_nodes_with_cutoff, adj, node_time
@@ -274,6 +286,7 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
                     "median_2hop_neighbors": median,
                     "mode_2hop_neighbors":   mode,
                     "num_seeds":             len(seed_nodes_with_cutoff),
+                    "sampled":               sampled,
                     "avg_1hop":              float(np.mean(hop1_counts)),
                     "std_1hop":              float(np.std(hop1_counts)),
                     "avg_2hop_only":         float(np.mean(hop2_counts)),
@@ -283,8 +296,9 @@ def compute_avg_2hop_neighbors(dataset_task_dict, verbose=True):
                 }
 
                 if verbose:
+                    sampled_tag = f" (sampled from {len(df):,})" if sampled else ""
                     print(
-                        f"    {split:5s} | seeds: {len(seed_nodes_with_cutoff):4d} | "
+                        f"    {split:5s} | seeds: {len(seed_nodes_with_cutoff):,}{sampled_tag} | "
                         f"avg: {avg:10.2f} ± {std:.2f} | "
                         f"median: {median:.2f} | mode: {mode}"
                     )
@@ -431,6 +445,17 @@ def main():
             "rel-f1:driver-top3  rel-amazon:user-churn"
         ),
     )
+    parser.add_argument(
+        "--sample-seeds",
+        type=int,
+        metavar="N",
+        default=None,
+        help=(
+            "If set, randomly downsample each split to at most N seeds before "
+            "running the 2-hop traversal.  Gives a fast approximation of "
+            "neighbourhood statistics on large datasets (e.g. --sample-seeds 10000)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.all:
@@ -459,7 +484,7 @@ def main():
             "rel-hm":     ["item-sales", "user-churn"],
         }
 
-    results = compute_avg_2hop_neighbors(dataset_task_dict)
+    results = compute_avg_2hop_neighbors(dataset_task_dict, max_seeds=args.sample_seeds)
 
     print("\n\n" + "=" * 60)
     print("SUMMARY")
@@ -474,8 +499,9 @@ def main():
             print(header)
             print("  " + "-" * (len(header) - 2))
             for split, m in splits.items():
+                sampled_tag = "*" if m.get("sampled") else " "
                 print(
-                    f"  {split:<6}  {m['num_seeds']:>8}  "
+                    f"  {split:<6}  {m['num_seeds']:>8}{sampled_tag} "
                     f"{m['avg_2hop_neighbors']:>14.2f}  "
                     f"{m['std_2hop_neighbors']:>10.2f}  "
                     f"{m['median_2hop_neighbors']:>10.2f}  "
