@@ -620,6 +620,7 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
             ntm_cpu  = batch["neighbor_times"].numpy()
             sel_cpu  = sel.cpu().numpy()
             global_idxs = batch["global_idx"].tolist()
+            B = nt.shape[0]
 
             for b in range(B):
                 g = global_idxs[b]
@@ -640,7 +641,10 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
 def mode_joint():
     # ---- 3a: ensure curated HDF5s exist ----
     splits = ["train", "val", "test"]
-    curated_paths = {s: os.path.join(curated_dir, f"{s}.h5") for s in splits}
+    # RelGTTokens reader expects {precomputed_dir}/{K}/{split}.h5, so we mirror
+    # that layout here when writing curated HDF5s.
+    curated_paths = {s: os.path.join(curated_dir, str(args.num_neighbors), f"{s}.h5")
+                     for s in splits}
 
     if local_rank == 0:
         missing = [s for s in splits if not os.path.exists(curated_paths[s])]
@@ -705,7 +709,7 @@ def mode_joint():
     frozen_modules = [
         model.type_encoder, model.hop_encoder, model.time_encoder, model.tfs_encoder,
         model.layer_norm_type, model.layer_norm_hop, model.layer_norm_time, model.layer_norm_tfs,
-        model.pe_encoder,
+        model.pe_encoder, model.layer_norm_pe,
     ]
     for m in frozen_modules:
         for p in m.parameters():
