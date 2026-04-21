@@ -54,17 +54,23 @@ class LocalModule(nn.Module):
         for layer in self.layers:
             layer.reset_parameters()
 
-    def forward(self, batched_data, pretrain_token=False):
+    def forward(self, batched_data, pretrain_token=False, extract_seed_logits=False):
         tensor = self.att_embeddings_nope(batched_data)
 
-        # transformer encoder
-        for enc_layer in self.layers:
-            tensor = enc_layer(tensor)
+        # transformer encoder. Extract row-0 pre-softmax attention logits from the
+        # LAST layer only — those best reflect the teacher's final selection behavior.
+        seed_logits = None
+        last_idx = len(self.layers) - 1
+        for i, enc_layer in enumerate(self.layers):
+            want_logits = extract_seed_logits and (i == last_idx)
+            tensor, layer_logits = enc_layer(tensor, extract_seed_logits=want_logits)
+            if want_logits:
+                seed_logits = layer_logits
 
         output = self.final_ln(tensor)
         
         if pretrain_token:
-            return output
+            return output, seed_logits
 
         _target = output[:, 0, :].unsqueeze(1).repeat(1, self.seq_len - 1, 1)
         split_tensor = torch.split(output, [1, self.seq_len - 1], dim=1)
@@ -88,7 +94,7 @@ class LocalModule(nn.Module):
 
         output = (node_tensor + neighbor_tensor).squeeze()
 
-        return output
+        return output, seed_logits
 
 
 class FeedForwardNetwork(nn.Module):
@@ -153,41 +159,48 @@ class EncoderLayer(nn.Module):
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
 
-    def forward(self, x, attn_bias=None):
-        # self-attention block with flash attention 
+    def forward(self, x, attn_bias=None, extract_seed_logits=False):
+        # self-attention block with flash attention
         residual = x
         x_norm = self.self_attention_norm(x)  # [B, L, D]
-        
+
         Q = self.q_proj(x_norm)  # [B, L, D]
         K = self.k_proj(x_norm)
         V = self.v_proj(x_norm)
         B, L, D = Q.shape
         head_dim = D // self.num_heads
-        
+
         # reshape Q, K, V to shape [B, num_heads, L, head_dim].
         Q = Q.view(B, L, self.num_heads, head_dim).transpose(1, 2)
         K = K.view(B, L, self.num_heads, head_dim).transpose(1, 2)
         V = V.view(B, L, self.num_heads, head_dim).transpose(1, 2)
-        
+
+        # Distillation target: seed row's pre-softmax attention logits, mean over heads.
+        seed_logits = None
+        if extract_seed_logits:
+            q_seed = Q[:, :, 0:1, :]                                # [B, H, 1, d_h]
+            dots = torch.matmul(q_seed, K.transpose(-2, -1)) / math.sqrt(head_dim)
+            seed_logits = dots.squeeze(2).mean(dim=1)               # [B, L]
+
         # PyTorch’s fast scaled dot-product attention (flash attention).
         attn_output = F.scaled_dot_product_attention(
             Q, K, V,
             attn_mask=attn_bias,
             dropout_p=self.attention_dropout_rate,
-            is_causal=False  
+            is_causal=False
         )  # Returns [B, num_heads, L, head_dim]
-        
+
         # reshape back to [B, L, D].
         attn_output = attn_output.transpose(1, 2).reshape(B, L, D)
-        
+
         attn_output = self.out_proj(attn_output)
         attn_output = self.self_attention_dropout(attn_output)
-        
+
         x = residual + attn_output
-        
-        # Feed-forward block 
+
+        # Feed-forward block
         residual = x
         x_norm = self.ffn_norm(x)
         ffn_output = self.ffn(x_norm)
         x = residual + ffn_output
-        return x
+        return x, seed_logits

@@ -139,6 +139,67 @@ def gather_1_and_2_hop_with_seed_time(
 
     return neighbors_with_time
 
+def _process_one_seed_scope(args):
+    """Variant of _process_one_seed that collects a scope-sized candidate pool
+    WITHOUT building per-subgraph edge_index. The scope HDF5 stores only token
+    arrays (types/indices/hops/times); edge_index is rebuilt from GLOBAL_ADJ
+    at phase-3 curate time on the sampler-selected K nodes.
+    """
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES
+
+    (data, scope, seed_node_type, seed_node_idx, seed_time, seed_val) = args
+    random.seed(seed_val)
+
+    T_hat = gather_1_and_2_hop_with_seed_time(
+        GLOBAL_ADJ, data, seed_node_type, seed_node_idx, seed_time
+    )
+    T_hat_list = list(T_hat)
+    size_th = len(T_hat_list)
+    scope_minus_1 = scope - 1
+
+    one_hop_neighbors = [n for n in T_hat_list if n[2] == 1]
+    two_hop_neighbors = [n for n in T_hat_list if n[2] == 2]
+    combined_neighbors = one_hop_neighbors + two_hop_neighbors
+
+    if size_th >= scope_minus_1:
+        chosen_neighbors = random.sample(combined_neighbors, scope_minus_1)
+    elif 0 < size_th < scope_minus_1:
+        # Use all real neighbors then pad with fallback from GLOBAL_ALL_NODES.
+        chosen_neighbors = list(combined_neighbors)
+        pad_n = scope_minus_1 - len(chosen_neighbors)
+        if pad_n <= len(GLOBAL_ALL_NODES):
+            fallback = random.sample(GLOBAL_ALL_NODES, pad_n)
+        else:
+            fallback = random.choices(GLOBAL_ALL_NODES, k=pad_n)
+        for (ft, fi) in fallback:
+            if hasattr(data[ft], "time"):
+                ft_time = data[ft].time[fi].item()
+                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
+            else:
+                rel_time = 0
+            chosen_neighbors.append((ft, fi, 3, rel_time, None))
+    else:
+        if scope_minus_1 <= len(GLOBAL_ALL_NODES):
+            fallback = random.sample(GLOBAL_ALL_NODES, scope_minus_1)
+        else:
+            fallback = random.choices(GLOBAL_ALL_NODES, k=scope_minus_1)
+        chosen_neighbors = []
+        for (ft, fi) in fallback:
+            if hasattr(data[ft], "time"):
+                ft_time = data[ft].time[fi].item()
+                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
+            else:
+                rel_time = 0
+            chosen_neighbors.append((ft, fi, 3, rel_time, None))
+
+    final_tokens = [(seed_node_type, seed_node_idx, 0, 0.0, 0)]
+    # Randomize candidate order; seed stays at index 0.
+    rest = random.sample(chosen_neighbors, len(chosen_neighbors))
+    final_tokens.extend(rest)
+
+    return (seed_node_type, seed_node_idx, final_tokens)
+
+
 def _process_one_seed(args):
     """
     Worker function: gather neighbors for a single seed node + time,
@@ -216,6 +277,58 @@ def _process_one_seed(args):
         edge_index = arr.T  # shape [2, E]
 
     return (seed_node_type, seed_node_idx, final_tokens, edge_index)
+
+def local_scope_nodes_hetero(
+    data: HeteroData,
+    scope: int,
+    table_input_nodes: tuple,
+    table_input_time: torch.Tensor,
+    undirected: bool = True,
+    num_workers: int = None,
+):
+    """Scope-sized analog of local_nodes_hetero. Returns token pools only,
+    no edge_index. Used to precompute the phase-3 sampler-input scope HDF5.
+    """
+    global GLOBAL_ADJ, GLOBAL_ALL_NODES
+
+    if GLOBAL_ADJ is None:
+        GLOBAL_ADJ = build_adjacency_hetero(data, undirected=undirected)
+    adjacency = GLOBAL_ADJ
+
+    if GLOBAL_ALL_NODES is None:
+        all_nodes_all_types = []
+        for nt in data.node_types:
+            for i in range(data[nt].num_nodes):
+                all_nodes_all_types.append((nt, i))
+        GLOBAL_ALL_NODES = all_nodes_all_types
+    else:
+        all_nodes_all_types = GLOBAL_ALL_NODES
+
+    seed_node_type, seed_node_idxs = table_input_nodes
+    assert len(seed_node_idxs) == len(table_input_time)
+
+    tasks = []
+    for i, node_idx_t in enumerate(seed_node_idxs):
+        node_idx = node_idx_t.item()
+        seed_t = table_input_time[i].item()
+        seed_val = hash((seed_node_type, node_idx, seed_t, scope)) & 0xffffffff
+        tasks.append((data, scope, seed_node_type, node_idx, seed_t, seed_val))
+
+    if num_workers is None:
+        num_workers = min(cpu_count() - 20, len(tasks))
+
+    with Pool(
+        processes=num_workers,
+        initializer=init_worker_globals,
+        initargs=(adjacency, all_nodes_all_types),
+    ) as pool:
+        results = pool.map(_process_one_seed_scope, tasks)
+
+    S = {seed_node_type: {}}
+    for (nt, idx, final_list) in results:
+        S[nt][idx] = final_list
+    return S
+
 
 def local_nodes_hetero(
     data: HeteroData,
@@ -619,3 +732,274 @@ class RelGTTokens(Dataset):
         })
 
         return out
+
+
+########################################
+#  Scope-pool dataset (phase-3 sampler input)
+########################################
+class RelGTScopeTokens(Dataset):
+    """Scope-sized candidate pool per seed. Stores only token arrays; no edges.
+
+    Consumed ONLY during phase-3 curate to feed the distilled sampler. The
+    resulting K-subgraph (with edge_index) is materialized by `curate_subgraphs`
+    and written to a separate HDF5 compatible with `RelGTTokens`.
+    """
+
+    def __init__(
+        self,
+        data,
+        task,
+        sample_scope: int,
+        split: str = "train",
+        undirected: bool = True,
+        num_workers: int = None,
+        precompute: bool = True,
+        precomputed_dir: str = None,
+    ):
+        super().__init__()
+        self.data = data
+        self.task = task
+        self.split = split
+        self.sample_scope = sample_scope
+        self.undirected = undirected
+        self.num_workers = num_workers
+        self.precompute = precompute
+        self.precomputed_dir = precomputed_dir
+
+        self.table = self.task.get_table(split=self.split)
+        self.table_input = get_node_train_table_input(self.table, self.task)
+        self.node_type, self.node_idxs = self.table_input.nodes
+        self.target = self.table_input.target if self.table_input.target is not None else None
+        self.time = getattr(self.table_input, "time", None)
+
+        self.node_types = self.data.node_types
+        self.node_type_to_index = {nt: idx for idx, nt in enumerate(self.node_types)}
+        self.index_to_node_type = {idx: nt for idx, nt in enumerate(self.node_types)}
+        self.max_neighbor_hop = 2 + 1
+
+        self._create_global_mappings()
+        self.precomputed_path = self._construct_precomputed_path()
+
+        if self.precompute:
+            if os.path.exists(self.precomputed_path):
+                print(f"[scope/{self.split}] Found existing HDF5 at {self.precomputed_path}")
+            else:
+                print(f"[scope/{self.split}] Precomputing scope={self.sample_scope} pools...")
+                self._precompute_scope()
+
+    def _create_global_mappings(self):
+        self.type_local_to_global = {}
+        self.global_to_type_local = {}
+        global_index = 0
+        for type_idx, node_type in self.index_to_node_type.items():
+            if 'x' in self.data[node_type]:
+                num_nodes = self.data[node_type]['x'].size(0)
+            else:
+                num_nodes = self.data[node_type].num_nodes
+            for local_idx in range(num_nodes):
+                key = (type_idx, local_idx)
+                self.type_local_to_global[key] = global_index
+                self.global_to_type_local[global_index] = key
+                global_index += 1
+
+    def get_global_index(self, type_idxs, local_idxs):
+        return [self.type_local_to_global[(t, l)] for t, l in zip(type_idxs, local_idxs)]
+
+    def _construct_precomputed_path(self) -> str:
+        if not self.precomputed_dir:
+            raise ValueError("must provide 'precomputed_dir'")
+        path = os.path.join(
+            self.precomputed_dir,
+            f"scope_{self.sample_scope}",
+            f"{self.split}.h5",
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def __len__(self):
+        return len(self.node_idxs)
+
+    def _precompute_scope(self):
+        total = len(self.node_idxs)
+        S = self.sample_scope
+        chunk_size = 5000
+
+        with h5py.File(self.precomputed_path, 'w') as hf:
+            _chunk = min(total, 5000)
+            datasets = {
+                "types":   hf.create_dataset("types",   shape=(total, S), dtype='int16',  chunks=(_chunk, S)),
+                "indices": hf.create_dataset("indices", shape=(total, S), dtype='int32',  chunks=(_chunk, S)),
+                "hops":    hf.create_dataset("hops",    shape=(total, S), dtype='int8',   chunks=(_chunk, S)),
+                "times":   hf.create_dataset("times",   shape=(total, S), dtype='float32', chunks=(_chunk, S)),
+            }
+            with tqdm(total=total, desc=f"Scope-precompute '{self.split}'") as pbar:
+                for start in range(0, total, chunk_size):
+                    end = min(start + chunk_size, total)
+                    n = end - start
+                    chunk_idxs = self.node_idxs[start:end]
+                    chunk_times = self.time[start:end] if self.time is not None else None
+
+                    S_chunk = local_scope_nodes_hetero(
+                        data=self.data.to("cpu"),
+                        scope=S,
+                        table_input_nodes=(self.node_type, chunk_idxs),
+                        table_input_time=chunk_times,
+                        undirected=self.undirected,
+                        num_workers=self.num_workers,
+                    )
+
+                    c_types = np.zeros((n, S), dtype=np.int16)
+                    c_indices = np.zeros((n, S), dtype=np.int32)
+                    c_hops = np.zeros((n, S), dtype=np.int8)
+                    c_times = np.zeros((n, S), dtype=np.float32)
+
+                    for i, node_id in enumerate(chunk_idxs):
+                        final_nodes = S_chunk[self.node_type][int(node_id)]
+                        for j, (t_str, nbr_loc_idx, hop, t_val, _) in enumerate(final_nodes):
+                            c_types[i, j] = self.node_type_to_index[t_str]
+                            c_indices[i, j] = nbr_loc_idx
+                            c_hops[i, j] = hop
+                            c_times[i, j] = t_val
+
+                    datasets["types"][start:end] = c_types
+                    datasets["indices"][start:end] = c_indices
+                    datasets["hops"][start:end] = c_hops
+                    datasets["times"][start:end] = c_times
+                    pbar.update(n)
+                    del S_chunk
+                    gc.collect()
+
+    def __getitem__(self, idx: int):
+        with h5py.File(self.precomputed_path, 'r') as hf:
+            sample = {
+                "types":   torch.from_numpy(hf["types"][idx]).long(),
+                "indices": torch.from_numpy(hf["indices"][idx]).long(),
+                "hops":    torch.from_numpy(hf["hops"][idx]).long(),
+                "times":   torch.from_numpy(hf["times"][idx]),
+            }
+        sample["first_type"] = sample["types"][0].item()
+        sample["first_index"] = sample["indices"][0].item()
+        sample["tfs"] = [
+            self.data[self.index_to_node_type[t.item()]].tf[i.item()]
+            for t, i in zip(sample["types"], sample["indices"])
+        ]
+        sample["global_idx"] = idx
+        label = self.target[idx] if self.target is not None else None
+        return sample, label
+
+    def collate(self, batch):
+        samples, labels = zip(*batch)
+
+        neighbor_types = torch.stack([s["types"] for s in samples], dim=0)
+        neighbor_indices = torch.stack([s["indices"] for s in samples], dim=0)
+        neighbor_hops = torch.stack([s["hops"] for s in samples], dim=0)
+        neighbor_times = torch.stack([s["times"] for s in samples], dim=0)
+
+        out = {
+            "neighbor_types": neighbor_types,
+            "neighbor_indices": neighbor_indices,
+            "neighbor_hops": neighbor_hops,
+            "neighbor_times": neighbor_times,
+            "labels": torch.stack(labels, dim=0) if self.target is not None else None,
+        }
+
+        first_types = [s["first_type"] for s in samples]
+        first_indices = [s["first_index"] for s in samples]
+        out["node_indices"] = torch.tensor(
+            self.get_global_index(first_types, first_indices), dtype=torch.long
+        )
+
+        B, K = neighbor_types.shape
+        grouped_tfs = {}
+        grouped_positions = {}
+        for t_id in range(len(self.node_types)):
+            mask = (neighbor_types == t_id)
+            if not mask.any():
+                continue
+            local_idxs = neighbor_indices[mask]
+            type_str = self.index_to_node_type[t_id]
+            positions_2d = torch.nonzero(mask, as_tuple=False)
+            offsets_list = [b * K + k for (b, k) in positions_2d.tolist()]
+            grouped_tfs[t_id] = self.data[type_str].tf[local_idxs]
+            grouped_positions[t_id] = offsets_list
+
+        flat_batch_idx = torch.arange(B).unsqueeze(1).expand(B, K).reshape(-1).tolist()
+        flat_nbr_idx = torch.arange(K).repeat(B).tolist()
+        global_idxs = torch.tensor([s["global_idx"] for s in samples], dtype=torch.long)
+
+        out.update({
+            "grouped_tfs": grouped_tfs,
+            "grouped_indices": grouped_positions,
+            "flat_batch_idx": flat_batch_idx,
+            "flat_nbr_idx": flat_nbr_idx,
+            "global_idx": global_idxs,
+        })
+        return out
+
+
+def build_edge_index_for_selection(
+    types: np.ndarray,
+    indices: np.ndarray,
+    index_to_node_type: Dict[int, str],
+) -> np.ndarray:
+    """Given K selected token positions (as parallel arrays of type and local
+    indices), rebuild edge_index in subgraph-local indexing using GLOBAL_ADJ.
+
+    Returns int16 array of shape [2, E]. Seed is assumed at position 0 if the
+    caller laid it out that way; this function is agnostic — it just builds
+    edges among whatever positions are provided.
+    """
+    global GLOBAL_ADJ
+    if GLOBAL_ADJ is None:
+        raise RuntimeError("GLOBAL_ADJ is not initialized; call build_adjacency_hetero first.")
+
+    K = len(types)
+    local_map = {}
+    for j in range(K):
+        local_map[(index_to_node_type[int(types[j])], int(indices[j]))] = j
+
+    edges = []
+    for j in range(K):
+        t_str = index_to_node_type[int(types[j])]
+        loc = int(indices[j])
+        for (nbr_t, nbr_i) in GLOBAL_ADJ[t_str][loc]:
+            j_dst = local_map.get((nbr_t, nbr_i))
+            if j_dst is not None:
+                edges.append((j, j_dst))
+
+    if not edges:
+        return np.zeros((2, 0), dtype=np.int16)
+    return np.array(edges, dtype=np.int16).T
+
+
+def write_curated_hdf5(
+    out_path: str,
+    types: np.ndarray,
+    indices: np.ndarray,
+    hops: np.ndarray,
+    times: np.ndarray,
+    edges_list: List[np.ndarray],
+):
+    """Write a curated HDF5 in the same format as RelGTTokens._precompute_sampling
+    produces. Shapes: types/indices/hops/times are [N, K]; edges_list is per-row.
+    """
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    N, K = types.shape
+    offsets = np.zeros(N + 1, dtype=np.uint64)
+    for i in range(N):
+        offsets[i + 1] = offsets[i] + (edges_list[i].shape[1] if edges_list[i] is not None else 0)
+    total_edges = int(offsets[-1])
+
+    with h5py.File(out_path, 'w') as hf:
+        _chunk = min(N, 10000)
+        hf.create_dataset("types",   data=types.astype(np.int16),   chunks=(_chunk, K))
+        hf.create_dataset("indices", data=indices.astype(np.int32), chunks=(_chunk, K))
+        hf.create_dataset("hops",    data=hops.astype(np.int8),     chunks=(_chunk, K))
+        hf.create_dataset("times",   data=times.astype(np.float32), chunks=(_chunk, K))
+        edges_dset = hf.create_dataset("edges", shape=(2, total_edges), dtype='int16')
+        for i in range(N):
+            e = edges_list[i]
+            s, e_ = offsets[i], offsets[i + 1]
+            if e is not None and e.size > 0:
+                edges_dset[:, s:e_] = e
+        hf.create_dataset("edges_offsets", data=offsets)

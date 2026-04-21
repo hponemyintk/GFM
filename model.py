@@ -90,17 +90,19 @@ class RelGTLayer(nn.Module):
         if hasattr(self.local_module, 'reset_parameters'):
             self.local_module.reset_parameters()
             
-    def forward(self, x_set, x, node_indices):
+    def forward(self, x_set, x, node_indices, extract_seed_logits=False):
+        seed_logits = None
         if self.conv_type == "local":
-            out = self.local_forward(x_set)
+            out, seed_logits = self.local_forward(x_set, extract_seed_logits=extract_seed_logits)
             out = self.layer_norm_local(out)
 
         elif self.conv_type == "global":
+            # Global path has no seed-attention logits — extraction unsupported here.
             out = self.global_forward(x, node_indices)
             out = self.layer_norm_global(out)
 
         elif self.conv_type == "full":
-            out_local = self.local_forward(x_set)
+            out_local, seed_logits = self.local_forward(x_set, extract_seed_logits=extract_seed_logits)
             out_global = self.global_forward(x, node_indices)
             out_local = self.layer_norm_local(out_local)
             out_global = self.layer_norm_global(out_global)
@@ -109,7 +111,7 @@ class RelGTLayer(nn.Module):
         else:
             raise NotImplementedError
 
-        return out
+        return out, seed_logits
 
     def global_forward(self, x, batch_idx):
         d, h = self.out_channels, self.heads
@@ -150,8 +152,8 @@ class RelGTLayer(nn.Module):
 
         return out
 
-    def local_forward(self, x_set, pretrain_token=False):
-        return self.local_module(x_set, pretrain_token)
+    def local_forward(self, x_set, pretrain_token=False, extract_seed_logits=False):
+        return self.local_module(x_set, pretrain_token, extract_seed_logits=extract_seed_logits)
 
     def __repr__(self) -> str:
         return (
@@ -281,7 +283,21 @@ class RelGT(torch.nn.Module):
 
         self.head.reset_parameters()
 
-    def forward(self, 
+    def base_concat_forward(self, neighbor_types, neighbor_hops, neighbor_times, grouped_tf_dict):
+        """Run only the four base encoders + their LNs and return the concat.
+        Used by phase-3 curate to avoid the O(S^2) transformer pass over the
+        scope pool. PE is intentionally excluded — the sampler does not use it.
+        """
+        neighbor_tfs_emb   = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
+        neighbor_types_emb = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops_emb  = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times_emb = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+        return torch.cat(
+            [neighbor_types_emb, neighbor_hops_emb, neighbor_times_emb, neighbor_tfs_emb],
+            dim=-1,
+        )
+
+    def forward(self,
                 neighbor_types,
                 node_indices,
                 neighbor_hops,
@@ -289,26 +305,47 @@ class RelGT(torch.nn.Module):
                 grouped_tf_dict,
                 edge_index=None,
                 batch=None,
+                extract_seed_logits=False,
+                return_base_concat=False,
                 ):
-        
-        neighbor_tfs = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
-        neighbor_types = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
-        neighbor_hops = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
-        neighbor_times = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
+
+        neighbor_tfs_emb = self.layer_norm_tfs(self.tfs_encoder(grouped_tf_dict, neighbor_types))
+        neighbor_types_emb = self.layer_norm_type(self.type_encoder(neighbor_types.long()))
+        neighbor_hops_emb = self.layer_norm_hop(self.hop_encoder(neighbor_hops.long()))
+        neighbor_times_emb = self.layer_norm_time(self.time_encoder(neighbor_times.float()))
         neighbor_subgraph_pe = self.layer_norm_pe(self.pe_encoder(edge_index, batch))
-        
-        cat_list = [neighbor_types, neighbor_hops, neighbor_times, neighbor_tfs, neighbor_subgraph_pe]
+
+        # Sampler-visible base concat: [type, hop, time, tfs] post-LN, PE excluded.
+        base_concat = None
+        if return_base_concat:
+            base_concat = torch.cat(
+                [neighbor_types_emb, neighbor_hops_emb, neighbor_times_emb, neighbor_tfs_emb],
+                dim=-1,
+            )
+
+        cat_list = [neighbor_types_emb, neighbor_hops_emb, neighbor_times_emb, neighbor_tfs_emb, neighbor_subgraph_pe]
         if self.ablate_idx is not None:
             cat_list.pop(self.ablate_idx)
-        x_set = torch.cat(cat_list, dim=-1)        
+        x_set = torch.cat(cat_list, dim=-1)
         x_set = self.in_mixture(x_set)
-        
-        x = x_set[:, 0, :] # select seed token representation
+
+        seed_logits = None
+        x = x_set[:, 0, :]  # select seed token representation
         for i, conv in enumerate(self.convs):
-            x_set = conv(x_set, x, node_indices)
+            x_set, layer_logits = conv(x_set, x, node_indices, extract_seed_logits=extract_seed_logits)
+            if extract_seed_logits and layer_logits is not None:
+                # RelGT currently uses a single conv layer; if multiple, the last non-None wins.
+                seed_logits = layer_logits
             x_set = self.ffs[i](x_set)
         x_set = self.head(x_set)
 
+        if extract_seed_logits or return_base_concat:
+            extras = {}
+            if extract_seed_logits:
+                extras["seed_logits"] = seed_logits
+            if return_base_concat:
+                extras["base_concat"] = base_concat
+            return x_set, extras
         return x_set
 
     def global_forward(self, x, pos_enc, node_indices):
