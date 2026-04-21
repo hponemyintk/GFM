@@ -28,15 +28,32 @@ _DISTILL_RE = re.compile(
     r"Epoch\s*(\d+)\s+distill_train=([-\d.eE+]+)\s+distill_val=([-\d.eE+]+)")
 
 
+_METRIC_RE = re.compile(
+    r"'([^']+)'\s*:\s*(?:np\.float(?:16|32|64)?\()?([-\d.eE+]+)"
+)
+# Preferred tune metric per task type (binary/regression/multilabel).
+_METRIC_PREFERENCE = ("roc_auc", "mae", "multilabel_auprc_macro",
+                      "average_precision", "accuracy")
+
+
 def _parse_val_metrics(s: str):
-    """Turn "{'roc_auc': 0.71, 'ap': 0.5}" into a dict of floats (first key wins)."""
+    """Parse a dict-literal substring into {metric_name: float}. Handles both
+    plain floats ('accuracy': 0.79) and np.float64(...) wrappers."""
     out = {}
-    for m in re.finditer(r"'([^']+)'\s*:\s*([-\d.eE+]+)", s):
+    for m in _METRIC_RE.finditer(s):
         try:
             out[m.group(1)] = float(m.group(2))
         except ValueError:
             pass
     return out
+
+
+def _pick_metric(metrics: dict) -> str:
+    """Pick the preferred metric from parsed metrics, else first key."""
+    for name in _METRIC_PREFERENCE:
+        if name in metrics:
+            return name
+    return next(iter(metrics.keys())) if metrics else ""
 
 
 def parse_supervised_log(path):
@@ -55,7 +72,7 @@ def parse_supervised_log(path):
             if not metrics:
                 continue
             if metric_name is None:
-                metric_name = next(iter(metrics.keys()))
+                metric_name = _pick_metric(metrics)
             vals.append(metrics.get(metric_name, float("nan")))
     if not epochs:
         return None
