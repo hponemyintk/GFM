@@ -587,6 +587,7 @@ def train_pass(epoch, phase: str = "joint") -> float:
         ) = _pass_build_subgraph(scope_batch, selected_idx, seed_embeds)
 
         optimizer.zero_grad()
+        preencoded_tfs.retain_grad()
         x_set = model.module.forward_with_preencoded_tfs(
             neighbor_types,
             node_indices,
@@ -596,7 +597,6 @@ def train_pass(epoch, phase: str = "joint") -> float:
             edge_index=edge_index_dev,
             batch=batch_vec_dev,
         )
-        x_set.retain_grad()
         pred = model.module.head(x_set)
         pred = pred.view(-1) if pred.size(1) == 1 else pred
         task_loss = loss_fn(pred.float(), labels)
@@ -605,10 +605,10 @@ def train_pass(epoch, phase: str = "joint") -> float:
         sample_loss_val = 0.0
         if (
             phase != "warmup"
-            and x_set.grad is not None
+            and preencoded_tfs.grad is not None
             and pass_sampler.batch_dist is not None
         ):
-            chain_grad = x_set.grad.detach()  # [B, D] — already 2D after convs
+            chain_grad = preencoded_tfs.grad[:, 0, :].detach()  # [B, D] — gradient at seed position in tfs space
             sample_loss = pass_sampler.reinforce_loss(chain_grad)
             sample_loss.backward()
             sample_loss_val = sample_loss.detach().item()
