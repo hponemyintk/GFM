@@ -33,7 +33,7 @@ DATASET="${DATASET:-rel-f1}"
 TASK="${TASK:-driver-top3}"
 
 BATCH_SIZE=16
-NUM_NEIGHBORS=10
+NUM_NEIGHBORS="${NUM_NEIGHBORS:-10}"
 NUM_LAYERS=3
 CHANNELS=256
 MAX_STEPS_PER_EPOCH=500
@@ -47,14 +47,21 @@ SAMPLE_SCOPE=1024
 
 SEEDS=(0 1 2 3 4)
 # Each entry is "label|extra_args"; label becomes the phase-3 subdir name.
+# Sanity ablations added:
+#   uniform      : bypass sampler, random K from real scope (does sampler add value?)
+#   det_unfrozen : det selection + unfreeze base encoders (is distribution shift the bottleneck?)
+#   t1_unfrozen  : same for temp=1
 TEMP_MODES=(
     "det|"
     "t1|--curate_stochastic --sample_temp 1.0"
     "t2|--curate_stochastic --sample_temp 2.0"
     "t5|--curate_stochastic --sample_temp 5.0"
+    "uniform|--curate_uniform"
+    "det_unfrozen|--unfreeze_encoders"
+    "t1_unfrozen|--unfreeze_encoders --curate_stochastic --sample_temp 1.0"
 )
 
-SWEEP_ROOT="results/full-sweep-distilled-sampler-${DATASET}-${TASK}"
+SWEEP_ROOT="${SWEEP_ROOT:-results/full-sweep-distilled-sampler-${DATASET}-${TASK}}"
 mkdir -p "${SWEEP_ROOT}"
 
 # Curated-HDF5 path is shared across seeds AND temps (cache_dir-scoped, not

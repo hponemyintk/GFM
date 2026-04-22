@@ -102,6 +102,12 @@ parser.add_argument("--sampler_ckpt", type=str, default=None,
                     help="Path to phase-2 sampler checkpoint. Auto-derived from out_dir if None.")
 parser.add_argument("--curate_stochastic", action="store_true", default=False,
                     help="Use Gumbel-Top-K at curate time for the train split (ablation).")
+parser.add_argument("--curate_uniform", action="store_true", default=False,
+                    help="Sanity check: ignore sampler scores; select K uniformly at random "
+                         "from the real (non-pad) scope candidates. Gumbel-Top-K over zeros.")
+parser.add_argument("--unfreeze_encoders", action="store_true", default=False,
+                    help="Phase-3 ablation: do NOT freeze the base encoders (type/hop/time/"
+                         "tfs + their LNs + PE). Default is to freeze them as in warm-start.")
 
 args = parser.parse_args()
 
@@ -675,10 +681,16 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
             nh_enc = nh.clone()
             nh_enc[nh_enc == -1] = 3
 
-            # Lightweight path: only the frozen base encoders + LNs. O(S) memory.
-            base_concat = teacher.base_concat_forward(nt, nh_enc, ntm, gtf)  # [B, S, 4C]
-            q_imp = sampler(base_concat, nt)                    # [B, H, S]
-            score = sampler.reduce_heads(q_imp)                 # [B, S]
+            if args.curate_uniform:
+                # Sanity check: uniform random from real (non-pad) candidates.
+                # Skip sampler entirely; use zero scores so Gumbel-Top-K
+                # reduces to uniform top-K over the real pool (pads still -inf).
+                score = torch.zeros(nt.shape, device=device, dtype=torch.float32)
+            else:
+                # Lightweight path: only the frozen base encoders + LNs. O(S) memory.
+                base_concat = teacher.base_concat_forward(nt, nh_enc, ntm, gtf)  # [B, S, 4C]
+                q_imp = sampler(base_concat, nt)                    # [B, H, S]
+                score = sampler.reduce_heads(q_imp)                 # [B, S]
 
             # Mask pad slots to -inf so Gumbel top-K never prefers them over
             # real neighbors. Slots that are still picked (because n_real<K-1)
@@ -796,7 +808,11 @@ def mode_joint():
 
             for s in missing:
                 # Stochastic only for train split if flag is set; val/test always deterministic.
-                stoch = args.curate_stochastic and (s == "train")
+                # Force stochastic for uniform sanity mode on all splits:
+                # otherwise top-K over zero scores would be an arbitrary
+                # deterministic pick. For the normal sampler path, keep val/
+                # test deterministic and only randomize train.
+                stoch = args.curate_uniform or (args.curate_stochastic and s == "train")
                 os.makedirs(os.path.dirname(curated_paths[s]), exist_ok=True)
                 _curate_one_split(teacher, sampler_m, scope_sets[s], curated_paths[s], stoch, s)
             del teacher, sampler_m
@@ -816,15 +832,21 @@ def mode_joint():
     # Load phase-1 weights.
     model.load_state_dict(torch.load(default_teacher_ckpt(), map_location=device))
 
-    frozen_modules = [
-        model.type_encoder, model.hop_encoder, model.time_encoder, model.tfs_encoder,
-        model.layer_norm_type, model.layer_norm_hop, model.layer_norm_time, model.layer_norm_tfs,
-        model.pe_encoder, model.layer_norm_pe,
-    ]
-    for m in frozen_modules:
-        for p in m.parameters():
-            p.requires_grad_(False)
-        m.eval()
+    if args.unfreeze_encoders:
+        # Ablation: let base encoders adapt to the curated distribution.
+        frozen_modules = []
+        if local_rank == 0:
+            print("[joint] --unfreeze_encoders: base encoders are trainable.")
+    else:
+        frozen_modules = [
+            model.type_encoder, model.hop_encoder, model.time_encoder, model.tfs_encoder,
+            model.layer_norm_type, model.layer_norm_hop, model.layer_norm_time, model.layer_norm_tfs,
+            model.pe_encoder, model.layer_norm_pe,
+        ]
+        for m in frozen_modules:
+            for p in m.parameters():
+                p.requires_grad_(False)
+            m.eval()
 
     model_ddp = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
 
