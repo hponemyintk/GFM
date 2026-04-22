@@ -102,6 +102,10 @@ parser.add_argument("--sampler_only_epochs", type=int, default=0,
                          "Runs after --sampler_warmup_epochs.")
 parser.add_argument("--use_reinforce_baseline", action="store_true",
                     help="PASS: enable EMA baseline for REINFORCE sampler loss (variance reduction)")
+parser.add_argument("--pass_lr_mult", type=float, default=10.0,
+                    help="PASS: multiplier on base LR for sampler-exclusive params (Ws, as_, "
+                         "type_embeddings). Sampler gradients are weaker than task gradients, so a "
+                         "higher LR here helps the policy diverge from uniform within the training window.")
 
 args = parser.parse_args()
 
@@ -328,10 +332,16 @@ if args.sampler == "pass":
         use_reinforce_baseline=args.use_reinforce_baseline,
     ).to(device)
     # Use own_parameters() — NOT .parameters() — to avoid double-registering
-    # the shared tfs_encoder params (already in model.parameters()).
+    # the shared tfs_encoder params (already in model.parameters()). Sampler
+    # params get a higher LR (pass_lr_mult × base) since REINFORCE gradients
+    # are weaker than task gradients.
+    sampler_lr = base_lr * args.pass_lr_mult
     optimizer = torch.optim.Adam(
-        list(model.parameters()) + list(pass_sampler.own_parameters()),
-        lr=base_lr, weight_decay=args.weight_decay,
+        [
+            {"params": list(model.parameters()), "lr": base_lr},
+            {"params": list(pass_sampler.own_parameters()), "lr": sampler_lr},
+        ],
+        weight_decay=args.weight_decay,
     )
 else:
     optimizer = torch.optim.Adam(model.parameters(), lr=base_lr, weight_decay=args.weight_decay)
@@ -748,12 +758,26 @@ if args.train_stage == "finetune":
             train_metrics = task.evaluate(train_pred, task.get_table("train"))
             train_ap = train_metrics.get("average_precision", float("nan"))
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Train AP: {train_ap:.4f}, Val metrics: {val_metrics}")
-            wandb.log({
+            epoch_log = {
                 "epoch": epoch,
                 "epoch_train_loss": train_loss,
                 "train_average_precision": train_ap,
                 **{f"val_{k}": v for k, v in val_metrics.items()}
-            })
+            }
+            if pass_sampler is not None:
+                with torch.no_grad():
+                    as_soft = F.softmax(pass_sampler.as_, dim=0).cpu().tolist()
+                    epoch_log["sampler/as_importance"] = as_soft[0]
+                    epoch_log["sampler/as_uniform"] = as_soft[1]
+                    epoch_log["sampler/Ws_norm"] = pass_sampler.Ws.norm().item()
+                    epoch_log["sampler/type_emb_norm"] = (
+                        pass_sampler.type_embeddings.weight.norm().item()
+                    )
+                print(
+                    f"  [sampler] as_softmax=[{as_soft[0]:.4f}, {as_soft[1]:.4f}] "
+                    f"Ws_norm={epoch_log['sampler/Ws_norm']:.4f}"
+                )
+            wandb.log(epoch_log)
 
             if (higher_is_better and val_metrics[tune_metric] >= best_val_metric) or (
                 not higher_is_better and val_metrics[tune_metric] <= best_val_metric

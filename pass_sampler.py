@@ -43,7 +43,8 @@ class PASSHeteroSampler(nn.Module):
         self.type_embeddings = nn.Embedding(num_types, embed_dim)
 
         # Paper Eq. 4 — single projection matrix Ws.
-        self.Ws = nn.Parameter(torch.zeros(embed_dim, hidden_dim))
+        self.Ws = nn.Parameter(torch.empty(embed_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.Ws, gain=1.414)
 
         # Paper Eq. 6 — learnable 2-element attention over {importance, uniform}.
         self.as_ = nn.Parameter(torch.tensor([0.5, 0.5]))
@@ -218,21 +219,9 @@ class PASSHeteroSampler(nn.Module):
 
         num_select = K - 1
 
-        # multinomial without replacement where possible; fall back to with-
-        # replacement for any row that does not have num_select valid
-        # candidates.
-        safe_rows = scope_counts >= num_select
-        if safe_rows.all():
-            selected = torch.multinomial(probs, num_select, replacement=False)
-        else:
-            selected = torch.multinomial(probs, num_select, replacement=True)
-            if safe_rows.any():
-                safe_selected = torch.multinomial(
-                    probs[safe_rows], num_select, replacement=False
-                )
-                selected[safe_rows] = safe_selected
-
-        selected = selected.long()
+        # Sample with replacement to match Categorical.log_prob's i.i.d.
+        # assumption — LinkedIn's PASS uses policy.sample_n (with replacement).
+        selected = torch.multinomial(probs, num_select, replacement=True).long()
 
         self.batch_selected = selected
         self.batch_dist = dist
