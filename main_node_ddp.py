@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import os
+import random
 from pathlib import Path
 from typing import Dict, List
 
@@ -615,7 +616,12 @@ def mode_distill():
 # 10. Mode: joint = 3a curate + 3b retrain
 ############################
 def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: bool, split: str):
-    """Rank-0-only. Produces a phase-3 HDF5 in RelGTTokens format."""
+    """Rank-0-only. Produces a phase-3 HDF5 in RelGTTokens format.
+
+    Selection: Gumbel top-K over real 1-2 hop neighbors only (pad slots are
+    masked). If a seed has fewer than K-1 real neighbors, pad-slot picks are
+    post-processed by drawing random global fallback nodes (hop=3) to fill.
+    """
     N = len(scope_dataset)
     K = args.num_neighbors
 
@@ -624,6 +630,17 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
     hops_out    = np.zeros((N, K), dtype=np.int8)
     times_out   = np.zeros((N, K), dtype=np.float32)
     edges_out   : List[np.ndarray] = [None] * N
+
+    # Ensure GLOBAL_ALL_NODES is populated for fallback when n_real < K-1.
+    if _utils.GLOBAL_ALL_NODES is None:
+        all_nodes = []
+        for nt_ in raw_data.node_types:
+            n_nodes = raw_data[nt_]['x'].size(0) if 'x' in raw_data[nt_] else raw_data[nt_].num_nodes
+            for i in range(n_nodes):
+                all_nodes.append((nt_, i))
+        _utils.GLOBAL_ALL_NODES = all_nodes
+    global_all = _utils.GLOBAL_ALL_NODES
+    nt_to_idx = scope_dataset.node_type_to_index
 
     loader = DataLoader(
         scope_dataset,
@@ -651,11 +668,24 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
                 'flat_nbr_idx':    batch['flat_nbr_idx'],
             }
 
-            # Lightweight path: only the frozen base encoders + LNs. O(S) memory,
-            # not O(S^2) — avoids running the transformer over scope=3000 tokens.
-            base_concat = teacher.base_concat_forward(nt, nh, ntm, gtf)     # [B, S, 4C]
+            # Clamp pad hops (-1) to 3 so the hop embedding lookup is in range.
+            # Pads are masked out of scoring below, so their encoded values are
+            # only used for the seed's own base_concat path (wasted compute but
+            # correct).
+            nh_enc = nh.clone()
+            nh_enc[nh_enc == -1] = 3
+
+            # Lightweight path: only the frozen base encoders + LNs. O(S) memory.
+            base_concat = teacher.base_concat_forward(nt, nh_enc, ntm, gtf)  # [B, S, 4C]
             q_imp = sampler(base_concat, nt)                    # [B, H, S]
-            score = sampler.reduce_heads(q_imp)                 # [B, S] — signal-weighted mean
+            score = sampler.reduce_heads(q_imp)                 # [B, S]
+
+            # Mask pad slots to -inf so Gumbel top-K never prefers them over
+            # real neighbors. Slots that are still picked (because n_real<K-1)
+            # are detected post-hoc via hops[...]==-1 and replaced with global
+            # fallback.
+            pad_mask = (nh == -1)
+            score = score.masked_fill(pad_mask, float("-inf"))
 
             sel = gumbel_top_k(score, k=K - 1, temperature=args.sample_temp,
                                stochastic=stochastic)            # [B, K-1] in [1, S)
@@ -675,6 +705,35 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
                 indices_out[g] = nidx_cpu[b, picks]
                 hops_out[g]    = nh_cpu[b, picks]
                 times_out[g]   = ntm_cpu[b, picks]
+
+                # Gumbel top-K landed on some pad slots iff n_real < K-1. Fill
+                # them to match relgt's _process_one_seed fallback:
+                #   0 < n_real < K-1: duplicate reals (random.choices with replacement)
+                #   n_real == 0:      random global fallback (hop=3)
+                pad_picked = hops_out[g] == -1
+                n_pads = int(pad_picked.sum())
+                if n_pads > 0:
+                    rng = random.Random(g * 1_000_003 + 7)
+                    pad_slots = np.where(pad_picked)[0]
+                    # Find the real 1-2 hop positions in this seed's scope pool.
+                    real_pos = np.where((nh_cpu[b, 1:] != -1))[0] + 1  # +1 past seed
+                    if len(real_pos) > 0:
+                        # Duplicate reals with replacement (matches relgt).
+                        src = rng.choices(real_pos.tolist(), k=n_pads)
+                        for slot, src_pos in zip(pad_slots, src):
+                            types_out[g, slot]   = nt_cpu[b, src_pos]
+                            indices_out[g, slot] = nidx_cpu[b, src_pos]
+                            hops_out[g, slot]    = nh_cpu[b, src_pos]
+                            times_out[g, slot]   = ntm_cpu[b, src_pos]
+                    else:
+                        # n_real == 0: only here use random global fallback.
+                        fb = rng.sample(global_all, n_pads)
+                        for slot, (ft, fi) in zip(pad_slots, fb):
+                            types_out[g, slot]   = nt_to_idx[ft]
+                            indices_out[g, slot] = fi
+                            hops_out[g, slot]    = 3
+                            times_out[g, slot]   = 0.0
+
                 eidx = build_edge_index_for_selection(
                     types_out[g], indices_out[g],
                     scope_dataset.index_to_node_type,

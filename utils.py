@@ -141,11 +141,18 @@ def gather_1_and_2_hop_with_seed_time(
 
 def _process_one_seed_scope(args):
     """Variant of _process_one_seed that collects a scope-sized candidate pool
-    WITHOUT building per-subgraph edge_index. The scope HDF5 stores only token
-    arrays (types/indices/hops/times); edge_index is rebuilt from GLOBAL_ADJ
-    at phase-3 curate time on the sampler-selected K nodes.
+    WITHOUT building per-subgraph edge_index.
+
+    The scope pool contains ONLY real 1-2 hop neighbors (up to scope-1). If
+    there are fewer than scope-1 real neighbors, remaining slots are filled
+    with PAD tokens (marked hop=-1, token values copied from the seed to keep
+    HDF5 lookups valid). This means the scope pool is pure local — the sampler
+    only scores real neighbors; pad slots get masked out at curate time.
+
+    If the curate step ends up with fewer than K-1 real neighbors, it falls
+    back to random global nodes at that point (not here).
     """
-    global GLOBAL_ADJ, GLOBAL_ALL_NODES
+    global GLOBAL_ADJ
 
     (data, scope, seed_node_type, seed_node_idx, seed_time, seed_val) = args
     random.seed(seed_val)
@@ -154,43 +161,22 @@ def _process_one_seed_scope(args):
         GLOBAL_ADJ, data, seed_node_type, seed_node_idx, seed_time
     )
     T_hat_list = list(T_hat)
-    size_th = len(T_hat_list)
-    scope_minus_1 = scope - 1
-
     one_hop_neighbors = [n for n in T_hat_list if n[2] == 1]
     two_hop_neighbors = [n for n in T_hat_list if n[2] == 2]
     combined_neighbors = one_hop_neighbors + two_hop_neighbors
+    size_th = len(combined_neighbors)
+    scope_minus_1 = scope - 1
 
     if size_th >= scope_minus_1:
         chosen_neighbors = random.sample(combined_neighbors, scope_minus_1)
-    elif 0 < size_th < scope_minus_1:
-        # Use all real neighbors then pad with fallback from GLOBAL_ALL_NODES.
-        chosen_neighbors = list(combined_neighbors)
-        pad_n = scope_minus_1 - len(chosen_neighbors)
-        if pad_n <= len(GLOBAL_ALL_NODES):
-            fallback = random.sample(GLOBAL_ALL_NODES, pad_n)
-        else:
-            fallback = random.choices(GLOBAL_ALL_NODES, k=pad_n)
-        for (ft, fi) in fallback:
-            if hasattr(data[ft], "time"):
-                ft_time = data[ft].time[fi].item()
-                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
-            else:
-                rel_time = 0
-            chosen_neighbors.append((ft, fi, 3, rel_time, None))
     else:
-        if scope_minus_1 <= len(GLOBAL_ALL_NODES):
-            fallback = random.sample(GLOBAL_ALL_NODES, scope_minus_1)
-        else:
-            fallback = random.choices(GLOBAL_ALL_NODES, k=scope_minus_1)
-        chosen_neighbors = []
-        for (ft, fi) in fallback:
-            if hasattr(data[ft], "time"):
-                ft_time = data[ft].time[fi].item()
-                rel_time = (seed_time - ft_time) / (60 * 60 * 24)
-            else:
-                rel_time = 0
-            chosen_neighbors.append((ft, fi, 3, rel_time, None))
+        # Use all real neighbors; pad remaining slots with PAD tokens.
+        # PAD: copy seed's (type, idx) to keep HDF5/tf lookups valid, hop=-1
+        # sentinel, time=0. Curate masks these out before Gumbel top-K.
+        chosen_neighbors = list(combined_neighbors)
+        pad_n = scope_minus_1 - size_th
+        pad_token = (seed_node_type, seed_node_idx, -1, 0.0, None)
+        chosen_neighbors.extend([pad_token] * pad_n)
 
     final_tokens = [(seed_node_type, seed_node_idx, 0, 0.0, 0)]
     # Randomize candidate order; seed stays at index 0.

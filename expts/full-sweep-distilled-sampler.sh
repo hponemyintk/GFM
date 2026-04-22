@@ -12,7 +12,7 @@
 #
 # Usage:
 #   bash expts/full-sweep-distilled-sampler.sh [GPU_ID]
-set -euo pipefail
+set -uo pipefail
 
 GPU_ID="${1:-0}"
 MASTER_PORT_BASE="${MASTER_PORT_BASE:-29320}"
@@ -33,7 +33,7 @@ DATASET="${DATASET:-rel-f1}"
 TASK="${TASK:-driver-top3}"
 
 BATCH_SIZE=16
-NUM_NEIGHBORS=128
+NUM_NEIGHBORS=10
 NUM_LAYERS=3
 CHANNELS=256
 MAX_STEPS_PER_EPOCH=500
@@ -45,7 +45,7 @@ DROPOUT=0.3
 
 SAMPLE_SCOPE=1024
 
-SEEDS=(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19)
+SEEDS=(0 1 2 3 4)
 # Each entry is "label|extra_args"; label becomes the phase-3 subdir name.
 TEMP_MODES=(
     "det|"
@@ -70,27 +70,41 @@ wipe_curated() {
 
 run_phase() {
     local out_dir="$1"; local log_name="$2"; local port="$3"; local seed="$4"
-    shift 4
+    local done_marker="$5"
+    shift 5
     local log_path="${out_dir}/${log_name}.log"
+
+    # Skip if already completed successfully.
+    if grep -q "${done_marker}" "${log_path}" 2>/dev/null; then
+        echo "=== [$(date '+%F %T')] SKIP seed=${seed} phase=${log_name} (already done) ==="
+        return 0
+    fi
+
     echo "=== [$(date '+%F %T')] seed=${seed} phase=${log_name} out=${out_dir} ==="
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
-    WANDB_MODE=offline \
-    WANDB_SILENT=true \
-    "${WRAP_CMD[@]}" torchrun \
-        --nproc_per_node=1 \
-        --master_port="${port}" \
-        main_node_ddp.py \
-        --dataset "${DATASET}" --task "${TASK}" --precompute \
-        --seed "${seed}" \
-        --batch_size "${BATCH_SIZE}" --num_neighbors "${NUM_NEIGHBORS}" \
-        --num_layers "${NUM_LAYERS}" --channels "${CHANNELS}" \
-        --gt_conv_type full --ablate none \
-        --max_steps_per_epoch "${MAX_STEPS_PER_EPOCH}" \
-        --num_workers "${NUM_WORKERS}" --epochs "${EPOCHS}" \
-        --lr "${LR}" --warmup_steps "${WARMUP}" \
-        --ff_dropout "${DROPOUT}" --attn_dropout "${DROPOUT}" \
-        --run_name "seed${seed}-${log_name}" --out_dir "${out_dir}" \
-        "$@" 2>&1 | tee "${log_path}"
+    local attempt max_attempts=3
+    for attempt in 1 2 3; do
+        CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+        WANDB_MODE=offline \
+        WANDB_SILENT=true \
+        "${WRAP_CMD[@]}" torchrun \
+            --nproc_per_node=1 \
+            --master_port="${port}" \
+            main_node_ddp.py \
+            --dataset "${DATASET}" --task "${TASK}" --precompute \
+            --seed "${seed}" \
+            --batch_size "${BATCH_SIZE}" --num_neighbors "${NUM_NEIGHBORS}" \
+            --num_layers "${NUM_LAYERS}" --channels "${CHANNELS}" \
+            --gt_conv_type full --ablate none \
+            --max_steps_per_epoch "${MAX_STEPS_PER_EPOCH}" \
+            --num_workers "${NUM_WORKERS}" --epochs "${EPOCHS}" \
+            --lr "${LR}" --warmup_steps "${WARMUP}" \
+            --ff_dropout "${DROPOUT}" --attn_dropout "${DROPOUT}" \
+            --run_name "seed${seed}-${log_name}" --out_dir "${out_dir}" \
+            "$@" 2>&1 | tee "${log_path}" && return 0
+        echo "=== [$(date '+%F %T')] RETRY ${attempt}/${max_attempts} seed=${seed} phase=${log_name} ==="
+    done
+    echo "=== [$(date '+%F %T')] FAILED after ${max_attempts} attempts: seed=${seed} phase=${log_name} ==="
+    return 1
 }
 
 for i in "${!SEEDS[@]}"; do
@@ -100,20 +114,25 @@ for i in "${!SEEDS[@]}"; do
     mkdir -p "${SEED_DIR}"
 
     # --- Phase 1: teacher (once per seed) ---
-    run_phase "${SEED_DIR}" "teacher" "${PORT}" "${SEED}" --run_mode teacher
+    run_phase "${SEED_DIR}" "teacher" "${PORT}" "${SEED}" "Best Test metrics" --run_mode teacher
 
     # --- Phase 2: distill (once per seed) ---
-    run_phase "${SEED_DIR}" "distill" "${PORT}" "${SEED}" --run_mode distill
+    run_phase "${SEED_DIR}" "distill" "${PORT}" "${SEED}" "ridge head_weights" --run_mode distill
 
-    # Dump (teacher_logits, q_imp) on one val batch.
-    echo "--- seed=${SEED} dumping sampler diagnostic NPZ ---"
-    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
-    "${WRAP_CMD[@]}" python dump_sampler_diagnostic.py \
-        --dataset "${DATASET}" --task "${TASK}" --out_dir "${SEED_DIR}" \
-        --num_neighbors "${NUM_NEIGHBORS}" --num_layers "${NUM_LAYERS}" \
-        --channels "${CHANNELS}" --ff_dropout "${DROPOUT}" --attn_dropout "${DROPOUT}" \
-        --gt_conv_type full --ablate none \
-        --batch_size "${BATCH_SIZE}" --seed "${SEED}" --split val
+    # Dump (teacher_logits, q_imp) on one val batch (skip if NPZ already exists).
+    NPZ_PATH="${SEED_DIR}/${DATASET}/${TASK}/distill_diagnostic.npz"
+    if [[ -f "${NPZ_PATH}" ]]; then
+        echo "--- seed=${SEED} diagnostic NPZ already exists, skipping ---"
+    else
+        echo "--- seed=${SEED} dumping sampler diagnostic NPZ ---"
+        CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+        "${WRAP_CMD[@]}" python dump_sampler_diagnostic.py \
+            --dataset "${DATASET}" --task "${TASK}" --out_dir "${SEED_DIR}" \
+            --num_neighbors "${NUM_NEIGHBORS}" --num_layers "${NUM_LAYERS}" \
+            --channels "${CHANNELS}" --ff_dropout "${DROPOUT}" --attn_dropout "${DROPOUT}" \
+            --gt_conv_type full --ablate none \
+            --batch_size "${BATCH_SIZE}" --seed "${SEED}" --split val
+    fi
 
     # Checkpoints are nested under {out_dir}/{dataset}/{task}/
     SEED_CKPT_DIR="${SEED_DIR}/${DATASET}/${TASK}"
@@ -129,7 +148,7 @@ for i in "${!SEEDS[@]}"; do
         wipe_curated
 
         # shellcheck disable=SC2086
-        run_phase "${TM_DIR}" "joint" "${PORT}" "${SEED}" \
+        run_phase "${TM_DIR}" "joint" "${PORT}" "${SEED}" "Best Test metrics" \
             --run_mode joint --sample_scope "${SAMPLE_SCOPE}" \
             --teacher_ckpt "${SEED_CKPT_DIR}/phase1.pt" \
             --sampler_ckpt "${SEED_CKPT_DIR}/sampler.pt" \
