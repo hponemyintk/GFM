@@ -175,12 +175,12 @@ class EncoderLayer(nn.Module):
         K = K.view(B, L, self.num_heads, head_dim).transpose(1, 2)
         V = V.view(B, L, self.num_heads, head_dim).transpose(1, 2)
 
-        # Distillation target: seed row's pre-softmax attention logits, mean over heads.
+        # Distillation target: seed row's pre-softmax attention logits, per head.
         seed_logits = None
         if extract_seed_logits:
             q_seed = Q[:, :, 0:1, :]                                # [B, H, 1, d_h]
             dots = torch.matmul(q_seed, K.transpose(-2, -1)) / math.sqrt(head_dim)
-            seed_logits = dots.squeeze(2).mean(dim=1)               # [B, L]
+            seed_logits = dots.squeeze(2)                           # [B, H, L]
 
         # PyTorch’s fast scaled dot-product attention (flash attention).
         attn_output = F.scaled_dot_product_attention(

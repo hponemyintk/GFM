@@ -484,8 +484,10 @@ def mode_distill():
     sampler = DistillSampler(
         embed_dim=4 * args.channels,
         hidden_dim=args.channels,
+        num_node_types=len(data["train"].node_types),
+        num_heads=args.num_heads,
     ).to(device)
-    sampler_ddp = DDP(sampler, device_ids=[local_rank])
+    sampler_ddp = DDP(sampler, device_ids=[local_rank], find_unused_parameters=True)
 
     optimizer = torch.optim.Adam(sampler_ddp.parameters(), lr=base_lr, weight_decay=args.weight_decay)
 
@@ -514,10 +516,10 @@ def mode_distill():
                     edge_index=b["edge_index"], batch=b["batch_vec"],
                     extract_seed_logits=True, return_base_concat=True,
                 )
-            teacher_logits = extras["seed_logits"]          # [B, K]
+            teacher_logits = extras["seed_logits"]          # [B, H, K]
             base_concat    = extras["base_concat"]          # [B, K, 4*C]
 
-            q_imp = sampler_ddp(base_concat)
+            q_imp = sampler_ddp(base_concat, b["neighbor_types"])
             loss = DistillSampler.distillation_loss(q_imp, teacher_logits)
 
             optimizer.zero_grad()
@@ -547,7 +549,7 @@ def mode_distill():
                     edge_index=b["edge_index"], batch=b["batch_vec"],
                     extract_seed_logits=True, return_base_concat=True,
                 )
-                q_imp = sampler_ddp(extras["base_concat"])
+                q_imp = sampler_ddp(extras["base_concat"], b["neighbor_types"])
                 vl = DistillSampler.distillation_loss(q_imp, extras["seed_logits"]).item()
                 val_loss_sum += vl * extras["base_concat"].size(0)
                 val_count += extras["base_concat"].size(0)
@@ -609,9 +611,10 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
             # Lightweight path: only the frozen base encoders + LNs. O(S) memory,
             # not O(S^2) — avoids running the transformer over scope=3000 tokens.
             base_concat = teacher.base_concat_forward(nt, nh, ntm, gtf)     # [B, S, 4C]
-            q_imp = sampler(base_concat)                        # [B, S]
+            q_imp = sampler(base_concat, nt)                    # [B, H, S]
+            score = q_imp.mean(dim=1)                           # [B, S] — reduce heads
 
-            sel = gumbel_top_k(q_imp, k=K - 1, temperature=args.sample_temp,
+            sel = gumbel_top_k(score, k=K - 1, temperature=args.sample_temp,
                                stochastic=stochastic)            # [B, K-1] in [1, S)
 
             nt_cpu   = batch["neighbor_types"].numpy()
@@ -678,7 +681,12 @@ def mode_joint():
                 p.requires_grad_(False)
             teacher.eval()
 
-            sampler_m = DistillSampler(embed_dim=4 * args.channels, hidden_dim=args.channels).to(device)
+            sampler_m = DistillSampler(
+                embed_dim=4 * args.channels,
+                hidden_dim=args.channels,
+                num_node_types=len(raw_data.node_types),
+                num_heads=args.num_heads,
+            ).to(device)
             sampler_m.load_state_dict(torch.load(default_sampler_ckpt(), map_location=device))
             for p in sampler_m.parameters():
                 p.requires_grad_(False)

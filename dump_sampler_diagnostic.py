@@ -139,7 +139,12 @@ def main():
     for p in model.parameters():
         p.requires_grad_(False)
 
-    sampler = DistillSampler(embed_dim=4 * args.channels, hidden_dim=args.channels).to(device)
+    sampler = DistillSampler(
+        embed_dim=4 * args.channels,
+        hidden_dim=args.channels,
+        num_node_types=len(ds.node_types),
+        num_heads=args.num_heads,
+    ).to(device)
     sampler.load_state_dict(torch.load(sampler_ckpt, map_location=device))
     sampler.eval()
 
@@ -163,7 +168,7 @@ def main():
         )
         teacher_logits = extras["seed_logits"].cpu().numpy()
         base_concat = extras["base_concat"]
-        q_imp = sampler(base_concat).cpu().numpy()
+        q_imp = sampler(base_concat, batch["neighbor_types"]).cpu().numpy()
 
     out_path = os.path.join(ckpt_dir, "distill_diagnostic.npz")
     np.savez(out_path, teacher_logits=teacher_logits, q_imp=q_imp)

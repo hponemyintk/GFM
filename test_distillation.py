@@ -32,14 +32,14 @@ def test_manual_dots_match_reference():
     x = torch.randn(B, L, D)
 
     _, seed_logits = layer(x, extract_seed_logits=True)
-    assert seed_logits.shape == (B, L)
+    assert seed_logits.shape == (B, H, L)
 
     # Reference: recompute Q/K from the same normed x and take row-0.
     x_norm = layer.self_attention_norm(x)
     Q = layer.q_proj(x_norm).view(B, L, H, d_h).transpose(1, 2)  # [B, H, L, d_h]
     K = layer.k_proj(x_norm).view(B, L, H, d_h).transpose(1, 2)
     dots = torch.matmul(Q[:, :, 0:1, :], K.transpose(-2, -1)) / math.sqrt(d_h)
-    ref = dots.squeeze(2).mean(dim=1)  # [B, L]
+    ref = dots.squeeze(2)  # [B, H, L]
 
     torch.testing.assert_close(seed_logits, ref, atol=1e-5, rtol=1e-5)
 
@@ -47,13 +47,13 @@ def test_manual_dots_match_reference():
 def test_local_module_extracts_from_last_layer():
     """Multi-layer LocalModule should return seed_logits from the LAST enc_layer."""
     torch.manual_seed(1)
-    B, L, D = 2, 5, 16
-    lm = LocalModule(seq_len=L, input_dim=D, n_layers=3, num_heads=4,
+    B, L, D, H = 2, 5, 16, 4
+    lm = LocalModule(seq_len=L, input_dim=D, n_layers=3, num_heads=H,
                      hidden_dim=D, dropout_rate=0.0, attention_dropout_rate=0.0).eval()
     x = torch.randn(B, L, D)
     _, seed_logits = lm(x, extract_seed_logits=True)
     assert seed_logits is not None
-    assert seed_logits.shape == (B, L)
+    assert seed_logits.shape == (B, H, L)
 
     # Without the flag: seed_logits is None.
     _, seed_logits_off = lm(x, extract_seed_logits=False)
@@ -63,25 +63,29 @@ def test_local_module_extracts_from_last_layer():
 def test_distill_sampler_shapes_and_loss_decreases():
     """Train the sampler on synthetic teacher targets; loss should decrease."""
     torch.manual_seed(2)
-    B, K, D_in, D_h = 8, 12, 20, 16
-    sampler = DistillSampler(embed_dim=D_in, hidden_dim=D_h)
+    B, K, D_in, D_h, T, H = 8, 12, 20, 16, 3, 4
+    d_head = D_h // H
+    sampler = DistillSampler(embed_dim=D_in, hidden_dim=D_h,
+                             num_node_types=T, num_heads=H)
     base = torch.randn(B, K, D_in)
+    types = torch.randint(0, T, (B, K))
 
-    # Synthetic teacher: seed-dot-candidate in a random projection space.
+    # Synthetic per-head teacher: random per-head projection, seed-dot-candidate
+    # with 1/sqrt(d_head) scaling (matches the sampler's geometry).
     with torch.no_grad():
-        proj = torch.randn(D_in, D_h)
-        p = base @ proj
-        teacher_logits = torch.bmm(p[:, 0:1, :], p.transpose(1, 2)).squeeze(1)
+        proj_h = torch.randn(H, D_in, d_head)
+        p = torch.einsum("bke,hed->bhkd", base, proj_h)         # [B, H, K, d_head]
+        teacher_logits = torch.einsum("bhd,bhkd->bhk", p[:, :, 0, :], p) / math.sqrt(d_head)
 
     opt = torch.optim.Adam(sampler.parameters(), lr=0.05)
-    initial_loss = DistillSampler.distillation_loss(sampler(base), teacher_logits).item()
+    initial_loss = DistillSampler.distillation_loss(sampler(base, types), teacher_logits).item()
     for _ in range(300):
-        q_imp = sampler(base)
+        q_imp = sampler(base, types)
         loss = DistillSampler.distillation_loss(q_imp, teacher_logits)
         opt.zero_grad(); loss.backward(); opt.step()
     final_loss = loss.item()
     assert final_loss < 0.3 * initial_loss, (initial_loss, final_loss)
-    assert q_imp.shape == (B, K)
+    assert q_imp.shape == (B, H, K)
 
 
 def test_gumbel_top_k_shape_and_no_replacement():
