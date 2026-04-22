@@ -129,13 +129,18 @@ class PASSHeteroSampler(nn.Module):
             encoded_flat[positions] = out
 
         encoded = encoded_flat.reshape(*original_shape, self.embed_dim)
-        encoded = encoded + self.type_embeddings(types_tensor.to(device).long())
+        # No additive type embedding — the sampler's sim_mlp receives type info
+        # as an explicit concatenated feature (tau_src/tau_dst) inside forward,
+        # and the main model has its own type_encoder on a parallel stream.
+        # Returning pure tfs_encoder output keeps content and type cleanly
+        # separated across both consumers.
         return encoded
 
     def encode_candidates(self, scope_batch, hetero_data, device):
-        """Encode the (B, S) candidate pool through tfs_encoder + type_emb.
+        """Encode the (B, S) candidate pool through tfs_encoder.
 
-        Returns tensor of shape [B, S, embed_dim].
+        Returns tensor of shape [B, S, embed_dim]. Type info is NOT added
+        here — sim_mlp receives it as an explicit feature in forward().
         """
         scope_types = scope_batch["scope_types"].to(device).long()
         scope_indices = scope_batch["scope_indices"].to(device).long()
