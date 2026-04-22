@@ -103,7 +103,7 @@ parser.add_argument("--sampler_only_epochs", type=int, default=0,
 parser.add_argument("--use_reinforce_baseline", action="store_true",
                     help="PASS: enable EMA baseline for REINFORCE sampler loss (variance reduction)")
 parser.add_argument("--pass_lr_mult", type=float, default=10.0,
-                    help="PASS: multiplier on base LR for sampler-exclusive params (Ws, as_, "
+                    help="PASS: multiplier on base LR for sampler-exclusive params (sim_mlp, as_, "
                          "type_embeddings). Sampler gradients are weaker than task gradients, so a "
                          "higher LR here helps the policy diverge from uniform within the training window.")
 

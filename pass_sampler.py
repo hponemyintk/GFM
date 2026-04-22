@@ -6,14 +6,25 @@ Implements the Performance-Adaptive Sampling Strategy (PASS) from:
   Neural Networks" (Yoon et al., KDD 2021, LinkedIn).
 
 Paper formulas (Equations 4-7):
-    q_imp(j|i)  = (Ws h_i) . (Ws h_j)
+    q_imp(j|i)  = (Ws h_i) . (Ws h_j)          # (homogeneous; see below)
     q_rand(j|i) = 1 / N(i)
     q_tilde     = as[0] * q_imp + as[1] * q_rand
     q(j|i)      = q_tilde / sum_k q_tilde
 
-The sampler is adapted for heterogeneous graphs by reusing RelGT's per-type
-TorchFrame encoders (shared reference, not a copy) and adding a learnable
-per-type embedding to capture cross-type interactions.
+Heterogeneous adaptation (C1): because each node type has an independently
+parameterized tfs_encoder, per-type features (h_drivers vs h_races etc.) live
+on unrelated learned manifolds and a single shared bilinear Ws cannot align
+them. We replace the bilinear form with a shared MLP that receives type
+information as explicit concatenated features:
+
+    q_imp(j|i) = sim_mlp(cat[h_i, h_j, tau_type(i), tau_type(j)])
+
+where tau_type is a learnable per-type embedding. The MLP is shared across
+all type pairs; type conditioning is routed via the tau inputs so the MLP
+generalizes across pairs while still expressing per-pair behavior.
+
+tfs_encoder is reused from RelGT by shared reference (not a copy); callers
+must register sampler params via `own_parameters()` to avoid double-counting.
 """
 
 import torch
@@ -101,8 +112,6 @@ class PASSHeteroSampler(nn.Module):
             flat_types.numel(), self.embed_dim, device=device
         )
 
-        inv_map = self.tfs_encoder.inv_node_type_map  # {idx -> type_str}
-
         for node_type_str, encoder in self.tfs_encoder.encoders.items():
             t_idx = self.tfs_encoder.node_type_map[node_type_str]
             mask = flat_types == t_idx
@@ -129,18 +138,27 @@ class PASSHeteroSampler(nn.Module):
             encoded_flat[positions] = out
 
         encoded = encoded_flat.reshape(*original_shape, self.embed_dim)
-        # No additive type embedding — the sampler's sim_mlp receives type info
-        # as an explicit concatenated feature (tau_src/tau_dst) inside forward,
-        # and the main model has its own type_encoder on a parallel stream.
-        # Returning pure tfs_encoder output keeps content and type cleanly
-        # separated across both consumers.
+        # Additive type_embeddings. Two roles:
+        #   1) Autograd plumbing (primary): preencoded_tfs is built from this
+        #      output downstream and must stay differentiable so retain_grad()
+        #      and task_loss.backward() can capture chain_grad for REINFORCE.
+        #      During sampler_only phase the task model (incl. tfs_encoder) is
+        #      frozen, so without a trainable term here, preencoded_tfs would
+        #      have requires_grad=False and the whole REINFORCE pipeline breaks.
+        #   2) Architectural (secondary): supplies a type marker in the
+        #      h-stream. This is redundant with the sim_mlp's explicit
+        #      tau_src/tau_dst inputs in forward(), but the MLP handles the
+        #      redundancy fine (can subtract the additive component if needed).
+        encoded = encoded + self.type_embeddings(types_tensor.to(device).long())
         return encoded
 
     def encode_candidates(self, scope_batch, hetero_data, device):
-        """Encode the (B, S) candidate pool through tfs_encoder.
+        """Encode the (B, S) candidate pool through tfs_encoder + type_emb.
 
-        Returns tensor of shape [B, S, embed_dim]. Type info is NOT added
-        here — sim_mlp receives it as an explicit feature in forward().
+        Returns tensor of shape [B, S, embed_dim]. See _encode_by_type for
+        why the additive type embedding is retained despite sim_mlp also
+        consuming type info explicitly (primary role: autograd-graph
+        connectivity during sampler_only phase).
         """
         scope_types = scope_batch["scope_types"].to(device).long()
         scope_indices = scope_batch["scope_indices"].to(device).long()
@@ -196,18 +214,24 @@ class PASSHeteroSampler(nn.Module):
         else:
             self.fallback_mask = None
 
-        # C1: q_imp = sim_mlp(cat[h_i, h_j, tau_i, tau_j]). Per Theorem 4.1,
-        # h_i/h_j/tau_i/tau_j are treated as constants for the REINFORCE
-        # estimator — gradient flows only to sim_mlp's own weights.
-        tau_src = self.type_embeddings(seed_type.to(device).long())  # [B, D]
-        tau_src = tau_src.unsqueeze(1).expand(B, S, D)                # [B, S, D]
+        # C1: q_imp = sim_mlp(cat[h_i, h_j, tau_i, tau_j]).
+        #
+        # Theorem 4.1 applies only to the FEATURES (h_i, h_j) — they are
+        # treated as constants so REINFORCE gradient doesn't flow back into
+        # tfs_encoder via this path. The TYPE EMBEDDINGS (tau) are policy
+        # parameters (analogous to Ws in the paper) and must stay
+        # differentiable so REINFORCE updates them through sim_mlp.
+        tau_src = self.type_embeddings(seed_type.to(device).long())    # [B, D]
+        tau_src = tau_src.unsqueeze(1).expand(B, S, D)                 # [B, S, D]
         tau_dst = self.type_embeddings(scope_types.to(device).long())  # [B, S, D]
 
-        h_src = seed_embeds.unsqueeze(1).expand(B, S, D)              # [B, S, D]
-        h_dst = candidate_embeds                                      # [B, S, D]
+        h_src = seed_embeds.unsqueeze(1).expand(B, S, D)               # [B, S, D]
+        h_dst = candidate_embeds                                       # [B, S, D]
 
-        feats = torch.cat([h_src, h_dst, tau_src, tau_dst], dim=-1).detach()
-        q_imp = self.sim_mlp(feats).squeeze(-1)                       # [B, S]
+        feats = torch.cat(
+            [h_src.detach(), h_dst.detach(), tau_src, tau_dst], dim=-1
+        )
+        q_imp = self.sim_mlp(feats).squeeze(-1)                        # [B, S]
 
         scope_counts = scope_counts.to(device).long()
 
@@ -223,8 +247,9 @@ class PASSHeteroSampler(nn.Module):
         # LinkedIn (PASS-GNN/model.py:108-115): `relu(cat[att1,att2,att3] @
         # softmax(sample_a)) + eps`. Previous code softmaxed q_imp first,
         # which collapsed to a peaky distribution and compressed gradients
-        # once Ws learned any structure. Raw dot-product + ReLU + Categorical
-        # keeps concentration linear in score magnitude (not exponential).
+        # once the importance scorer learned any structure. Raw score + ReLU
+        # + Categorical keeps concentration linear in score magnitude (not
+        # exponential).
         as_w = F.softmax(self.as_, dim=0)
         q_tilde = as_w[0] * q_imp + as_w[1] * q_rand
         q_tilde = F.relu(q_tilde)
