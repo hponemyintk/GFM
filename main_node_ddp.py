@@ -499,25 +499,8 @@ def mode_distill():
         print(f"Sampler trainable params: {total_params}")
         wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
 
-    # --- Calibrate per-head signal weights from the first train batch ---
-    # Down-weights heads that collapsed to near-uniform attention during
-    # phase-1 training; avoids wasting sampler capacity fitting dead-head
-    # noise (observed on some seeds with two dead heads out of four).
-    with torch.no_grad():
-        calib_batch = move_batch(next(iter(loaders["train"])))
-        _, calib_extras = teacher(
-            calib_batch["neighbor_types"], calib_batch["node_indices"],
-            calib_batch["neighbor_hops"], calib_batch["neighbor_times"],
-            calib_batch["grouped_tf_dict"],
-            edge_index=calib_batch["edge_index"], batch=calib_batch["batch_vec"],
-            extract_seed_logits=True, return_base_concat=False,
-        )
-        # [B, H, K] -> per-head std over (B, candidates excluding self)
-        per_head_std = calib_extras["seed_logits"][:, :, 1:].std(dim=(0, 2))
-    sampler_ddp.module.set_head_weights(per_head_std)
-    if local_rank == 0:
-        print(f"[distill] per-head std: {per_head_std.tolist()}")
-        print(f"[distill] head_weights: {sampler_ddp.module.head_weights.tolist()}")
+    # Training uses uniform per-head MSE (head_weights defaults to ones);
+    # ridge weights for head reduction are fit once at the end of phase 2.
 
     global_step = 0
     best_val_loss = math.inf
@@ -585,6 +568,46 @@ def mode_distill():
                 best_val_loss = val_loss
                 torch.save(sampler_ddp.module.state_dict(), default_sampler_ckpt())
 
+    dist.barrier()
+
+    # --- Fit ridge head-weights: sampler's per-head output -> teacher's gold ---
+    # gold[b, k] = sum_h softmax(teacher_logits[b, h, :])[k]  (sum of per-head
+    # post-softmax attention — the quantity the teacher actually aggregates).
+    # Best linear reduction w of sampler's per-head logits to predict gold is
+    # w = (Q^T Q + λI)^{-1} Q^T y, with rows of Q stacking per-(seed, candidate)
+    # sampler head vectors. Inference reduction at phase-3 curate uses this w.
+    if local_rank == 0:
+        print("[distill] Fitting ridge head-weights (sampler→gold) on val...")
+        best_state = torch.load(default_sampler_ckpt(), map_location=device)
+        sampler_ddp.module.load_state_dict(best_state)
+        sampler_ddp.eval()
+
+        H = sampler_ddp.module.num_heads
+        Q_rows, G_rows = [], []
+        with torch.no_grad():
+            for batch in loaders["val"]:
+                b = move_batch(batch)
+                _, extras = teacher(
+                    b["neighbor_types"], b["node_indices"], b["neighbor_hops"],
+                    b["neighbor_times"], b["grouped_tf_dict"],
+                    edge_index=b["edge_index"], batch=b["batch_vec"],
+                    extract_seed_logits=True, return_base_concat=True,
+                )
+                q = sampler_ddp(extras["base_concat"], b["neighbor_types"])
+                tl = extras["seed_logits"]
+                # Drop self-entry, then stack rows: [B*(K-1), H]  and  [B*(K-1)].
+                q_nb = q[:, :, 1:].permute(0, 2, 1).reshape(-1, H)
+                g_nb = torch.softmax(tl, dim=-1).sum(dim=1)[:, 1:].reshape(-1)
+                Q_rows.append(q_nb.float())
+                G_rows.append(g_nb.float())
+        Q = torch.cat(Q_rows, dim=0)
+        G = torch.cat(G_rows, dim=0)
+        QtQ = Q.T @ Q
+        lam = 1e-3 * QtQ.diag().mean().clamp_min(1e-6)
+        w_star = torch.linalg.solve(QtQ + lam * torch.eye(H, device=Q.device), Q.T @ G)
+        sampler_ddp.module.head_weights.copy_(w_star.to(sampler_ddp.module.head_weights))
+        torch.save(sampler_ddp.module.state_dict(), default_sampler_ckpt())
+        print(f"[distill] ridge head_weights: {w_star.tolist()}")
     dist.barrier()
 
 
