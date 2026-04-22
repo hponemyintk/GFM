@@ -580,8 +580,11 @@ def train_pass(epoch, phase: str = "joint") -> float:
 
         scope_counts = scope_batch["scope_count"].to(device)
         scope_hops = scope_batch["scope_hops"].to(device)
+        seed_type = scope_batch["seed_type"].to(device)
+        scope_types = scope_batch["scope_types"].to(device)
         selected_idx, _ = pass_sampler(
             seed_embeds, candidate_embeds, scope_counts, args.num_neighbors,
+            seed_type=seed_type, scope_types=scope_types,
             scope_hops=scope_hops,
         )
 
@@ -668,8 +671,11 @@ def test_pass(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
 
         scope_counts = scope_batch["scope_count"].to(device)
         scope_hops_eval = scope_batch["scope_hops"].to(device)
+        seed_type_eval = scope_batch["seed_type"].to(device)
+        scope_types_eval = scope_batch["scope_types"].to(device)
         selected_idx, _ = pass_sampler(
             seed_embeds, candidate_embeds, scope_counts, args.num_neighbors,
+            seed_type=seed_type_eval, scope_types=scope_types_eval,
             scope_hops=scope_hops_eval,
         )
 
@@ -769,13 +775,16 @@ if args.train_stage == "finetune":
                     as_soft = F.softmax(pass_sampler.as_, dim=0).cpu().tolist()
                     epoch_log["sampler/as_importance"] = as_soft[0]
                     epoch_log["sampler/as_uniform"] = as_soft[1]
-                    epoch_log["sampler/Ws_norm"] = pass_sampler.Ws.norm().item()
+                    mlp_norm = sum(
+                        p.norm().item() ** 2 for p in pass_sampler.sim_mlp.parameters()
+                    ) ** 0.5
+                    epoch_log["sampler/sim_mlp_norm"] = mlp_norm
                     epoch_log["sampler/type_emb_norm"] = (
                         pass_sampler.type_embeddings.weight.norm().item()
                     )
                 print(
                     f"  [sampler] as_softmax=[{as_soft[0]:.4f}, {as_soft[1]:.4f}] "
-                    f"Ws_norm={epoch_log['sampler/Ws_norm']:.4f}"
+                    f"sim_mlp_norm={mlp_norm:.4f}"
                 )
             wandb.log(epoch_log)
 

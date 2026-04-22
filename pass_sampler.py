@@ -42,9 +42,16 @@ class PASSHeteroSampler(nn.Module):
 
         self.type_embeddings = nn.Embedding(num_types, embed_dim)
 
-        # Paper Eq. 4 — single projection matrix Ws.
-        self.Ws = nn.Parameter(torch.empty(embed_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.Ws, gain=1.414)
+        # C1 (heterogeneous): shared MLP similarity scorer replacing the bilinear
+        # Ws projection. Input: cat([h_i, h_j, tau_i, tau_j]) -> scalar score.
+        # Handles heterogeneous type mismatch by receiving the type embeddings
+        # as explicit conditioning features instead of relying on a single
+        # bilinear form to align incompatible per-type feature spaces.
+        self.sim_mlp = nn.Sequential(
+            nn.Linear(4 * embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
 
         # Paper Eq. 6 — learnable 2-element attention over {importance, uniform}.
         # Init biased toward the uniform head (post-softmax ≈ [0.478, 0.522]),
@@ -67,7 +74,11 @@ class PASSHeteroSampler(nn.Module):
         """Sampler-exclusive params. Excludes the shared tfs_encoder — callers
         must use this (not .parameters()) to avoid double-registration in the
         optimizer."""
-        return [self.Ws, self.as_, *self.type_embeddings.parameters()]
+        return [
+            self.as_,
+            *self.type_embeddings.parameters(),
+            *self.sim_mlp.parameters(),
+        ]
 
     def _encode_by_type(self, types_tensor, indices_tensor, hetero_data, device):
         """Shared helper for encode_candidates / encode_seeds.
@@ -137,7 +148,7 @@ class PASSHeteroSampler(nn.Module):
         return self._encode_by_type(seed_type, seed_index, hetero_data, device)
 
     def forward(self, seed_embeds, candidate_embeds, scope_counts, K,
-                scope_hops=None):
+                seed_type=None, scope_types=None, scope_hops=None):
         """Sample K-1 neighbors per seed using the PASS policy.
 
         Args:
@@ -145,6 +156,9 @@ class PASSHeteroSampler(nn.Module):
             candidate_embeds: [B, S, D]
             scope_counts: [B] — number of valid (non-padding) candidates per row
             K: total subgraph size including the seed token; we sample K-1.
+            seed_type: [B] long tensor of seed node-type indices (required).
+            scope_types: [B, S] long tensor of candidate node-type indices
+                (required).
             scope_hops: [B, S] optional — hop labels (1/2 = real, 3 = fallback).
                 Seeds whose entire scope is hop=3 use uniform sampling.
 
@@ -177,17 +191,18 @@ class PASSHeteroSampler(nn.Module):
         else:
             self.fallback_mask = None
 
-        # Detach implements Theorem 4.1 — h_i, h_j are treated as constants by
-        # the REINFORCE estimator. Gradients flow only to Ws, as_, and
-        # type_embeddings here.
-        source = seed_embeds.unsqueeze(1).expand(B, S, D).reshape(B * S, D)
-        target = candidate_embeds.reshape(B * S, D)
+        # C1: q_imp = sim_mlp(cat[h_i, h_j, tau_i, tau_j]). Per Theorem 4.1,
+        # h_i/h_j/tau_i/tau_j are treated as constants for the REINFORCE
+        # estimator — gradient flows only to sim_mlp's own weights.
+        tau_src = self.type_embeddings(seed_type.to(device).long())  # [B, D]
+        tau_src = tau_src.unsqueeze(1).expand(B, S, D)                # [B, S, D]
+        tau_dst = self.type_embeddings(scope_types.to(device).long())  # [B, S, D]
 
-        ss = torch.mm(source.detach(), self.Ws)
-        tt = torch.mm(target.detach(), self.Ws)
+        h_src = seed_embeds.unsqueeze(1).expand(B, S, D)              # [B, S, D]
+        h_dst = candidate_embeds                                      # [B, S, D]
 
-        q_imp = torch.bmm(ss.unsqueeze(1), tt.unsqueeze(2)).squeeze(-1).squeeze(-1)
-        q_imp = q_imp.reshape(B, S)
+        feats = torch.cat([h_src, h_dst, tau_src, tau_dst], dim=-1).detach()
+        q_imp = self.sim_mlp(feats).squeeze(-1)                       # [B, S]
 
         scope_counts = scope_counts.to(device).long()
 
