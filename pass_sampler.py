@@ -47,7 +47,10 @@ class PASSHeteroSampler(nn.Module):
         nn.init.xavier_uniform_(self.Ws, gain=1.414)
 
         # Paper Eq. 6 — learnable 2-element attention over {importance, uniform}.
-        self.as_ = nn.Parameter(torch.tensor([0.5, 0.5]))
+        # Init biased toward the uniform head (post-softmax ≈ [0.478, 0.522]),
+        # mirroring LinkedIn's sample_a = [10e-3, 10e-3, 10e-1] which gives
+        # post-softmax ≈ [0.324, 0.324, 0.353] — a mild random-head preference.
+        self.as_ = nn.Parameter(torch.tensor([0.01, 0.1]))
 
         # REINFORCE EMA baseline for variance reduction.
         self.use_reinforce_baseline = use_reinforce_baseline
@@ -191,25 +194,30 @@ class PASSHeteroSampler(nn.Module):
         arange_S = torch.arange(S, device=device).unsqueeze(0)
         pad_mask = arange_S >= scope_counts.unsqueeze(1)
 
-        # Row-wise softmax on q_imp so the importance distribution is proper
-        # (non-negative, sums to 1) without zero-eroding negative candidates.
-        q_imp_masked = q_imp.masked_fill(pad_mask, float("-inf"))
-        q_imp_soft = F.softmax(q_imp_masked, dim=1)
-        q_imp_soft = torch.nan_to_num(q_imp_soft, nan=0.0)  # all-pad rows
-
         # Uniform baseline over valid (non-pad) positions.
         valid = (~pad_mask).float()
         denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
         q_rand = valid / denom
 
+        # Mix raw q_imp with q_rand BEFORE non-negativity clamp — matches
+        # LinkedIn (PASS-GNN/model.py:108-115): `relu(cat[att1,att2,att3] @
+        # softmax(sample_a)) + eps`. Previous code softmaxed q_imp first,
+        # which collapsed to a peaky distribution and compressed gradients
+        # once Ws learned any structure. Raw dot-product + ReLU + Categorical
+        # keeps concentration linear in score magnitude (not exponential).
         as_w = F.softmax(self.as_, dim=0)
-        q_tilde = as_w[0] * q_imp_soft + as_w[1] * q_rand
+        q_tilde = as_w[0] * q_imp + as_w[1] * q_rand
+        q_tilde = F.relu(q_tilde)
 
-        # Force pure uniform for fallback seeds (no real neighbors).
+        # Force pure uniform for fallback seeds (no real neighbors). Use
+        # torch.where (not in-place index assignment) so the new F.relu
+        # above stays differentiable.
         if self.fallback_mask is not None and self.fallback_mask.any():
-            q_tilde[self.fallback_mask] = q_rand[self.fallback_mask]
+            q_tilde = torch.where(
+                self.fallback_mask.unsqueeze(1), q_rand, q_tilde
+            )
 
-        q_tilde = q_tilde.masked_fill(pad_mask, 0.0) + 1e-9
+        q_tilde = q_tilde + 1e-9  # floor to keep Categorical well-defined
         q_tilde = q_tilde.masked_fill(pad_mask, 0.0)
 
         row_sums = q_tilde.sum(dim=1, keepdim=True).clamp(min=1e-9)
