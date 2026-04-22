@@ -499,6 +499,26 @@ def mode_distill():
         print(f"Sampler trainable params: {total_params}")
         wandb.init(project="rel-gt-expts", name=args.run_name, config=vars(args))
 
+    # --- Calibrate per-head signal weights from the first train batch ---
+    # Down-weights heads that collapsed to near-uniform attention during
+    # phase-1 training; avoids wasting sampler capacity fitting dead-head
+    # noise (observed on some seeds with two dead heads out of four).
+    with torch.no_grad():
+        calib_batch = move_batch(next(iter(loaders["train"])))
+        _, calib_extras = teacher(
+            calib_batch["neighbor_types"], calib_batch["node_indices"],
+            calib_batch["neighbor_hops"], calib_batch["neighbor_times"],
+            calib_batch["grouped_tf_dict"],
+            edge_index=calib_batch["edge_index"], batch=calib_batch["batch_vec"],
+            extract_seed_logits=True, return_base_concat=False,
+        )
+        # [B, H, K] -> per-head std over (B, candidates excluding self)
+        per_head_std = calib_extras["seed_logits"][:, :, 1:].std(dim=(0, 2))
+    sampler_ddp.module.set_head_weights(per_head_std)
+    if local_rank == 0:
+        print(f"[distill] per-head std: {per_head_std.tolist()}")
+        print(f"[distill] head_weights: {sampler_ddp.module.head_weights.tolist()}")
+
     global_step = 0
     best_val_loss = math.inf
     for epoch in range(1, args.epochs + 1):
@@ -520,7 +540,7 @@ def mode_distill():
             base_concat    = extras["base_concat"]          # [B, K, 4*C]
 
             q_imp = sampler_ddp(base_concat, b["neighbor_types"])
-            loss = DistillSampler.distillation_loss(q_imp, teacher_logits)
+            loss = sampler_ddp.module.distillation_loss(q_imp, teacher_logits)
 
             optimizer.zero_grad()
             loss.backward()
@@ -550,7 +570,7 @@ def mode_distill():
                     extract_seed_logits=True, return_base_concat=True,
                 )
                 q_imp = sampler_ddp(extras["base_concat"], b["neighbor_types"])
-                vl = DistillSampler.distillation_loss(q_imp, extras["seed_logits"]).item()
+                vl = sampler_ddp.module.distillation_loss(q_imp, extras["seed_logits"]).item()
                 val_loss_sum += vl * extras["base_concat"].size(0)
                 val_count += extras["base_concat"].size(0)
         val_loss = val_loss_sum / max(val_count, 1)
@@ -612,7 +632,7 @@ def _curate_one_split(teacher, sampler, scope_dataset, out_path, stochastic: boo
             # not O(S^2) — avoids running the transformer over scope=3000 tokens.
             base_concat = teacher.base_concat_forward(nt, nh, ntm, gtf)     # [B, S, 4C]
             q_imp = sampler(base_concat, nt)                    # [B, H, S]
-            score = q_imp.mean(dim=1)                           # [B, S] — reduce heads
+            score = sampler.reduce_heads(q_imp)                 # [B, S] — signal-weighted mean
 
             sel = gumbel_top_k(score, k=K - 1, temperature=args.sample_temp,
                                stochastic=stochastic)            # [B, K-1] in [1, S)

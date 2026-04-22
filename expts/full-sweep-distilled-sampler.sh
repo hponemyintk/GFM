@@ -45,7 +45,7 @@ DROPOUT=0.3
 
 SAMPLE_SCOPE=1024
 
-SEEDS=(0 1 2)
+SEEDS=(0 1 2 3 4)
 # Each entry is "label|extra_args"; label becomes the phase-3 subdir name.
 TEMP_MODES=(
     "det|"

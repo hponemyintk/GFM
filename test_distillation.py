@@ -77,11 +77,14 @@ def test_distill_sampler_shapes_and_loss_decreases():
         p = torch.einsum("bke,hed->bhkd", base, proj_h)         # [B, H, K, d_head]
         teacher_logits = torch.einsum("bhd,bhkd->bhk", p[:, :, 0, :], p) / math.sqrt(d_head)
 
+    # Calibrate head weights from the synthetic teacher's per-head std.
+    sampler.set_head_weights(teacher_logits[:, :, 1:].std(dim=(0, 2)))
+
     opt = torch.optim.Adam(sampler.parameters(), lr=0.05)
-    initial_loss = DistillSampler.distillation_loss(sampler(base, types), teacher_logits).item()
+    initial_loss = sampler.distillation_loss(sampler(base, types), teacher_logits).item()
     for _ in range(300):
         q_imp = sampler(base, types)
-        loss = DistillSampler.distillation_loss(q_imp, teacher_logits)
+        loss = sampler.distillation_loss(q_imp, teacher_logits)
         opt.zero_grad(); loss.backward(); opt.step()
     final_loss = loss.item()
     assert final_loss < 0.3 * initial_loss, (initial_loss, final_loss)

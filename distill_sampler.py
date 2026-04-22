@@ -13,8 +13,14 @@ class DistillSampler(nn.Module):
     Per node-type projection `Ws[t]: embed_dim -> hidden_dim`, split into
     `num_heads` heads of `hidden_dim/num_heads`. Score is a per-head dot
     product with `1/sqrt(d_head)` scaling, matching the teacher's attention
-    convention. Returns `[B, H, K]` per-head logits; at inference, reduce
-    across heads (sum/mean) before Gumbel-Top-K.
+    convention. Returns `[B, H, K]` per-head logits.
+
+    Signal-weighted distillation: `head_weights[h] ∝ Var(teacher head h)`
+    downweights dead/collapsed heads during training MSE and in the curate-
+    time reduction, so the sampler's capacity and the top-K selection aren't
+    polluted by heads that converged to near-uniform attention. Weights are
+    set by `set_head_weights` after a calibration pass on the teacher; the
+    default is uniform (falls back to unweighted mean).
     """
 
     def __init__(self, embed_dim: int, hidden_dim: int, num_node_types: int, num_heads: int):
@@ -31,10 +37,23 @@ class DistillSampler(nn.Module):
             nn.Linear(embed_dim, hidden_dim, bias=False)
             for _ in range(num_node_types)
         ])
+        # Normalized to mean 1; uniform by default so loss is equivalent to
+        # unweighted MSE until set_head_weights() is called.
+        self.register_buffer("head_weights", torch.ones(num_heads))
 
     def reset_parameters(self):
         for w in self.Ws:
             nn.init.xavier_uniform_(w.weight)
+        self.head_weights.fill_(1.0)
+
+    def set_head_weights(self, per_head_std: Tensor):
+        """Set head weights from measured teacher per-head std (shape [H]).
+        Weights proportional to std² (variance), normalized to mean 1.
+        """
+        assert per_head_std.shape == (self.num_heads,)
+        var = per_head_std.detach().to(self.head_weights.dtype).pow(2)
+        w = var / var.mean().clamp_min(1e-8)
+        self.head_weights.copy_(w.to(self.head_weights.device))
 
     def forward(self, base_concat: Tensor, types: Tensor) -> Tensor:
         # base_concat: [B, K, embed_dim]. Seed at index 0, candidates at 1..K-1.
@@ -59,10 +78,19 @@ class DistillSampler(nn.Module):
         q_imp = torch.matmul(seed_t, cand_t).squeeze(2) / math.sqrt(self.head_dim)
         return q_imp                                                   # [B, H, K]
 
-    @staticmethod
-    def distillation_loss(q_imp: Tensor, teacher_logits: Tensor) -> Tensor:
-        # Drop self-entry at column 0 on both sides (across all heads).
-        return F.mse_loss(q_imp[:, :, 1:], teacher_logits[:, :, 1:])
+    def reduce_heads(self, q_imp: Tensor) -> Tensor:
+        """Signal-weighted mean across heads: `score_k = mean_h(w_h * q_h,k)`.
+        Input `[B, H, K]`, returns `[B, K]`.
+        """
+        w = self.head_weights.to(q_imp.dtype).view(1, -1, 1)
+        return (q_imp * w).mean(dim=1)
+
+    def distillation_loss(self, q_imp: Tensor, teacher_logits: Tensor) -> Tensor:
+        # Per-head MSE (drop self-entry col 0), weighted by self.head_weights.
+        err = (q_imp[:, :, 1:] - teacher_logits[:, :, 1:]).pow(2)        # [B, H, K-1]
+        per_head_mse = err.mean(dim=(0, 2))                              # [H]
+        w = self.head_weights.to(per_head_mse.dtype)
+        return (w * per_head_mse).mean()
 
 
 def gumbel_top_k(
@@ -75,8 +103,9 @@ def gumbel_top_k(
     """Select k candidate indices from q_imp's columns [1, K), excluding the seed.
 
     Input is `[B, K]` — a single scalar score per candidate. Callers with a
-    multi-head sampler should reduce `[B, H, K] -> [B, K]` (e.g. mean over
-    heads) before calling. Returns indices in [1, K) of shape [B, k].
+    multi-head sampler should reduce `[B, H, K] -> [B, K]` (e.g. via
+    `DistillSampler.reduce_heads`) before calling. Returns indices in
+    [1, K) of shape [B, k].
     """
     B, K = q_imp.shape
     candidates = q_imp[:, 1:]                                      # [B, K-1]
