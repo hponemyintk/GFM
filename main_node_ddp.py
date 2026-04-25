@@ -34,7 +34,17 @@ from relbench.tasks import get_task
 # within this project
 from model import RelGT
 from utils import GloveTextEmbedding
-from gfm_data import DatasetGraphCache, TaskTokens, collate_single_task
+from gfm_data import (
+    DatasetGraphCache,
+    DistributedMultiTaskSampler,
+    MultiTaskConcat,
+    TaskTokens,
+    collate_multi_task,
+    collate_single_task,
+)
+from gfm_data.task_tokens import TASK_TYPE_BINARY, TASK_TYPE_REGRESSION
+from heads.multi_task_head import MultiTaskRelGT
+from losses.multi_task_loss import MultiTaskLoss
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -109,8 +119,26 @@ parser.add_argument(
          "Combined with --tf_store_dir this bounds resident memory for "
          "laptop-scale runs on big datasets.",
 )
+# PR3 multi-task flags. When --tasks is provided, --dataset/--task are ignored.
+parser.add_argument(
+    "--tasks",
+    type=str,
+    default=None,
+    help="Comma-separated list of '<dataset>.<task>[:weight]' pairs, e.g. "
+         "'rel-f1.driver-position:1,rel-f1.driver-top3:1'. When set, the "
+         "single-task --dataset/--task path is replaced by multi-task "
+         "training over a MultiTaskConcat with DistributedMultiTaskSampler.",
+)
+parser.add_argument(
+    "--loss_balance",
+    type=str,
+    default="none",
+    help="Multi-task loss aggregation: 'none' (RT batch-mean, default), "
+         "'per_task_mean', 'fixed:w1,w2,...', or 'uncertainty'.",
+)
 
 args = parser.parse_args()
+MULTI_TASK = args.tasks is not None
 
 ############################
 # 2. Initialize DDP and set device
@@ -143,6 +171,16 @@ if torch.cuda.is_available():
 seed_everything(args.seed)
 
 gpu_handle = init_gpu_utilization(local_rank)
+
+# PR3 dispatch: if --tasks is set, run the multi-task pipeline and exit.
+# The single-task code below is unchanged (preserves dev-kyaw parity).
+if MULTI_TASK:
+    from train_multi_task import run as run_multi_task
+    if local_rank == 0:
+        args.run_name = f"multi_task-{args.run_name}"
+    run_multi_task(args, local_rank, device, gpu_handle)
+    dist.destroy_process_group()
+    import sys; sys.exit(0)
 
 ############################
 # 3. Load dataset, task, and prepare data

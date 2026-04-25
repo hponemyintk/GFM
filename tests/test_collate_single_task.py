@@ -80,6 +80,11 @@ class _StubTaskTokens:
             for li in range(4):
                 self.type_local_to_global[(ti, li)] = g
                 g += 1
+    def __len__(self):
+        return len(self.target)
+    def __getitem__(self, idx):
+        # Round-robin sample for multi-task dispatch tests.
+        return _make_sample(global_idx=idx, task_id=0)
     def get_global_index(self, type_idxs, local_idxs):
         return [self.type_local_to_global[(t, l)] for t, l in zip(type_idxs, local_idxs)]
 

@@ -123,6 +123,24 @@ class TaskTokens(Dataset):
         self.time = getattr(self.table_input, "time", None)
         self.transform = getattr(self.table_input, "transform", None)
 
+        # Regression target z-score stats (PR3). Fit only on the train split
+        # so val/test never leak. ``denormalize`` undoes ``normalize`` for
+        # metric computation. Binary targets are passed through unchanged.
+        self.target_mean: Optional[float] = None
+        self.target_std: Optional[float] = None
+        if (
+            self.task_type_id == TASK_TYPE_REGRESSION
+            and self.target is not None
+            and split == "train"
+        ):
+            t = self.target.float()
+            mu = float(t.mean().item())
+            sd = float(t.std(unbiased=False).item())
+            if sd < 1e-8:
+                sd = 1.0  # avoid div-by-zero on degenerate constant target
+            self.target_mean = mu
+            self.target_std = sd
+
         # Inherit type tables from the cache (kept on the dataset object so
         # main_node_ddp.py:228-230 still works without a cache reference).
         self.node_types: List[str] = list(cache.node_types)
@@ -179,6 +197,39 @@ class TaskTokens(Dataset):
 
     def get_global_index(self, type_idxs: List[int], local_idxs: List[int]) -> List[int]:
         return [self.type_local_to_global[(t, l)] for t, l in zip(type_idxs, local_idxs)]
+
+    # ------------------------------------------------- regression target ops
+    def adopt_target_stats(self, mean: Optional[float], std: Optional[float]):
+        """Copy z-score stats from a sibling split (train -> val/test).
+
+        Call once on the val and test ``TaskTokens`` instances after
+        constructing the train one, so all three splits use stats fitted
+        only on the train target distribution.
+        """
+        self.target_mean = mean
+        self.target_std = std
+
+    def normalize_target(self, y) -> Tensor:
+        """Apply z-score to a regression label (no-op for binary)."""
+        if (
+            self.task_type_id != TASK_TYPE_REGRESSION
+            or self.target_mean is None
+            or self.target_std is None
+        ):
+            return y
+        if not isinstance(y, Tensor):
+            y = torch.as_tensor(y, dtype=torch.float32)
+        return (y.float() - self.target_mean) / self.target_std
+
+    def denormalize_pred(self, p: Tensor) -> Tensor:
+        """Undo ``normalize_target`` on a model prediction (binary unchanged)."""
+        if (
+            self.task_type_id != TASK_TYPE_REGRESSION
+            or self.target_mean is None
+            or self.target_std is None
+        ):
+            return p
+        return p.float() * self.target_std + self.target_mean
 
     # --------------------------------------------------------- HDF5 cache
     def _construct_precomputed_path(self) -> str:
@@ -346,6 +397,8 @@ class TaskTokens(Dataset):
             sample = self._sample_from_hdf5(idx)
 
         label = self.target[idx] if self.target is not None else None
+        if label is not None:
+            label = self.normalize_target(label)
 
         sample["first_type"] = sample["types"][0].item()
         sample["first_index"] = sample["indices"][0].item()

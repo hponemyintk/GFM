@@ -1,10 +1,18 @@
-"""Single-task batch collation.
+"""Single-task and multi-task batch collation.
 
-A direct port of ``utils.RelGTTokens.collate`` (commit ``0359e08``) lifted
-into a free function so a future multi-task collate (PR3) can reuse the
-same per-row stacking + edge-offset logic.
+The single-task collate is a direct port of dev-kyaw's
+``RelGTTokens.collate`` lifted into a free function. The multi-task
+collate is a thin wrapper that picks the right child ``TaskTokens`` from
+a ``MultiTaskConcat`` based on the batch's task_id.
 
-PR1 adds two forward-compat keys to the batch dict:
+PR3 design choice: each batch is **single-task** (rows from one
+(dataset, task) only) -- see ``DistributedMultiTaskSampler`` rationale.
+Cross-task mixing happens at the *epoch* level via the task schedule,
+not within a single batch. This keeps grouped_tfs simple (one cache,
+one prefixed-type namespace) and avoids cross-rank shape mismatches in
+DDP.
+
+PR1 adds two forward-compat keys to the batch dict, populated per-row:
 
 * ``task_id`` -- ``int64[B]`` (constant within a single-task batch)
 * ``task_type_id`` -- ``int64[B]`` (constant within a single-task batch)
@@ -114,3 +122,30 @@ def collate_single_task(
         [s["task_type_id"] for s in samples], dtype=torch.long,
     )
     return out
+
+
+def collate_multi_task(concat, batch):
+    """Multi-task collate. Dispatches to the child TaskTokens that owns
+    the batch's rows.
+
+    Assumes all rows in ``batch`` come from the same task (enforced by
+    ``DistributedMultiTaskSampler``). On a mixed-task batch this asserts
+    so the bug surfaces early rather than producing a silently wrong
+    ``grouped_tfs``.
+
+    Parameters
+    ----------
+    concat : gfm_data.multi_task_dataset.MultiTaskConcat
+    batch  : List[Tuple[sample, label]]
+    """
+    if not batch:
+        raise ValueError("empty batch")
+    # All samples must share task_id (single-task-per-batch invariant).
+    task_id = batch[0][0]["task_id"]
+    if any(s["task_id"] != task_id for s, _ in batch):
+        seen = sorted({s["task_id"] for s, _ in batch})
+        raise ValueError(
+            f"collate_multi_task expects single-task batches; got task_ids={seen}"
+        )
+    dataset = concat.datasets[task_id]
+    return collate_single_task(dataset, batch)
