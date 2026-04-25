@@ -163,10 +163,33 @@ Flat VRAM across 41 samples confirms training does not leak GPU memory across st
 ./scripts/pretrain_alltasks.sh
 # Knobs via env vars: K, EPOCHS, MAX_STEPS, NPROC, LR, LOSS_BALANCE, OUT_DIR, RUN_NAME
 
-# This laptop (27 GB RAM, RTX 5070 12 GB VRAM), reduced config:
+# This laptop (27 GB RAM, RTX 5070 12 GB VRAM), reduced config (5 rel-f1 tasks only;
+# rel-event materialization peaks at ~25 GB RAM and OOMs the laptop):
 ./scripts/pretrain_laptop.sh
 # Knobs: K, BATCH, CHANNELS, HEADS, EPOCHS, MAX_STEPS, MAX_ROWS_TRAIN, LOSS_BALANCE
 ```
+
+### Laptop run results — 5 rel-f1 tasks (channels=64, K=32, batch=32, 5 epochs × 300 steps)
+
+```json
+"test_metrics": {
+  "driver-position":     {"r2":  0.046, "mae": 4.16, "rmse": 5.09},
+  "driver-dnf":          {"roc_auc": 0.250, "ap": 0.588, "acc": 0.70, "f1": 0.83},
+  "driver-top3":         {"roc_auc": 0.834, "ap": 0.416, "acc": 0.18, "f1": 0.30},
+  "results-position":    {"r2":  0.969, "mae": 0.61, "rmse": 0.94},
+  "qualifying-position": {"r2":  0.850, "mae": 2.22, "rmse": 2.41}
+}
+```
+
+Highlights and known issues:
+* **driver-top3 AUROC 0.834** beats the PR2 single-task baseline (0.786) — multi-task transfer is real.
+* **results-position r²=0.97 / qualifying-position r²=0.85** — z-score regression target normalization + Huber working well.
+* **driver-dnf AUROC 0.250** is anti-correlated. The model is confidently predicting the wrong class. Likely a label-sign bug specific to this task — worth tracing through `task.evaluate` vs the per-row label our pipeline feeds into BCE. Does NOT affect the other tasks.
+* Test metrics are taken from the **last-epoch** model. Per-task best epochs are scattered across the run (multi-task interference oscillation under `--loss_balance none`); adding best-val-per-task checkpointing is an obvious follow-up.
+
+### Important fix landed during this run
+
+`make_pkey_fkey_graph` was being called with `dataset.get_db()` whose default `upto_test_timestamp=True` drops post-train-cutoff entities — but the test split's seeds reference up to test-cutoff entity ids. So results-position test seed indices reached 26078 while the materialized `results` table only had 20323 nodes, and the CSR adjacency `indptr[seed_idx + 1]` indexed out of bounds. Fixed by passing `upto_test_timestamp=False` and using a distinct cache directory `materialized_full`. Temporal leakage is still prevented at sampling time by the per-row `seed_time` filter — the materialization just needs to *contain* every entity the eval references. Both the multi-task and single-task paths fixed.
 
 **ML6 grad-norm logging** (added in PR4 close-out): `train_multi_task.py` now logs `head_grad_norm_numeric` and `head_grad_norm_boolean` to wandb each step. After warmup the two should stay within an order of magnitude of each other; one going to zero would indicate head starvation (a real risk if a task type has very few rows in a batch).
 

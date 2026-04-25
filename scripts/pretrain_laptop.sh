@@ -36,19 +36,20 @@ MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"  # train-only cap (val/test stay full)
 OUT_DIR="${OUT_DIR:-results/pretrain_laptop}"
 RUN_NAME="${RUN_NAME:-laptop_alltasks}"
 
-DATASETS=(rel-f1 rel-event)
+# NOTE: rel-event omitted on this laptop. rel-event's events.pt is 13 GB
+# on disk; materialize_pkey_fkey_graph loads it entirely into RAM (no
+# torch_frame streaming path), peaking at ~25 GB RSS which exceeds the
+# 27 GB laptop budget and gets OOM-killed. rel-event is included in
+# scripts/pretrain_alltasks.sh for the 8xA100 / 1TB box. The 5 rel-f1
+# tasks here still exercise the full multi-task pipeline end-to-end
+# with mixed regression + binary heads.
+DATASETS=(rel-f1)
 TASKS=(
-  "rel-f1.driver-position:1.0"
-  "rel-f1.driver-dnf:1.0"
-  "rel-f1.driver-top3:1.0"
-  "rel-f1.results-position:1.0"
-  "rel-f1.qualifying-position:1.0"
-  "rel-event.user-attendance:1.0"
-  "rel-event.user-repeat:1.0"
-  "rel-event.user-ignore:1.0"
-  "rel-event.event_interest-interested:1.0"
-  "rel-event.event_interest-not_interested:1.0"
-  "rel-event.users-birthyear:1.0"
+  "rel-f1.driver-position:1.0"        # regression
+  "rel-f1.driver-dnf:1.0"             # binary
+  "rel-f1.driver-top3:1.0"            # binary
+  "rel-f1.results-position:1.0"       # regression
+  "rel-f1.qualifying-position:1.0"    # regression
 )
 TASKS_CSV=$(IFS=,; echo "${TASKS[*]}")
 

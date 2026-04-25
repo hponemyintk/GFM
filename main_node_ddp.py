@@ -202,12 +202,15 @@ except FileNotFoundError:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
 data, col_stats_dict = make_pkey_fkey_graph(
-    dataset.get_db(),
+    # upto_test_timestamp=False so entity tables contain all rows the
+    # test seeds reference. Temporal leakage is enforced at sampling
+    # time (per-row seed_time filter), not via materialization cutoff.
+    dataset.get_db(upto_test_timestamp=False),
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
         text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
     ),
-    cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+    cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
 )
 
 # Build the CSR graph cache once for this dataset; the three splits share it.

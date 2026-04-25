@@ -46,14 +46,19 @@ def main():
         for col, st in c2s.items():
             c2s[col] = stype(st)
 
+    # upto_test_timestamp=False: entity tables must contain all rows the
+    # test split references; temporal leakage is enforced at sampling
+    # time via per-row seed_time filtering, not via materialization
+    # cutoff. (RelBench's default True drops post-train-cutoff entities
+    # which then crash test eval with IndexError.)
     data, _ = make_pkey_fkey_graph(
-        dataset.get_db(),
+        dataset.get_db(upto_test_timestamp=False),
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device="cpu"),
             batch_size=256,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )
 
     print(f"Building TF store for {args.dataset} -> {args.out_dir}")

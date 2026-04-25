@@ -90,11 +90,18 @@ def parse_tasks(spec: str) -> List[Tuple[str, str, float]]:
 def _load_dataset(name: str, cache_dir: str, device: str):
     dset = get_dataset(name, download=True)
     stypes_path = Path(cache_dir) / name / "stypes.json"
+    # IMPORTANT: pass upto_test_timestamp=False here. Otherwise the
+    # entity tables stop at train cutoff and TEST seeds (which reference
+    # entities created between train and test cutoffs) index out of
+    # bounds in the CSR adjacency. Temporal leakage is still prevented
+    # by the per-row seed_time filter in the sampler -- the materialized
+    # graph just needs to *contain* all entities the task tables reference.
+    db = dset.get_db(upto_test_timestamp=False)
     try:
         with open(stypes_path) as f:
             cs = json.load(f)
     except FileNotFoundError:
-        cs = get_stype_proposal(dset.get_db())
+        cs = get_stype_proposal(db)
         stypes_path.parent.mkdir(parents=True, exist_ok=True)
         with open(stypes_path, "w") as f:
             json.dump(cs, f, indent=2, default=str)
@@ -102,12 +109,14 @@ def _load_dataset(name: str, cache_dir: str, device: str):
         for col, st in c2s.items():
             c2s[col] = stype(st) if isinstance(st, str) else st
     data, col_stats = make_pkey_fkey_graph(
-        dset.get_db(),
+        db,
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device=device), batch_size=256,
         ),
-        cache_dir=f"{cache_dir}/{name}/materialized",
+        # Distinct cache dir from the train-cutoff materialization so the
+        # two layouts don't collide.
+        cache_dir=f"{cache_dir}/{name}/materialized_full",
     )
     return data, col_stats
 
