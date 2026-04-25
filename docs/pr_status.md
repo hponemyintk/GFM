@@ -157,11 +157,18 @@ Flat VRAM across 41 samples confirms training does not leak GPU memory across st
 - Tests ML11–ML13 (cross-dataset sanity on real run), MS2 (8×A100 throughput).
 - ML4–ML7 acceptance on the rel-event side (we have the rel-f1 side: train_loss 0.470 → 0.331 → 0.303 over 3 epochs, multi-task driver-top3 AUROC 0.835 vs single-task 0.786).
 
-**Reproduction on the 8×A100 box:**
+**Reproduction:**
 ```
-./scripts/pretrain_6task.sh
+# 8xA100 / 1TB box, full pretraining (11 tasks, paper-style hyperparams):
+./scripts/pretrain_alltasks.sh
 # Knobs via env vars: K, EPOCHS, MAX_STEPS, NPROC, LR, LOSS_BALANCE, OUT_DIR, RUN_NAME
+
+# This laptop (27 GB RAM, RTX 5070 12 GB VRAM), reduced config:
+./scripts/pretrain_laptop.sh
+# Knobs: K, BATCH, CHANNELS, HEADS, EPOCHS, MAX_STEPS, MAX_ROWS_TRAIN, LOSS_BALANCE
 ```
+
+**ML6 grad-norm logging** (added in PR4 close-out): `train_multi_task.py` now logs `head_grad_norm_numeric` and `head_grad_norm_boolean` to wandb each step. After warmup the two should stay within an order of magnitude of each other; one going to zero would indicate head starvation (a real risk if a task type has very few rows in a batch).
 
 ### Future (post-PR4, out of current "don't modify model.py" scope)
 

@@ -25,15 +25,20 @@ SHARDS="$CACHE/shards"
 K="${K:-300}"
 
 DATASETS=(rel-f1 rel-event)
-# 3 rel-f1 + 3 rel-event tasks (matches the paper's evaluation set,
-# regression + binary only).
+# 11 tasks total: every regression + binary task across rel-f1 + rel-event.
+# (driver-circuit-compete is link-prediction -- out of current scope.)
 TASKS=(
-  "rel-f1.driver-position:1.0"     # regression
-  "rel-f1.driver-dnf:1.0"          # binary
-  "rel-f1.driver-top3:1.0"         # binary
-  "rel-event.user-attendance:1.0"  # regression
-  "rel-event.user-repeat:1.0"      # binary
-  "rel-event.user-ignore:1.0"      # binary
+  "rel-f1.driver-position:1.0"               # regression
+  "rel-f1.driver-dnf:1.0"                    # binary
+  "rel-f1.driver-top3:1.0"                   # binary
+  "rel-f1.results-position:1.0"              # regression
+  "rel-f1.qualifying-position:1.0"           # regression
+  "rel-event.user-attendance:1.0"            # regression
+  "rel-event.user-repeat:1.0"                # binary
+  "rel-event.user-ignore:1.0"                # binary
+  "rel-event.event_interest-interested:1.0"  # binary
+  "rel-event.event_interest-not_interested:1.0"  # binary
+  "rel-event.users-birthyear:1.0"            # regression
 )
 
 echo "=== [1/3] Building TF memmap stores ==="

@@ -227,16 +227,6 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
 
 
 # --------------------------------------------------------- model build
-def _build_unified_type_map(caches: Dict[str, DatasetGraphCache]):
-    """Concatenate per-dataset prefixed type lists into a single global map."""
-    all_types: List[str] = []
-    for ds_name in sorted(caches.keys()):
-        all_types.extend(caches[ds_name].node_types)
-    type_to_index = {t: i for i, t in enumerate(all_types)}
-    index_to_type = {i: t for i, t in enumerate(all_types)}
-    return type_to_index, index_to_type, all_types
-
-
 def _build_model(args, caches, col_stats_per_ds, type_to_index, num_nodes_total, device):
     """Build RelGT(out_channels=channels) so its output is an embedding."""
     # Union col_names_dict over all datasets/tables (raw type -> col_names_dict).
@@ -396,6 +386,16 @@ def run(args, local_rank: int, device, gpu_handle):
                          task_type_id=task_type)
             loss, info = loss_fn(pred.float(), labels, task_id, task_type)
             loss.backward()
+
+            # ML6 (plan §6.3.2): per-datatype head grad norms. Log them
+            # so head-starvation surfaces immediately (one head receiving
+            # ~zero grad while the other dominates).
+            head_module = model.module.head
+            num_g = head_module.numeric_head.weight.grad
+            bool_g = head_module.boolean_head.weight.grad
+            num_norm = float(num_g.norm().item()) if num_g is not None else 0.0
+            bool_norm = float(bool_g.norm().item()) if bool_g is not None else 0.0
+
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
 
@@ -407,7 +407,9 @@ def run(args, local_rank: int, device, gpu_handle):
                 payload = {"train_loss": v, "global_step": global_step,
                            "lr": optim.param_groups[0]["lr"],
                            "gpu_util_percent": gpu_util,
-                           "gpu_mem_allocated_MB": mem_a}
+                           "gpu_mem_allocated_MB": mem_a,
+                           "head_grad_norm_numeric": num_norm,
+                           "head_grad_norm_boolean": bool_norm}
                 for k, t in info.items():
                     if k.startswith("task_"):
                         payload[k] = float(t.item() if isinstance(t, torch.Tensor) else t)
