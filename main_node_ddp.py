@@ -33,7 +33,8 @@ from relbench.tasks import get_task
 
 # within this project
 from model import RelGT
-from utils import GloveTextEmbedding, RelGTTokens
+from utils import GloveTextEmbedding
+from gfm_data import DatasetGraphCache, TaskTokens, collate_single_task
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -139,29 +140,34 @@ data, col_stats_dict = make_pkey_fkey_graph(
     cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
 )
 
+# Build the CSR graph cache once for this dataset; the three splits share it.
+graph_cache = DatasetGraphCache(data=data, undirected=True, name_prefix=None)
+
 data = {
-    split: RelGTTokens(
-        data=data, 
+    split: TaskTokens(
+        cache=graph_cache,
         task=task,
-        K=args.num_neighbors, 
-        split=split, 
-        undirected=True, 
+        K=args.num_neighbors,
+        split=split,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
-        num_workers=args.num_workers,
-        train_stage=args.train_stage)
-        for split in ["train", "val", "test"]
-    }
+        train_stage=args.train_stage,
+    )
+    for split in ["train", "val", "test"]
+}
 
 ############################
 # 4. Create DataLoaders (with a DistributedSampler for training)
 ############################
+def _collate_for(ds: TaskTokens):
+    return lambda batch: collate_single_task(ds, batch)
+
 train_sampler = DistributedSampler(data["train"], shuffle=True, seed=args.seed)
 loader_train = DataLoader(
-    data["train"], 
-    batch_size=args.batch_size, 
+    data["train"],
+    batch_size=args.batch_size,
     sampler=train_sampler,
-    collate_fn=data["train"].collate,
+    collate_fn=_collate_for(data["train"]),
     num_workers=args.num_workers,
     persistent_workers=args.num_workers > 0,
     pin_memory=True)
@@ -171,8 +177,7 @@ loader_val = DataLoader(
     data["val"],
     batch_size=args.batch_size,
     sampler=val_sampler,
-    # shuffle=False,
-    collate_fn=data["val"].collate,
+    collate_fn=_collate_for(data["val"]),
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
     pin_memory=True
@@ -183,8 +188,7 @@ loader_test = DataLoader(
     data["test"],
     batch_size=args.batch_size,
     sampler=test_sampler,
-    # shuffle=False,
-    collate_fn=data["test"].collate,
+    collate_fn=_collate_for(data["test"]),
     num_workers=args.num_workers,
     persistent_workers=(args.num_workers > 0),
     pin_memory=True
