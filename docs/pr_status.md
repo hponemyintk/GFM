@@ -10,10 +10,10 @@ Single source of truth for what has landed on this branch and what's next. The a
 |---|---|---|---|
 | **PR1** | Refactor preprocessing into `gfm_data/` with CSR adjacency | ✅ merged | `d4d33cd` |
 | **PR2** | Memmap shards + memmap TFs + streaming/precomputed modes | ✅ merged | `372c82a`, `6a557e5`, `93f506b`, `31f4474` |
-| **PR3** | Multi-task plumbing (rel-f1 first) | ▶ next | — |
-| **PR4** | rel-event + 6-task pretraining run | pending | — |
+| **PR3** | Multi-task plumbing (rel-f1 first) | ✅ merged | `d49376c`, `4570fdb` |
+| **PR4** | Cross-dataset namespacing + 6-task launcher | ✅ scaffolding merged | this commit |
 
-178 unit tests green, 2 real-data smokes green, 1 ML parity sweep green.
+197 unit tests green, 3 real-data smokes green, 1 ML parity sweep green, 1 multi-task ML4-ML7 smoke green.
 
 ---
 
@@ -143,13 +143,25 @@ Flat VRAM across 41 samples confirms training does not leak GPU memory across st
 
 **Tests:** Co1–Co6 (mixed-batch collate), D1–D5 (DDP sampler), H1–H7 (heads + loss), M1–M4 (per-task metrics), ML4–ML7 (multi-task overfit + balance + interference). Re-run ML3.5 in single-task degenerate mode as PR3 acceptance.
 
-### PR4 — rel-event + 6-task pretraining
+### PR4 — cross-dataset namespacing + 6-task launcher
 
-- Build TF memmap + shards for rel-event offline (PR2 tools cover this).
-- Add the three rel-event tasks (`user-attendance`, `user-repeat`, `user-ignore`).
-- Tune task weights / loss balance.
-- Tests ML11–ML13 (cross-dataset sanity), MS2 (8×A100 throughput).
-- This is the run that goes on the 8×A100 box.
+**What landed (laptop side):**
+- `unified_type_map` plumbed through `TaskTokens.__init__` so HDF5 / shard precompute writes a single global type vocabulary across datasets. Required because each `DatasetGraphCache` re-numbers types from 0 with its own prefix; without unification, the model's `NeighborNodeTypeEncoder` would mis-embed cross-dataset rows.
+- Per-(dataset, task) shards path resolution in `train_multi_task.py` so `--shards_dir <root>` automatically expands to `<root>/<ds>/<task>/` per task.
+- `tests/test_cross_dataset_types.py` (3 tests): two caches with different `name_prefix` produce disjoint namespaces; the unified-map branch in `TaskTokens` overrides the per-cache map; correct global ids assigned.
+- `scripts/pretrain_6task.sh` — three-phase reference launcher (build TF memmaps → build shards → DDP train).
+
+**Deferred to 8×A100 box (per plan §8):**
+- Actual rel-event TF memmap + shards build. On this laptop, loading rel-event TFs takes ~10–15 min just for `events.pt` (13 GB on disk → ~14 GB RAM peak). On 8×A100/1TB the build is trivial.
+- The 6-task pretraining run itself.
+- Tests ML11–ML13 (cross-dataset sanity on real run), MS2 (8×A100 throughput).
+- ML4–ML7 acceptance on the rel-event side (we have the rel-f1 side: train_loss 0.470 → 0.331 → 0.303 over 3 epochs, multi-task driver-top3 AUROC 0.835 vs single-task 0.786).
+
+**Reproduction on the 8×A100 box:**
+```
+./scripts/pretrain_6task.sh
+# Knobs via env vars: K, EPOCHS, MAX_STEPS, NPROC, LR, LOSS_BALANCE, OUT_DIR, RUN_NAME
+```
 
 ### Future (post-PR4, out of current "don't modify model.py" scope)
 

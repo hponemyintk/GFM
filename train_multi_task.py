@@ -137,6 +137,16 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
         )
         col_stats_per_ds[ds_name] = col_stats
 
+    # PR4: pre-compute the unified type map ONCE here so every TaskTokens
+    # gets the same global vocabulary at construction. This makes HDF5 /
+    # precomputed-shards correct under multi-dataset training (otherwise
+    # they'd write per-cache local ids and the model would mis-embed).
+    unified_type_map: Dict[str, int] = {}
+    for ds_name in sorted(caches.keys()):
+        for prefixed in caches[ds_name].node_types:
+            if prefixed not in unified_type_map:
+                unified_type_map[prefixed] = len(unified_type_map)
+
     # Build TaskTokens per (dataset, task, split). task_id is the global
     # index of the (ds, tk) pair in tasks_spec order.
     task_tokens: Dict[str, List[TaskTokens]] = {"train": [], "val": [], "test": []}
@@ -154,23 +164,35 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
             cache=caches[ds_name], task=task, K=args.num_neighbors,
             split="train", mode=args.mode, precompute=args.precompute,
             precomputed_dir=f"{args.cache_dir}/precomputed/{ds_name}/{tk_name}",
-            shards_dir=args.shards_dir, train_stage=args.train_stage,
-            task_id=ti,
+            shards_dir=(
+                os.path.join(args.shards_dir, ds_name, tk_name)
+                if args.shards_dir else None
+            ),
+            train_stage=args.train_stage,
+            task_id=ti, unified_type_map=unified_type_map,
         )
         # Adopt train stats on val/test for regression z-score.
         val_tokens = TaskTokens(
             cache=caches[ds_name], task=task, K=args.num_neighbors,
             split="val", mode=args.mode, precompute=args.precompute,
             precomputed_dir=f"{args.cache_dir}/precomputed/{ds_name}/{tk_name}",
-            shards_dir=args.shards_dir, train_stage=args.train_stage,
-            task_id=ti,
+            shards_dir=(
+                os.path.join(args.shards_dir, ds_name, tk_name)
+                if args.shards_dir else None
+            ),
+            train_stage=args.train_stage,
+            task_id=ti, unified_type_map=unified_type_map,
         )
         test_tokens = TaskTokens(
             cache=caches[ds_name], task=task, K=args.num_neighbors,
             split="test", mode=args.mode, precompute=args.precompute,
             precomputed_dir=f"{args.cache_dir}/precomputed/{ds_name}/{tk_name}",
-            shards_dir=args.shards_dir, train_stage=args.train_stage,
-            task_id=ti,
+            shards_dir=(
+                os.path.join(args.shards_dir, ds_name, tk_name)
+                if args.shards_dir else None
+            ),
+            train_stage=args.train_stage,
+            task_id=ti, unified_type_map=unified_type_map,
         )
         val_tokens.adopt_target_stats(
             train_tokens.target_mean, train_tokens.target_std,
@@ -271,14 +293,10 @@ def run(args, local_rank: int, device, gpu_handle):
         _build_caches_and_tokens(args, local_rank, tasks_spec, f"cuda:{local_rank}")
     )
 
-    # Build unified node-type map across all caches.
-    type_to_index, _, _ = _build_unified_type_map(caches)
-    # Patch each TaskTokens' index map so its collate uses the unified one.
-    for split in ("train", "val", "test"):
-        for tok in task_tokens[split]:
-            tok.node_type_to_index = type_to_index
-            tok.index_to_node_type = {i: t for t, i in type_to_index.items()}
-            tok.node_types = list(type_to_index.keys())
+    # The unified type map was already wired into each TaskTokens at
+    # construction (see _build_caches_and_tokens). Pull it back out here
+    # for the model construction.
+    type_to_index = task_tokens["train"][0].node_type_to_index
     num_nodes_total = sum(c.num_nodes_total() for c in caches.values())
 
     # DataLoaders

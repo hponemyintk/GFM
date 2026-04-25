@@ -89,7 +89,14 @@ class TaskTokens(Dataset):
         train_stage: str = "finetune",
         task_id: int = 0,
         task_type_id: Optional[int] = None,
+        unified_type_map: Optional[Dict[str, int]] = None,
     ):
+        """``unified_type_map`` (PR4): when training across multiple
+        datasets, all TaskTokens must share a single global node-type
+        vocabulary so the model's NeighborNodeTypeEncoder sees a
+        consistent id range. Pass the union of all caches' type maps
+        here at construction time so HDF5 / shards precompute writes
+        unified ids (not per-cache locals)."""
         super().__init__()
         if mode not in ("hdf5", "streaming", "precomputed_shards"):
             raise ValueError(f"unknown mode: {mode!r}")
@@ -141,11 +148,23 @@ class TaskTokens(Dataset):
             self.target_mean = mu
             self.target_std = sd
 
-        # Inherit type tables from the cache (kept on the dataset object so
-        # main_node_ddp.py:228-230 still works without a cache reference).
-        self.node_types: List[str] = list(cache.node_types)
-        self.node_type_to_index: Dict[str, int] = dict(cache.node_type_to_index)
-        self.index_to_node_type: Dict[int, str] = dict(cache.index_to_node_type)
+        # Inherit type tables. When unified_type_map is provided (PR4
+        # multi-dataset path), use it -- otherwise fall back to the per-
+        # cache map (PR1 / single-dataset / dev-kyaw parity).
+        if unified_type_map is not None:
+            # Sanity: every type our cache knows must be in the unified map.
+            for t in cache.node_types:
+                if t not in unified_type_map:
+                    raise ValueError(
+                        f"prefixed type {t!r} missing from unified_type_map"
+                    )
+            self.node_type_to_index = dict(unified_type_map)
+            self.index_to_node_type = {i: t for t, i in unified_type_map.items()}
+            self.node_types = list(unified_type_map.keys())
+        else:
+            self.node_types = list(cache.node_types)
+            self.node_type_to_index = dict(cache.node_type_to_index)
+            self.index_to_node_type = dict(cache.index_to_node_type)
         self.max_neighbor_hop = 2 + 1  # 0,1,2 + fallback (3)
 
         self._create_global_mappings()
