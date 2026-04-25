@@ -234,16 +234,18 @@ data = {
 }
 
 # Optional seed-row cap for memory-bounded laptop runs (plan §6.3.6).
+# Only cap the *train* split; val/test stay full because task.evaluate()
+# expects the full RelBench table size.
 if args.max_rows_per_task > 0:
-    for split, ds in data.items():
-        n = min(args.max_rows_per_task, len(ds.node_idxs))
-        ds.node_idxs = ds.node_idxs[:n]
-        if ds.time is not None:
-            ds.time = ds.time[:n]
-        if ds.target is not None:
-            ds.target = ds.target[:n]
-        if local_rank == 0:
-            print(f"[{split}] capped to {n} seed rows via --max_rows_per_task")
+    ds = data["train"]
+    n = min(args.max_rows_per_task, len(ds.node_idxs))
+    ds.node_idxs = ds.node_idxs[:n]
+    if ds.time is not None:
+        ds.time = ds.time[:n]
+    if ds.target is not None:
+        ds.target = ds.target[:n]
+    if local_rank == 0:
+        print(f"[train] capped to {n} seed rows via --max_rows_per_task")
 
 ############################
 # 4. Create DataLoaders (with a DistributedSampler for training)

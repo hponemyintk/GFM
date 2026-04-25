@@ -178,15 +178,15 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
         test_tokens.adopt_target_stats(
             train_tokens.target_mean, train_tokens.target_std,
         )
-        # Optional row cap for laptop runs.
+        # Optional row cap for laptop runs. Train only -- val/test stay
+        # full because task.evaluate expects the full RelBench table size.
         if args.max_rows_per_task > 0:
-            for tok in (train_tokens, val_tokens, test_tokens):
-                n = min(args.max_rows_per_task, len(tok.node_idxs))
-                tok.node_idxs = tok.node_idxs[:n]
-                if tok.time is not None:
-                    tok.time = tok.time[:n]
-                if tok.target is not None:
-                    tok.target = tok.target[:n]
+            n = min(args.max_rows_per_task, len(train_tokens.node_idxs))
+            train_tokens.node_idxs = train_tokens.node_idxs[:n]
+            if train_tokens.time is not None:
+                train_tokens.time = train_tokens.time[:n]
+            if train_tokens.target is not None:
+                train_tokens.target = train_tokens.target[:n]
         task_tokens["train"].append(train_tokens)
         task_tokens["val"].append(val_tokens)
         task_tokens["test"].append(test_tokens)
