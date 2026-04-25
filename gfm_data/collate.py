@@ -66,7 +66,7 @@ def collate_single_task(
         raw = dataset.cache.prefixed_to_raw[prefixed]
         positions_2d = torch.nonzero(mask, as_tuple=False)
         offsets_list = [int(b) * K + int(k) for (b, k) in positions_2d.tolist()]
-        grouped_tfs[t_id] = dataset.cache.data[raw].tf[local_idxs]
+        grouped_tfs[t_id] = dataset.cache.tf_view(raw, local_idxs)
         grouped_positions[t_id] = offsets_list
 
     flat_batch_idx = torch.arange(B).unsqueeze(1).expand(B, K).reshape(-1).tolist()

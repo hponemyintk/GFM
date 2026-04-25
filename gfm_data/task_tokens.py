@@ -52,10 +52,22 @@ class TaskTokens(Dataset):
     K : int
         Number of tokens per sample (seed + K-1 neighbors).
     split : {"train", "val", "test"}
+    mode : {"hdf5", "streaming", "precomputed_shards"}
+        Sample materialization strategy.
+
+        * ``hdf5`` (default): legacy dev-kyaw layout, single HDF5 file per
+          split. Built in-process if ``precompute`` is True.
+        * ``streaming``: no precompute. ``__getitem__`` calls the sampler
+          directly each time. Best for small datasets / iteration / laptop.
+        * ``precomputed_shards``: read from memmap shards under
+          ``shards_dir`` produced by ``tools/precompute_shards.py``. Best
+          for production / 8xA100 box.
     precompute : bool
-        If True, materialize K-token expansions into HDF5 (matches dev-kyaw).
+        Only relevant for ``mode="hdf5"``. Build the HDF5 if missing.
     precomputed_dir : str
-        Cache directory for the HDF5 file.
+        Cache directory for the HDF5 file (mode="hdf5").
+    shards_dir : Optional[str]
+        Directory of memmap shards (mode="precomputed_shards").
     train_stage : {"finetune"}
     task_id : int, default 0
         Forward-compat: which (dataset, task) this is in a multi-task run.
@@ -70,20 +82,26 @@ class TaskTokens(Dataset):
         task,
         K: int,
         split: str = "train",
+        mode: str = "hdf5",
         precompute: bool = True,
         precomputed_dir: Optional[str] = None,
+        shards_dir: Optional[str] = None,
         train_stage: str = "finetune",
         task_id: int = 0,
         task_type_id: Optional[int] = None,
     ):
         super().__init__()
+        if mode not in ("hdf5", "streaming", "precomputed_shards"):
+            raise ValueError(f"unknown mode: {mode!r}")
         self.cache = cache
         self.data = cache.data  # exposed for back-compat with main_node_ddp.py
         self.task = task
         self.split = split
         self.K = K
+        self.mode = mode
         self.precompute = precompute
         self.precomputed_dir = precomputed_dir
+        self.shards_dir = shards_dir
         self.train_stage = train_stage
         self.task_id = int(task_id)
         self.task_type_id = (
@@ -114,13 +132,31 @@ class TaskTokens(Dataset):
 
         self._create_global_mappings()
 
-        self.precomputed_path = self._construct_precomputed_path() if precompute else None
-        if self.precompute:
-            if os.path.exists(self.precomputed_path):
-                print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
-            else:
-                print(f"[{self.split}] Precomputing neighbor sampling (K={self.K})...")
-                self._precompute_sampling()
+        # Per-mode setup.
+        self.precomputed_path = None
+        self._shard_reader = None
+        if self.mode == "hdf5":
+            self.precomputed_path = self._construct_precomputed_path() if precompute else None
+            if self.precompute:
+                if os.path.exists(self.precomputed_path):
+                    print(f"[{self.split}] Found existing HDF5 at {self.precomputed_path}")
+                else:
+                    print(f"[{self.split}] Precomputing neighbor sampling (K={self.K})...")
+                    self._precompute_sampling()
+        elif self.mode == "precomputed_shards":
+            from gfm_data.shard_io import ShardReader
+            assert shards_dir is not None, \
+                "mode='precomputed_shards' requires shards_dir"
+            shard_split_dir = os.path.join(shards_dir, str(K), self.split)
+            assert os.path.isdir(shard_split_dir), \
+                f"shards not found at {shard_split_dir}; run tools/precompute_shards.py"
+            self._shard_reader = ShardReader(shard_split_dir)
+            assert self._shard_reader.meta.K == K
+            assert len(self._shard_reader) == len(self.node_idxs), (
+                f"shards has {len(self._shard_reader)} samples, "
+                f"task split has {len(self.node_idxs)}"
+            )
+        # streaming: no setup needed; sampler runs in __getitem__
 
     # ------------------------------------------------------------ id maps
     def _create_global_mappings(self):
@@ -241,8 +277,8 @@ class TaskTokens(Dataset):
                     edges_dset[:, start:end_] = e_arr
             hf.create_dataset("edges_offsets", data=offsets)
 
-    # ------------------------------------------------------------- access
-    def __getitem__(self, idx: int):
+    # ----------------------------------------------------- per-mode samplers
+    def _sample_from_hdf5(self, idx: int):
         with h5py.File(self.precomputed_path, "r") as hf:
             sample = {
                 "types": torch.from_numpy(hf["types"][idx]).long(),
@@ -259,18 +295,69 @@ class TaskTokens(Dataset):
             else:
                 eidx = torch.from_numpy(edges_dset[:, start:end_]).long()
             sample["edge_index"] = eidx
+        return sample
+
+    def _sample_from_shards(self, idx: int):
+        s = self._shard_reader.read(idx)
+        return {
+            "types": torch.from_numpy(s["types"].astype(np.int64, copy=False)),
+            "indices": torch.from_numpy(s["indices"].astype(np.int64, copy=False)),
+            "hops": torch.from_numpy(s["hops"].astype(np.int64, copy=False)),
+            "times": torch.from_numpy(s["times"]),
+            "edge_index": torch.from_numpy(s["edge_index"].astype(np.int64, copy=False)),
+        }
+
+    def _sample_streaming(self, idx: int):
+        """Run the sampler on demand. No precompute, no caching."""
+        from gfm_data.sampler import sample_local_subgraph
+        node_idx_t = self.node_idxs[idx]
+        node_idx = int(node_idx_t.item() if isinstance(node_idx_t, Tensor) else node_idx_t)
+        seed_t = float(self.time[idx].item()) if self.time is not None else 0.0
+        seed_val = hash((self.node_type, node_idx, seed_t, self.K)) & 0xFFFFFFFF
+        final_nodes, edge_index = sample_local_subgraph(
+            self.cache, self.K, self.node_type,
+            node_idx, seed_t, seed_val,
+        )
+        K = self.K
+        types_arr = np.zeros(K, dtype=np.int64)
+        idx_arr = np.zeros(K, dtype=np.int64)
+        hops_arr = np.zeros(K, dtype=np.int64)
+        times_arr = np.zeros(K, dtype=np.float32)
+        for j, (t_str, nbr_loc, hop, t_val, _c) in enumerate(final_nodes):
+            types_arr[j] = self.node_type_to_index[t_str]
+            idx_arr[j] = nbr_loc
+            hops_arr[j] = hop
+            times_arr[j] = t_val
+        return {
+            "types": torch.from_numpy(types_arr),
+            "indices": torch.from_numpy(idx_arr),
+            "hops": torch.from_numpy(hops_arr),
+            "times": torch.from_numpy(times_arr),
+            "edge_index": torch.from_numpy(edge_index.astype(np.int64, copy=False)),
+        }
+
+    # ------------------------------------------------------------- access
+    def __getitem__(self, idx: int):
+        if self.mode == "streaming":
+            sample = self._sample_streaming(idx)
+        elif self.mode == "precomputed_shards":
+            sample = self._sample_from_shards(idx)
+        else:  # hdf5
+            sample = self._sample_from_hdf5(idx)
 
         label = self.target[idx] if self.target is not None else None
 
         sample["first_type"] = sample["types"][0].item()
         sample["first_index"] = sample["indices"][0].item()
 
-        # Per-token TFs are pulled from the shared cache.data so multiple
-        # tasks of the same dataset don't duplicate column tensors.
+        # Per-token TFs come from cache.tf_view, which dispatches to either
+        # the in-RAM ``data[type].tf`` (default) or a memmap-backed
+        # TFStoreReader (when ``tf_store_root`` was passed to the cache).
         sample["tfs"] = [
-            self.cache.data[
-                self.cache.prefixed_to_raw[self.index_to_node_type[t.item()]]
-            ].tf[i.item()]
+            self.cache.tf_view(
+                self.cache.prefixed_to_raw[self.index_to_node_type[t.item()]],
+                int(i.item()),
+            )
             for t, i in zip(sample["types"], sample["indices"])
         ]
         sample["global_idx"] = idx

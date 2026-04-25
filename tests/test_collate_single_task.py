@@ -59,6 +59,9 @@ class _StubCache:
         self.prefixed_to_raw = {nt: nt for nt in node_types}
     def _num_nodes_of(self, data, node_type):
         return data[node_type].num_nodes
+    def tf_view(self, raw_node_type, row_idx):
+        # Mirrors DatasetGraphCache.tf_view(in-RAM branch).
+        return self.data[raw_node_type].tf[row_idx]
 
 
 class _StubTaskTokens:

@@ -18,6 +18,7 @@ are off by default so single-task runs match dev-kyaw exactly.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -94,10 +95,28 @@ class DatasetGraphCache:
         data: HeteroData,
         undirected: bool = True,
         name_prefix: Optional[str] = None,
+        tf_store_root: Optional[str] = None,
     ):
+        """Build the CSR cache for one dataset.
+
+        Parameters
+        ----------
+        data, undirected, name_prefix
+            See class docstring.
+        tf_store_root : Optional[str]
+            If provided, ``tf_view(...)`` reads TensorFrame slices from
+            per-table memmap stores under
+            ``<tf_store_root>/<raw_node_type>/`` instead of from
+            ``data[node_type].tf``. This is what unlocks training on
+            datasets too big to fit TF columns in CPU RAM (rel-event,
+            full RelBench v2). Built offline by
+            ``tools/build_tf_store.py``.
+        """
         self.data = data
         self.undirected = undirected
         self.name_prefix = name_prefix or ""
+        self.tf_store_root = tf_store_root
+        self._tf_readers: Dict[str, object] = {}  # raw_type -> TFStoreReader, lazy
 
         # Stable type ordering matches data.node_types (consistent with
         # main_node_ddp.py:228 and utils.RelGTTokens._create_global_mappings).
@@ -255,6 +274,24 @@ class DatasetGraphCache:
         for k in range(end - start):
             out.add((self.index_to_node_type[int(nt_ids[k])], int(nidx[k])))
         return out
+
+    # ----------------------------------------------------------- TF lookup
+    def tf_view(self, raw_node_type: str, row_idx):
+        """Return a TensorFrame slice for one node type.
+
+        Dispatches to the in-RAM ``data[type].tf[idx]`` (default) or to a
+        memmap-backed ``TFStoreReader`` (if ``tf_store_root`` was passed).
+        ``raw_node_type`` is the un-prefixed type name (matches the keys in
+        ``self.data``).
+        """
+        if self.tf_store_root is None:
+            return self.data[raw_node_type].tf[row_idx]
+        if raw_node_type not in self._tf_readers:
+            from gfm_data.tf_store import TFStoreReader  # local import to avoid hard dep
+            self._tf_readers[raw_node_type] = TFStoreReader(
+                os.path.join(self.tf_store_root, raw_node_type)
+            )
+        return self._tf_readers[raw_node_type].view(row_idx)
 
     # -------------------------------------------------------- diagnostic API
     def num_edges_total(self) -> int:
