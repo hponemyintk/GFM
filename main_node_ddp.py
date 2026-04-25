@@ -77,6 +77,38 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+# PR2 data-layer mode flags. Default keeps dev-kyaw / PR1 behavior intact.
+parser.add_argument(
+    "--mode",
+    type=str,
+    default="hdf5",
+    choices=["hdf5", "streaming", "precomputed_shards"],
+    help="Sample materialization strategy. 'hdf5' (default) matches dev-kyaw. "
+         "'streaming' samples in DataLoader workers. 'precomputed_shards' "
+         "reads memmap shards built by tools/precompute_shards.py.",
+)
+parser.add_argument(
+    "--shards_dir",
+    type=str,
+    default=None,
+    help="Directory of precomputed shards (required for --mode=precomputed_shards).",
+)
+parser.add_argument(
+    "--tf_store_dir",
+    type=str,
+    default=None,
+    help="Directory of memmap-backed TensorFrame columns. If set, TF reads "
+         "go through gfm_data.tf_store.TFStoreReader instead of the in-RAM "
+         "data[type].tf -- needed for datasets too big to fit TFs in RAM.",
+)
+parser.add_argument(
+    "--max_rows_per_task",
+    type=int,
+    default=0,
+    help="If > 0, cap the number of seed rows used per (split, task). "
+         "Combined with --tf_store_dir this bounds resident memory for "
+         "laptop-scale runs on big datasets.",
+)
 
 args = parser.parse_args()
 
@@ -141,7 +173,12 @@ data, col_stats_dict = make_pkey_fkey_graph(
 )
 
 # Build the CSR graph cache once for this dataset; the three splits share it.
-graph_cache = DatasetGraphCache(data=data, undirected=True, name_prefix=None)
+graph_cache = DatasetGraphCache(
+    data=data,
+    undirected=True,
+    name_prefix=None,
+    tf_store_root=args.tf_store_dir,  # None = in-RAM TFs (default)
+)
 
 data = {
     split: TaskTokens(
@@ -149,12 +186,26 @@ data = {
         task=task,
         K=args.num_neighbors,
         split=split,
+        mode=args.mode,
         precompute=args.precompute,
         precomputed_dir=f"{args.cache_dir}/precomputed/{args.dataset}/{args.task}",
+        shards_dir=args.shards_dir,
         train_stage=args.train_stage,
     )
     for split in ["train", "val", "test"]
 }
+
+# Optional seed-row cap for memory-bounded laptop runs (plan §6.3.6).
+if args.max_rows_per_task > 0:
+    for split, ds in data.items():
+        n = min(args.max_rows_per_task, len(ds.node_idxs))
+        ds.node_idxs = ds.node_idxs[:n]
+        if ds.time is not None:
+            ds.time = ds.time[:n]
+        if ds.target is not None:
+            ds.target = ds.target[:n]
+        if local_rank == 0:
+            print(f"[{split}] capped to {n} seed rows via --max_rows_per_task")
 
 ############################
 # 4. Create DataLoaders (with a DistributedSampler for training)

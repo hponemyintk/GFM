@@ -139,18 +139,46 @@ def test_T7_random_row_view_is_independent_per_call():
         assert torch.equal(v.feat_dict[stype.numerical], t.feat_dict[stype.numerical])
 
 
-# Multicat sanity: builder must raise.
-def test_multicat_builder_raises_NotImplementedError():
-    """Until PR4, multi_categorical must fail loudly rather than silently drop.
-
-    We bypass the real ``MultiNestedTensor`` here because torch_frame's
-    validator is stricter than the builder's branch we want to exercise; the
-    builder iterates ``tf.feat_dict`` and dispatches on the stype name, so a
-    duck-typed object is sufficient.
+# T2: multi_categorical round-trip.
+def test_T2_multicategorical_roundtrip():
+    """Build a MultiNestedTensor from realistic jagged data and verify
+    ``view(...)`` reconstructs the cell slices a row at a time.
     """
-    class _FakeTF:
-        feat_dict = {stype.multicategorical: object()}
-        col_names_dict = {stype.multicategorical: ["m"]}
-        num_rows = 4
-    with tempfile.TemporaryDirectory() as root, pytest.raises(NotImplementedError):
-        build_tf_store(_FakeTF(), root)
+    from torch_frame.data.multi_nested_tensor import MultiNestedTensor
+
+    # 4 rows x 2 cols; mat[i][j] is a 1D tensor of arbitrary length.
+    mat = [
+        [torch.tensor([1, 2, 3], dtype=torch.long), torch.tensor([10], dtype=torch.long)],
+        [torch.tensor([4, 5], dtype=torch.long),    torch.tensor([20, 21], dtype=torch.long)],
+        [torch.tensor([6], dtype=torch.long),       torch.tensor([30, 31, 32], dtype=torch.long)],
+        [torch.tensor([], dtype=torch.long),        torch.tensor([40], dtype=torch.long)],
+    ]
+    mnt = MultiNestedTensor.from_tensor_mat(mat)
+    feat = {stype.multicategorical: mnt}
+    cnd = {stype.multicategorical: ["m1", "m2"]}
+    tf = TensorFrame(feat_dict=feat, col_names_dict=cnd, num_rows=4)
+
+    with tempfile.TemporaryDirectory() as root:
+        build_tf_store(tf, root)
+        r = TFStoreReader(root)
+
+        # Full-table view matches.
+        v = r.view([0, 1, 2, 3])
+        vmnt = v.feat_dict[stype.multicategorical]
+        assert vmnt.num_rows == 4 and vmnt.num_cols == 2
+        assert torch.equal(vmnt.values, mnt.values)
+        assert torch.equal(vmnt.offset, mnt.offset)
+
+        # Subset view: rows 0 and 2 -> cells (0,0),(0,1),(2,0),(2,1)
+        v = r.view([0, 2])
+        vmnt = v.feat_dict[stype.multicategorical]
+        # Expected concatenated values: 1,2,3, 10, 6, 30,31,32
+        assert vmnt.values.tolist() == [1, 2, 3, 10, 6, 30, 31, 32]
+        # Expected offsets: 0, 3, 4, 5, 8
+        assert vmnt.offset.tolist() == [0, 3, 4, 5, 8]
+
+        # Empty cell (row 3 col 0) handled correctly.
+        v = r.view([3])
+        vmnt = v.feat_dict[stype.multicategorical]
+        assert vmnt.values.tolist() == [40]
+        assert vmnt.offset.tolist() == [0, 0, 1]

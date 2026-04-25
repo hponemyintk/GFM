@@ -36,6 +36,7 @@ import numpy as np
 import torch
 from torch_frame import TensorFrame, stype
 from torch_frame.data.multi_embedding_tensor import MultiEmbeddingTensor
+from torch_frame.data.multi_nested_tensor import MultiNestedTensor
 
 
 # Per-stype memmap dtype.
@@ -45,6 +46,8 @@ _STYPE_DTYPE = {
     "timestamp": np.int64,  # always [N, C, 7]
     "embedding_values": np.float32,
     "embedding_offset": np.int64,
+    "multicategorical_values": np.int64,
+    "multicategorical_offset": np.int64,
 }
 
 
@@ -74,6 +77,7 @@ def build_tf_store(tf, root: str):
         "stypes": [_stype_str(s) for s in tf.feat_dict.keys()],
         "shapes": {},
         "embedding_offset": None,
+        "multicategorical_num_cols": None,  # set if stype.multicategorical present
         "layout_version": 1,
     }
 
@@ -94,9 +98,20 @@ def build_tf_store(tf, root: str):
             meta["shapes"][s_name] = list(arr.shape)
             arr.tofile(os.path.join(root, f"{s_name}.{ _STYPE_DTYPE[s_name].__name__}"))
         elif s_name == "multicategorical":
-            raise NotImplementedError(
-                "multi_categorical TF storage is on the PR4 plan (lands with rel-event)."
+            # MultiNestedTensor: flat ``values`` + flat ``offset`` of length
+            # num_rows*num_cols + 1 (one offset per (row, col) cell).
+            mnt: MultiNestedTensor = t
+            values_np = mnt.values.detach().cpu().numpy().astype(
+                _STYPE_DTYPE["multicategorical_values"], copy=False
             )
+            offset_np = mnt.offset.detach().cpu().numpy().astype(
+                _STYPE_DTYPE["multicategorical_offset"], copy=False
+            )
+            meta["shapes"]["multicategorical_values"] = list(values_np.shape)
+            meta["shapes"]["multicategorical_offset"] = list(offset_np.shape)
+            meta["multicategorical_num_cols"] = int(mnt.num_cols)
+            values_np.tofile(os.path.join(root, "multicategorical.values.i64"))
+            offset_np.tofile(os.path.join(root, "multicategorical.offset.i64"))
         else:
             raise NotImplementedError(f"unsupported stype: {s_name}")
 
@@ -121,6 +136,7 @@ class _TableMeta:
     stypes: List[str]
     shapes: Dict[str, List[int]]
     embedding_offset: Optional[List[int]]
+    multicategorical_num_cols: Optional[int]
 
 
 class TFStoreReader:
@@ -139,6 +155,7 @@ class TFStoreReader:
             stypes=list(raw["stypes"]),
             shapes={k: list(v) for k, v in raw["shapes"].items()},
             embedding_offset=raw.get("embedding_offset"),
+            multicategorical_num_cols=raw.get("multicategorical_num_cols"),
         )
         # Lazy memmaps.
         self._mm: Dict[str, np.memmap] = {}
@@ -170,6 +187,14 @@ class TFStoreReader:
             shape = tuple(self.meta.shapes["embedding_offset"])
             dtype = _STYPE_DTYPE["embedding_offset"]
             path = os.path.join(self.root, "embedding.offset.i64")
+        elif name == "multicategorical_values":
+            shape = tuple(self.meta.shapes["multicategorical_values"])
+            dtype = _STYPE_DTYPE["multicategorical_values"]
+            path = os.path.join(self.root, "multicategorical.values.i64")
+        elif name == "multicategorical_offset":
+            shape = tuple(self.meta.shapes["multicategorical_offset"])
+            dtype = _STYPE_DTYPE["multicategorical_offset"]
+            path = os.path.join(self.root, "multicategorical.offset.i64")
         else:
             raise KeyError(name)
         mm = np.memmap(path, mode="r", shape=shape, dtype=dtype)
@@ -218,6 +243,8 @@ class TFStoreReader:
                     values=torch.from_numpy(values_arr),
                     offset=torch.from_numpy(offset_arr),
                 )
+            elif s_name == "multicategorical":
+                feat_dict[s_enum] = self._view_multicategorical(idx_np)
             else:
                 raise NotImplementedError(s_name)
 
@@ -225,4 +252,49 @@ class TFStoreReader:
             feat_dict=feat_dict,
             col_names_dict=self.meta.col_names_dict,
             num_rows=int(idx_np.shape[0]),
+        )
+
+    def _view_multicategorical(self, idx_np: np.ndarray) -> "MultiNestedTensor":
+        """Build a MultiNestedTensor slice from the memmaps.
+
+        The on-disk ``offset`` is layout-major (one entry per (row, col)
+        cell + 1), so cell ``(i, j)`` lives at
+        ``values[offset[i*num_cols + j] : offset[i*num_cols + (j+1)]]``.
+        We copy the cell slices for each requested row into a new flat
+        buffer and produce a fresh offset of length
+        ``len(idx_np) * num_cols + 1``.
+        """
+        num_cols = self.meta.multicategorical_num_cols
+        assert num_cols is not None
+        full_values = self._open("multicategorical_values")
+        full_offset = self._open("multicategorical_offset")
+        n_out = idx_np.shape[0]
+
+        # First pass: compute per-cell lengths -> new offset.
+        new_offset = np.zeros(n_out * num_cols + 1, dtype=np.int64)
+        cur = 0
+        per_cell = []  # list[(start, end)] in old values
+        for i in range(n_out):
+            row = int(idx_np[i])
+            base = row * num_cols
+            for j in range(num_cols):
+                start = int(full_offset[base + j])
+                end = int(full_offset[base + j + 1])
+                per_cell.append((start, end))
+                cur += (end - start)
+                new_offset[i * num_cols + j + 1] = cur
+
+        # Second pass: copy values.
+        new_values = np.empty(cur, dtype=full_values.dtype)
+        write = 0
+        for (s, e) in per_cell:
+            n = e - s
+            if n > 0:
+                new_values[write:write + n] = full_values[s:e]
+                write += n
+        return MultiNestedTensor(
+            num_rows=n_out,
+            num_cols=num_cols,
+            values=torch.from_numpy(new_values),
+            offset=torch.from_numpy(new_offset),
         )
