@@ -55,14 +55,17 @@ torchrun --nproc_per_node 1 main_node_ddp.py \
     > "$LOG" 2>&1 &
 TRAIN_PID=$!
 
-echo "ts,rss_mb" > "$RSS_LOG"
+echo "ts,rss_mb,vram_mb" > "$RSS_LOG"
 START=$(date +%s)
 while kill -0 "$TRAIN_PID" 2>/dev/null; do
   ts=$(($(date +%s) - START))
   # Sum RSS across the parent + any python children (DataLoader workers).
   rss_kb=$(ps -o rss= --pid "$TRAIN_PID" --ppid "$TRAIN_PID" 2>/dev/null | awk '{s+=$1} END {print s+0}')
   rss_mb=$(awk "BEGIN {printf \"%.1f\", $rss_kb/1024}")
-  echo "$ts,$rss_mb" >> "$RSS_LOG"
+  # Total VRAM used on GPU 0. nvidia-smi reports MB directly.
+  vram_mb=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' ' | head -1)
+  vram_mb=${vram_mb:-0}
+  echo "$ts,$rss_mb,$vram_mb" >> "$RSS_LOG"
   sleep 1
 done
 
@@ -76,14 +79,18 @@ import csv, statistics
 rows = list(csv.DictReader(open("results/memory_smoke/rss.csv")))
 if not rows:
     print("no samples"); raise SystemExit
-xs = [float(r["rss_mb"]) for r in rows]
-print(f"  samples:    {len(xs)}")
-print(f"  peak RSS:   {max(xs):8.1f} MB")
-print(f"  median RSS: {statistics.median(xs):8.1f} MB")
-print(f"  final RSS:  {xs[-1]:8.1f} MB")
+rss = [float(r["rss_mb"]) for r in rows]
+vram = [float(r["vram_mb"]) for r in rows]
+print(f"  samples:        {len(rows)}")
+print(f"  peak   RSS:     {max(rss):8.1f} MB")
+print(f"  median RSS:     {statistics.median(rss):8.1f} MB")
+print(f"  final  RSS:     {rss[-1]:8.1f} MB")
+print(f"  peak   VRAM:    {max(vram):8.1f} MB")
+print(f"  median VRAM:    {statistics.median(vram):8.1f} MB")
+print(f"  final  VRAM:    {vram[-1]:8.1f} MB")
 PY
 else
-  echo "  (no RSS samples collected)"
+  echo "  (no samples collected)"
 fi
 
 echo
