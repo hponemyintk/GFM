@@ -39,6 +39,60 @@ from gfm_data.shard_io import ShardWriter
 from utils import GloveTextEmbedding
 
 
+def _load_or_generate_stypes(stypes_path: Path, dataset):
+    """Load stypes.json defensively; regenerate if missing or corrupt.
+
+    See ``tools/build_tf_store.py:_load_or_generate_stypes`` for the
+    full rationale -- both tools deliberately keep the same defensive
+    loader so either one can be the first to materialize ``stypes.json``
+    on a fresh box.
+    """
+    cs = None
+    if stypes_path.exists():
+        try:
+            with open(stypes_path) as f:
+                raw = json.load(f)
+            ok = isinstance(raw, dict) and all(
+                isinstance(c2s, dict)
+                and all(isinstance(v, (str, type(None))) for v in c2s.values())
+                for c2s in raw.values()
+            )
+            if ok:
+                cs = raw
+            else:
+                print(f"[stypes] {stypes_path} has non-string entries; regenerating",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[stypes] {stypes_path} unreadable ({e}); regenerating",
+                  file=sys.stderr)
+
+    if cs is None:
+        from relbench.modeling.utils import get_stype_proposal
+        cs_raw = get_stype_proposal(dataset.get_db(upto_test_timestamp=False))
+        cs = {}
+        for tab, c2s in cs_raw.items():
+            cs[tab] = {}
+            for col, st in c2s.items():
+                if hasattr(st, "value"):
+                    cs[tab][col] = st.value
+                elif isinstance(st, str):
+                    cs[tab][col] = st
+        stypes_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stypes_path, "w") as f:
+            json.dump(cs, f, indent=2)
+
+    out = {}
+    for tab, c2s in cs.items():
+        out[tab] = {}
+        for col, st in c2s.items():
+            if isinstance(st, str):
+                try:
+                    out[tab][col] = stype(st)
+                except ValueError:
+                    pass
+    return out
+
+
 def parse_args():
     p = argparse.ArgumentParser(__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--dataset", required=True)
@@ -56,20 +110,8 @@ def load_data(args):
     dataset = get_dataset(args.dataset, download=True)
     task = get_task(args.dataset, args.task, download=True)
 
-    # Pre-generate stypes.json if missing (fresh AWS box).
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    if stypes_path.exists():
-        with open(stypes_path) as f:
-            cs = json.load(f)
-    else:
-        from relbench.modeling.utils import get_stype_proposal
-        cs = get_stype_proposal(dataset.get_db(upto_test_timestamp=False))
-        stypes_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stypes_path, "w") as f:
-            json.dump(cs, f, indent=2, default=str)
-    for tab, c2s in cs.items():
-        for col, st in c2s.items():
-            c2s[col] = stype(st) if isinstance(st, str) else st
+    cs = _load_or_generate_stypes(stypes_path, dataset)
 
     # upto_test_timestamp=False so test seed indices don't overflow the
     # entity tables. Temporal leakage is prevented at sampling time via

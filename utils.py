@@ -26,11 +26,32 @@ GLOBAL_ADJ = None
 GLOBAL_ALL_NODES = None
 
 class GloveTextEmbedding:
-        def __init__(self, device: torch.device):
-            self.model = SentenceTransformer("sentence-transformers/average_word_embeddings_glove.6B.300d", device=device)
-        
-        def __call__(self, sentences: List[str]) -> Tensor:
-            return torch.from_numpy(self.model.encode(sentences))
+    def __init__(self, device: torch.device):
+        self.model = SentenceTransformer(
+            "sentence-transformers/average_word_embeddings_glove.6B.300d",
+            device=device,
+        )
+
+    def __call__(self, sentences: List[str]) -> Tensor:
+        # Some text columns in RelBench v2 contain NaN (pandas reads
+        # missing strings as float('nan')). sentence_transformers calls
+        # .split() during tokenization, which crashes on a float --
+        # surface as 'float object has no attribute split'. Coerce
+        # missing values to "" before encoding so the model gets a
+        # clean string for every row.
+        safe = []
+        for s in sentences:
+            if s is None:
+                safe.append("")
+            elif isinstance(s, float):
+                # Catches np.nan / float('nan') / pd.NA cast to float.
+                if np.isnan(s):
+                    safe.append("")
+                else:
+                    safe.append(str(s))
+            else:
+                safe.append(str(s))
+        return torch.from_numpy(self.model.encode(safe))
 
 def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
     adjacency = {
