@@ -8,9 +8,24 @@
 #   ~8 TB local NVMe
 #
 # Trains across every BINARY_CLASSIFICATION and REGRESSION task in
-# RelBench v2 by default. To restrict to a subset of datasets:
+# RelBench v2 by default. Restrict to a dataset subset via DATASETS env.
 #
-#   DATASETS=rel-f1,rel-event ./scripts/pretrain_p4d.sh
+# Examples:
+#
+#   # Full RelBench v2, 3-day budget (~25 tasks, EPOCHS=20):
+#   STEPS_PER_TASK=1000 EPOCHS=20 ./scripts/pretrain_p4d.sh
+#
+#   # rel-f1 + rel-event only (~11 tasks, ~30h wall):
+#   DATASETS=rel-f1,rel-event STEPS_PER_TASK=1000 EPOCHS=20 \
+#       ./scripts/pretrain_p4d.sh
+#
+#   # rel-f1 + rel-event quick shake-out (~1h wall):
+#   DATASETS=rel-f1,rel-event STEPS_PER_TASK=200 EPOCHS=3 \
+#       ./scripts/pretrain_p4d.sh
+#
+#   # Single dataset:
+#   DATASETS=rel-f1 STEPS_PER_TASK=500 EPOCHS=10 \
+#       ./scripts/pretrain_p4d.sh
 #
 # Phases:
 #   0. enumerate tasks from relbench dynamically (filter to binary +
