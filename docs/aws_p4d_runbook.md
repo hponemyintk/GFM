@@ -169,3 +169,25 @@ skips already-built artifacts. If a build fails:
 3. Fix the root cause (drop `PARALLEL_SHARD_BUILDS`, delete corrupt
    stypes.json so it regenerates), then re-run the script — done
    sentinels prevent rebuilding everything.
+
+### Phase 3 OOM during dataset load
+
+If torchrun crashes with OOM-kill while still printing
+`Loading Database object from .../db...`, the cause is 8 DDP ranks all
+pickle-loading the raw RelBench DB simultaneously. Each rank holds the
+full DB pickle (~25 GiB on rel-event / rel-amazon) plus transient
+make_pkey_fkey_graph buffers; with 8 ranks this peaks past pod RAM
+even though each rank's *steady* state (after dropping tf+edge_index)
+is small.
+
+Mitigations baked in:
+- `--load_concurrency 1` (default in the launcher) serializes loads:
+  only 1 rank loads at a time, peak transient = 1× per-rank instead of
+  8×. Set `LOAD_CONCURRENCY=2` (or 4) for faster startup if you have
+  RAM headroom.
+- relbench's `Dataset.get_db` is `@lru_cache`-decorated; we
+  `cache_clear()` it after `make_pkey_fkey_graph` so the raw pickle
+  doesn't stay pinned for the rest of training.
+- Per-rank RSS is logged at `[rss r0] pre-load <ds>` and
+  `[rss r0] post-load <ds>`; grep for `\[rss` in the train log to see
+  which dataset's load is the peak.

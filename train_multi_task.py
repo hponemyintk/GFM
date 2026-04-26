@@ -87,6 +87,19 @@ def parse_tasks(spec: str) -> List[Tuple[str, str, float]]:
 
 
 # --------------------------------------------------------------- data
+def _rss_gb() -> float:
+    """Resident set size of the current process in GiB (Linux only)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    kb = int(line.split()[1])
+                    return kb / (1024.0 * 1024.0)
+    except Exception:
+        pass
+    return float("nan")
+
+
 def _load_dataset(name: str, cache_dir: str, device: str):
     """Load one dataset's HeteroData + col_stats.
 
@@ -101,6 +114,7 @@ def _load_dataset(name: str, cache_dir: str, device: str):
         filter_to_db_columns as _filter_stypes,
         load_or_generate_stypes as _load_stypes,
     )
+    import gc
     dset = get_dataset(name, download=True)
     stypes_path = Path(cache_dir) / name / "stypes.json"
     # IMPORTANT: pass upto_test_timestamp=False here. Otherwise the
@@ -122,6 +136,18 @@ def _load_dataset(name: str, cache_dir: str, device: str):
         # two layouts don't collide.
         cache_dir=f"{cache_dir}/{name}/materialized_full",
     )
+    # OOM mitigation: relbench's Dataset.get_db is decorated with
+    # @lru_cache(maxsize=None), so the raw pickle (~25 GiB on
+    # rel-event/rel-amazon) is pinned to the bound method's cache --
+    # NOT to a plain instance attribute. Clear the lru_cache to drop
+    # the strong reference, then delete the dset itself.
+    try:
+        dset.get_db.cache_clear()
+    except Exception:
+        pass
+    del db
+    del dset
+    gc.collect()
     return data, col_stats
 
 
@@ -134,10 +160,42 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
 
     caches: Dict[str, DatasetGraphCache] = {}
     col_stats_per_ds: Dict[str, dict] = {}
+
+    # OOM mitigation: stagger dataset loads across DDP ranks. With 8 GPUs
+    # all ranks would otherwise call make_pkey_fkey_graph + get_db
+    # simultaneously, peaking at 8x the per-rank transient (raw db pickle,
+    # tf tensors, text-embed buffers). After the load each rank drops
+    # tf+edge_index, so steady-state is small -- but the transient was
+    # blowing past the pod limit. Serializing into chunks of size
+    # `args.load_concurrency` (default 1) bounds peak transient memory.
+    ddp_world = dist.get_world_size() if dist.is_initialized() else 1
+    ddp_rank = dist.get_rank() if dist.is_initialized() else 0
+    chunk = max(1, int(getattr(args, "load_concurrency", 1)))
+
+    def _log_rss(tag: str, ds: str = ""):
+        # Each rank prints to its own line; tag includes rank so logs
+        # interleave readably.
+        print(f"[rss r{ddp_rank}] {tag}{(' ' + ds) if ds else ''}: "
+              f"{_rss_gb():.2f} GiB", flush=True)
+
     for ds_name in by_ds:
         if local_rank == 0:
-            print(f"[multi-task] loading dataset '{ds_name}' ...")
-        data, col_stats = _load_dataset(ds_name, args.cache_dir, device)
+            print(f"[multi-task] loading dataset '{ds_name}' ...", flush=True)
+        # Serialize: only ranks in the current "slot" load at once.
+        # Slot = ddp_rank // chunk. We barrier between slots.
+        if dist.is_initialized() and ddp_world > chunk:
+            for slot in range(0, ddp_world, chunk):
+                if slot <= ddp_rank < slot + chunk:
+                    _log_rss("pre-load", ds_name)
+                    data, col_stats = _load_dataset(
+                        ds_name, args.cache_dir, device,
+                    )
+                    _log_rss("post-load", ds_name)
+                dist.barrier()
+        else:
+            _log_rss("pre-load", ds_name)
+            data, col_stats = _load_dataset(ds_name, args.cache_dir, device)
+            _log_rss("post-load", ds_name)
         cache_root = (
             os.path.join(args.tf_store_dir, ds_name)
             if args.tf_store_dir else None

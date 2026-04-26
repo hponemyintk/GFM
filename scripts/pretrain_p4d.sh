@@ -440,6 +440,11 @@ else
 fi
 
 LOG="$OUT_DIR/train.log"
+# OOM mitigation: how many DDP ranks may pickle-load + materialize a
+# dataset simultaneously. Default 1 = strict serialization (slowest
+# startup, lowest peak RAM). Bump to 2 or 4 if pod has headroom.
+LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-1}"
+
 torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --tasks "$TASKS_CSV" \
     --mode precomputed_shards \
@@ -459,6 +464,7 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --lr "$LR" \
     --warmup_steps "$WARMUP" \
     --loss_balance "$LOSS_BALANCE" \
+    --load_concurrency "$LOAD_CONCURRENCY" \
     --out_dir "$OUT_DIR" \
     --run_name "$RUN_NAME" \
     2>&1 | tee "$LOG"

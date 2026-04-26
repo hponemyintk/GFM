@@ -136,6 +136,16 @@ parser.add_argument(
     help="Multi-task loss aggregation: 'none' (RT batch-mean, default), "
          "'per_task_mean', 'fixed:w1,w2,...', or 'uncertainty'.",
 )
+parser.add_argument(
+    "--load_concurrency",
+    type=int,
+    default=1,
+    help="Phase-3 OOM mitigation: how many DDP ranks may load a dataset "
+         "simultaneously (via make_pkey_fkey_graph + get_db). Default 1 "
+         "serializes loads across the 8 GPUs so peak transient RAM is "
+         "bounded by one rank's load instead of WORLD_SIZE x. Bump to 2-4 "
+         "for faster startup if pod RAM headroom allows.",
+)
 
 args = parser.parse_args()
 MULTI_TASK = args.tasks is not None
@@ -204,21 +214,49 @@ except FileNotFoundError:
 # upto_test_timestamp=False so entity tables contain all rows the
 # test seeds reference. Temporal leakage is enforced at sampling
 # time (per-row seed_time filter), not via materialization cutoff.
-_db = dataset.get_db(upto_test_timestamp=False)
-# Drop stype entries for columns the active task strips for leakage
-# prevention (e.g., results-position removes 'position' / 'statusId'
-# / 'points' from results.df). Without this the torch_frame
-# Dataset.__init__ inside make_pkey_fkey_graph raises ValueError.
 from gfm_data.stypes import filter_to_db_columns as _filter_stypes
-col_to_stype_dict = _filter_stypes(col_to_stype_dict, _db)
-data, col_stats_dict = make_pkey_fkey_graph(
-    _db,
-    col_to_stype_dict=col_to_stype_dict,
-    text_embedder_cfg=TextEmbedderConfig(
-        text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256
-    ),
-    cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
-)
+
+# OOM mitigation: serialize get_db + make_pkey_fkey_graph across ranks
+# (chunks of args.load_concurrency, default 1). Otherwise 8 GPUs all
+# pickle-load the raw DB simultaneously and peak past pod RAM.
+_world = dist.get_world_size() if dist.is_initialized() else 1
+_rank = dist.get_rank() if dist.is_initialized() else 0
+_chunk = max(1, int(args.load_concurrency))
+
+
+def _do_load_db_and_graph():
+    db_local = dataset.get_db(upto_test_timestamp=False)
+    cs_local = _filter_stypes(col_to_stype_dict, db_local)
+    d_local, cs_dict_local = make_pkey_fkey_graph(
+        db_local,
+        col_to_stype_dict=cs_local,
+        text_embedder_cfg=TextEmbedderConfig(
+            text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"),
+            batch_size=256,
+        ),
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
+    )
+    return db_local, d_local, cs_dict_local
+
+
+if dist.is_initialized() and _world > _chunk:
+    for _slot in range(0, _world, _chunk):
+        if _slot <= _rank < _slot + _chunk:
+            _db, data, col_stats_dict = _do_load_db_and_graph()
+        dist.barrier()
+else:
+    _db, data, col_stats_dict = _do_load_db_and_graph()
+# OOM mitigation (single-task DDP path): relbench's Dataset.get_db is
+# @lru_cache(maxsize=None), so the raw pickle (~25 GiB on rel-event /
+# rel-amazon) is pinned to the bound-method cache, not an instance attr.
+# Clear the cache to release the reference now that we have HeteroData.
+try:
+    dataset.get_db.cache_clear()
+except Exception:
+    pass
+del _db
+import gc as _gc_db
+_gc_db.collect()
 
 # Build the CSR graph cache once for this dataset; the three splits share it.
 graph_cache = DatasetGraphCache(
