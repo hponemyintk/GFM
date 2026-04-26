@@ -169,23 +169,40 @@ Flat VRAM across 41 samples confirms training does not leak GPU memory across st
 # Knobs: K, BATCH, CHANNELS, HEADS, EPOCHS, MAX_STEPS, MAX_ROWS_TRAIN, LOSS_BALANCE
 ```
 
-### Laptop run results — 5 rel-f1 tasks (channels=64, K=32, batch=32, 5 epochs × 300 steps)
+### Laptop run results — 5 rel-f1 tasks (channels=64, K=32, batch=32)
+
+**30-epoch run** with best-macro checkpointing (test metrics on the epoch-8 checkpoint, where best macro=0.486 was hit):
 
 ```json
 "test_metrics": {
-  "driver-position":     {"r2":  0.046, "mae": 4.16, "rmse": 5.09},
-  "driver-dnf":          {"roc_auc": 0.250, "ap": 0.588, "acc": 0.70, "f1": 0.83},
-  "driver-top3":         {"roc_auc": 0.834, "ap": 0.416, "acc": 0.18, "f1": 0.30},
-  "results-position":    {"r2":  0.969, "mae": 0.61, "rmse": 0.94},
-  "qualifying-position": {"r2":  0.850, "mae": 2.22, "rmse": 2.41}
+  "driver-position":     {"r2":  0.174, "mae": 3.88, "rmse": 4.74},
+  "driver-dnf":          {"roc_auc": 0.224, "ap": 0.580, "acc": 0.27, "f1": 0.36},
+  "driver-top3":         {"roc_auc": 0.862, "ap": 0.453, "acc": 0.74, "f1": 0.56},
+  "results-position":    {"r2":  0.877, "mae": 1.74, "rmse": 1.88},
+  "qualifying-position": {"r2":  0.987, "mae": 0.52, "rmse": 0.72}
 }
+"best_epoch": 8, "best_val_macro": 0.486
 ```
 
-Highlights and known issues:
-* **driver-top3 AUROC 0.834** beats the PR2 single-task baseline (0.786) — multi-task transfer is real.
-* **results-position r²=0.97 / qualifying-position r²=0.85** — z-score regression target normalization + Huber working well.
-* **driver-dnf AUROC 0.250** is anti-correlated. The model is confidently predicting the wrong class. Likely a label-sign bug specific to this task — worth tracing through `task.evaluate` vs the per-row label our pipeline feeds into BCE. Does NOT affect the other tasks.
-* Test metrics are taken from the **last-epoch** model. Per-task best epochs are scattered across the run (multi-task interference oscillation under `--loss_balance none`); adding best-val-per-task checkpointing is an obvious follow-up.
+For comparison, the earlier 5-epoch run (last-epoch model, no best-macro):
+`driver-top3=0.834, results-position r²=0.97, qualifying-position r²=0.85`.
+
+**Highlights:**
+* **driver-top3 AUROC 0.862** vs PR2 single-task 0.786 — clear multi-task transfer (+7.6 pts).
+* **qualifying-position r²=0.987, MAE=0.52** — essentially solved.
+* **results-position r²=0.877** — solid, slightly worse than 5-epoch run because best-macro epoch 8 wasn't this task's best epoch.
+
+**Known issues / follow-ups uncovered by the 30-epoch run:**
+
+1. **`driver-dnf` AUROC 0.224 — two stacked causes**:
+   * **Temporal distribution shift in the data**: train is 88% DNF, val 78%, test much lower (post-2000 era car reliability). The model picks up era-correlated features and they generalize wrong to test era.
+   * **Shared boolean head structurally conflicts with `driver-top3`**: my `MultiTaskHead` puts a single `Linear(64, 1)` between the backbone embedding and ALL binary tasks. Across 30 epochs the two tasks **oscillate in opposition** (epoch 8: top3=0.829 / dnf=0.328; epoch 12: top3=0.247 / dnf=0.639; epoch 28: top3=0.218 / dnf=0.764). This is the head ping-ponging between two solutions because the two tasks demand opposite signs along the same decision direction.
+
+   *Fix*: replace the shared per-datatype head with **per-task heads** (one `Linear(channels, 1)` per task). Same conceptual model, just doesn't force binary tasks to compete for one decision boundary. RT paper does this implicitly via masked-cell prediction.
+
+2. **Multi-task interference oscillation under `--loss_balance none`**: per-task best-val epochs are spread across 1, 8, 12, 28 etc. — best-macro picks one balanced epoch but no single epoch is each task's individual best. Per-task heads (above) would dampen this for binary tasks. For regression tasks, `--loss_balance per_task_mean` or `uncertainty` is the next lever.
+
+3. **Best-macro checkpointing** (landed in PR4.1 / commit below) saves the highest-macro state-dict in memory each epoch and loads it before test eval. The 30-epoch run uses this; the prior 5-epoch run used last-epoch model only. Macro = mean of per-task scores where score = AUROC for binary, 1/(1+MAE) for regression.
 
 ### Important fix landed during this run
 

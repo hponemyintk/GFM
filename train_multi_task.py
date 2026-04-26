@@ -283,6 +283,31 @@ def _gpu_stats(handle, device):
         torch.cuda.memory_reserved(device) / 1024**2
 
 
+def _macro_score(per_task_metrics: Dict[int, dict], task_objs: List["EntityTask"]) -> float:
+    """Average a per-task val metric to a comparable scalar.
+
+    Returns the macro-mean over tasks, where each task contributes:
+      - AUROC (already in (0, 1], higher = better) for binary classification
+      - 1/(1+MAE) (in (0, 1], higher = better) for regression
+    Tasks with naturally easier MAE will dominate the regression term;
+    that is acceptable here since the alternative -- trying to compute
+    a 'normalized' MAE on z-score scale -- requires extra plumbing and
+    macro-best-epoch selection is robust to scale at the relative
+    ranking level.
+    """
+    scores = []
+    for ti, m in per_task_metrics.items():
+        tt = task_objs[ti].task_type
+        if tt == TaskType.BINARY_CLASSIFICATION:
+            s = float(m["roc_auc"])
+        elif tt == TaskType.REGRESSION:
+            s = 1.0 / (1.0 + float(m["mae"]))
+        else:
+            continue
+        scores.append(s)
+    return sum(scores) / len(scores) if scores else float("-inf")
+
+
 def run(args, local_rank: int, device, gpu_handle):
     tasks_spec = parse_tasks(args.tasks)
     if local_rank == 0:
@@ -480,6 +505,18 @@ def run(args, local_rank: int, device, gpu_handle):
         return per_task_metrics
 
     if args.train_stage == "finetune":
+        # Best-macro checkpointing. Each epoch we score per-task val
+        # metric on a comparable scale (AUROC for binary, 1/(1+MAE) for
+        # regression -- both in (0, 1], higher is better) and average.
+        # The single checkpoint at the best-macro epoch is loaded before
+        # the final test eval. This is the standard single-model
+        # multi-task convention (T5 / RT pretraining); per-task fine-
+        # tuning would beat it but needs a separate run per task.
+        best_macro = -math.inf
+        best_state = None
+        best_epoch = 0
+        per_epoch_macro: Dict[int, float] = {}
+
         for epoch in range(1, args.epochs + 1):
             tr_loss = _train_epoch(epoch)
             dist.barrier()
@@ -488,19 +525,43 @@ def run(args, local_rank: int, device, gpu_handle):
                 print(f"Epoch {epoch:02d} train_loss={tr_loss:.4f}")
                 for ti, m in val_metrics.items():
                     print(f"  val[{task_names[ti]}]: {m}")
+                macro = _macro_score(val_metrics, task_objs)
+                per_epoch_macro[epoch] = macro
                 wandb.log({"epoch": epoch, "epoch_train_loss": tr_loss,
+                           "val_macro": macro,
                            **{f"val_{task_names[ti]}_{k}": float(v)
                               for ti, m in val_metrics.items()
                               for k, v in m.items()}})
+                if macro > best_macro:
+                    best_macro = macro
+                    best_epoch = epoch
+                    best_state = copy.deepcopy(model.module.state_dict())
+                    print(f"  [best] macro={macro:.4f} @ epoch {epoch}; checkpoint cached in memory")
+                else:
+                    print(f"  macro={macro:.4f} (best={best_macro:.4f} @ epoch {best_epoch})")
             dist.barrier()
 
-        # Final test
+        # Load best-macro checkpoint on rank 0, broadcast to all ranks.
+        if local_rank == 0 and best_state is not None:
+            print(f"\nLoading best-macro checkpoint (epoch {best_epoch}, macro={best_macro:.4f}) "
+                  f"before test eval.")
+            model.module.load_state_dict(best_state)
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0)
+        for buf in model.buffers():
+            dist.broadcast(buf.data, src=0)
+        dist.barrier()
+
+        # Final test on the loaded best-macro model.
         test_metrics = _eval(loader_test, "test", 0)
         if local_rank == 0:
             print("=== test ===")
             for ti, m in test_metrics.items():
                 print(f"  test[{task_names[ti]}]: {m}")
             with open(os.path.join(output_path, f"{args.seed}.json"), "w") as f:
-                json.dump({"test_metrics": {task_names[ti]: m
-                                            for ti, m in test_metrics.items()}},
-                          f, indent=2)
+                json.dump({
+                    "test_metrics": {task_names[ti]: m for ti, m in test_metrics.items()},
+                    "best_epoch": int(best_epoch),
+                    "best_val_macro": float(best_macro),
+                    "per_epoch_macro": {str(k): float(v) for k, v in per_epoch_macro.items()},
+                }, f, indent=2)
