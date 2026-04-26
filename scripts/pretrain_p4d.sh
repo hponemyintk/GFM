@@ -592,9 +592,16 @@ TAIL_PID=$!
                 echo "[watchdog] (avoids kubelet OOMKilled which would truncate this log)"
                 echo "================================================================"
             } >> "$LOG"
-            # SIGTERM the torchrun process group; python's signal handler
-            # (or default) will exit cleanly enough to flush stdout/stderr.
-            kill -TERM -"$TORCHRUN_PID" 2>/dev/null || kill -TERM "$TORCHRUN_PID" 2>/dev/null
+            # SIGTERM torchrun's process group + child tree. We try
+            # three reach-mechanisms in order so that older bash
+            # versions where ``set -m`` doesn't put the bg job in a
+            # new pgid still get every DataLoader worker reaped:
+            #   1. ``kill -TERM -PID`` (negative = pgid signal).
+            #   2. ``pkill -TERM -P PID`` (every direct child by ppid).
+            #   3. ``kill -TERM PID`` (the torchrun launcher itself).
+            kill -TERM -"$TORCHRUN_PID" 2>/dev/null || true
+            pkill -TERM -P "$TORCHRUN_PID" 2>/dev/null || true
+            kill -TERM "$TORCHRUN_PID" 2>/dev/null || true
             # Give python 30s to flush + cleanup, then escalate.
             for _ in $(seq 1 30); do
                 kill -0 "$TORCHRUN_PID" 2>/dev/null || break
@@ -602,7 +609,9 @@ TAIL_PID=$!
             done
             if kill -0 "$TORCHRUN_PID" 2>/dev/null; then
                 echo "[watchdog] grace expired; SIGKILL" >> "$LOG"
-                kill -KILL -"$TORCHRUN_PID" 2>/dev/null || kill -KILL "$TORCHRUN_PID" 2>/dev/null
+                kill -KILL -"$TORCHRUN_PID" 2>/dev/null || true
+                pkill -KILL -P "$TORCHRUN_PID" 2>/dev/null || true
+                kill -KILL "$TORCHRUN_PID" 2>/dev/null || true
             fi
             exit 0
         fi

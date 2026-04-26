@@ -57,7 +57,16 @@ def _load_release_fn():
     body = after if end_rel < 0 else after[:end_rel]
     body = textwrap.dedent(body)
     # Stub helpers the function references.
-    ns: dict = {"_rss_gb": lambda: 0.0}
+    class _FakeDist:
+        @staticmethod
+        def is_initialized() -> bool:  # tests run without a process group
+            return False
+
+        @staticmethod
+        def barrier() -> None:
+            pass
+
+    ns: dict = {"_rss_gb": lambda: 0.0, "dist": _FakeDist}
     exec(body, ns)
     return ns["_release_cache_data"]
 

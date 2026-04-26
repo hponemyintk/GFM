@@ -392,6 +392,14 @@ def _release_cache_data(args, caches, task_tokens, local_rank: int) -> None:
         )
         print(f"[rss r{local_rank}] post-release: {_rss_gb():.2f} GiB",
               flush=True)
+    # Align ranks before the next DDP collective. ``gc.collect()`` is
+    # synchronous and can take several seconds on a heap that just
+    # held multi-GiB HeteroData refs; without an explicit barrier the
+    # slowest rank could lag into DDP init's first all_reduce while
+    # faster ranks have already started, eating into NCCL's 30-min
+    # timeout for no good reason. Cheap insurance.
+    if dist.is_initialized():
+        dist.barrier()
 
 
 # --------------------------------------------------------- model build
