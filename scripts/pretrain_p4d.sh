@@ -69,7 +69,14 @@
 #   CENTROIDS                (default 4096)
 #   EPOCHS                   (default 30)
 #   MAX_STEPS                steps/epoch (default 3000)
-#   WORKERS                  DataLoader workers per rank (default 4)
+#   WORKERS                  DataLoader workers per rank (default 2).
+#                            Each worker is a forked Python process;
+#                            CPython ref-counting breaks COW so each
+#                            fork's anon RSS grows toward parent-rank
+#                            size. With 8 ranks * 2 workers = 16 forks
+#                            (vs 32 at the old default of 4) we cut
+#                            anon overhead in half. Bump only if I/O
+#                            is the bottleneck and you have RAM.
 #   LR                       base lr (default 1e-4; multiplied by world_size)
 #   WARMUP                   warmup steps (default 1000)
 #   LOSS_BALANCE             none|per_task_mean|fixed:..|uncertainty
@@ -147,7 +154,7 @@ EPOCHS="${EPOCHS:-10}"
 #
 # Auto-computed below. Override MAX_STEPS directly to bypass the auto.
 STEPS_PER_TASK="${STEPS_PER_TASK:-500}"
-WORKERS="${WORKERS:-4}"
+WORKERS="${WORKERS:-2}"
 LR="${LR:-1e-4}"
 WARMUP="${WARMUP:-1000}"
 LOSS_BALANCE="${LOSS_BALANCE:-none}"

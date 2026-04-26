@@ -200,7 +200,20 @@ Mitigations baked in:
   break COW). It is only used by the streaming sampler's fallback
   path; ``--mode precomputed_shards`` (the launcher default) never
   touches it.
-- **Memory watchdog**: the launcher samples cgroup `memory.current`
+- **`cache.data` released after `_build_model`**: in shards+tf_store
+  mode no remaining code path reads `cache.data` or `TaskTokens.data`,
+  but both objects keep the full `HeteroData` alive (per-type `time`
+  tensors are int64-per-node, multi-GiB on rel-event). Without this
+  drop, every DataLoader worker fork inherits the references and
+  COW-duplicates them on first ref-count write. The release happens
+  *before* the model is wrapped in DDP / DataLoader is constructed,
+  so workers fork with minimal anon memory.
+- **`WORKERS` default lowered from 4 to 2**: each DataLoader worker
+  is a forked Python process; CPython ref-counting breaks COW so each
+  fork's anon RSS grows toward parent-rank size. With 8 ranks * 2
+  workers = 16 forks (vs 32 at the old default of 4) we cut the
+  anon-memory multiplier in half.
+- **Memory watchdog**: the launcher samples cgroup `memory.stat`
   (v2) or `memory.usage_in_bytes` (v1) every 3s. When usage exceeds
   `MEM_WATCHDOG_PCT` (default 92%) of the cgroup limit, it SIGTERMs
   torchrun's process group and gives python 30s to flush before

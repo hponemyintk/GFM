@@ -17,6 +17,8 @@ _HEAVY_MODULES = [
     "sentence_transformers",
     "relbench",
     "relbench.base",
+    "relbench.datasets",
+    "relbench.tasks",
     "relbench.modeling",
     "relbench.modeling.graph",
     "relbench.modeling.utils",

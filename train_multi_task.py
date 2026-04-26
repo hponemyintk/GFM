@@ -347,6 +347,53 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
     return caches, concats, task_objs, task_names, col_stats_per_ds, task_tokens
 
 
+def _release_cache_data(args, caches, task_tokens, local_rank: int) -> None:
+    """Free per-cache HeteroData refs after _build_model.
+
+    OOM mitigation (final pass): in shards+tf_store mode no remaining
+    code path reads ``cache.data``. The HeteroData object still holds
+    per-type ``time`` tensors (int64 per node -- up to several GiB on
+    rel-event), per-type ``x`` if any, and stale edge metadata. All
+    of this gets COW-duplicated on every DataLoader worker fork
+    (CPython ref-count writes break COW). Drop the reference now so
+    the workers fork with minimal anon memory.
+
+    Conditions for the drop to be safe:
+      * args.mode in {precomputed_shards, hdf5}: streaming mode
+        calls cache.data inside the per-batch sampler.
+      * args.tf_store_dir set: cache.tf_view falls back to
+        ``data[type].tf`` only when tf_store_root is None.
+    Must be called AFTER _build_model -- _build_model has a fallback
+    path that reads cache.data when ``_captured_col_names_dict`` is
+    missing a prefix (test paths only; the multi-task flow always
+    captures, but the fallback would crash if data is None).
+    """
+    if (
+        args.mode not in ("precomputed_shards", "hdf5")
+        or args.tf_store_dir is None
+    ):
+        return
+    import gc as _gc_final
+    for ds_name, cache in caches.items():
+        cache.data = None
+    # TaskTokens.data captured a reference to HeteroData at __init__
+    # ("exposed for back-compat with main_node_ddp.py"); even with
+    # cache.data nulled, those copies keep the HeteroData alive (and
+    # COW-duplicated on every worker fork). Null them too.
+    for split_toks in task_tokens.values():
+        for tok in split_toks:
+            tok.data = None
+    _gc_final.collect()
+    if local_rank == 0:
+        print(
+            f"[multi-task] released cache.data on {len(caches)} caches "
+            f"(shards mode + tf_store_dir; HeteroData no longer needed)",
+            flush=True,
+        )
+        print(f"[rss r{local_rank}] post-release: {_rss_gb():.2f} GiB",
+              flush=True)
+
+
 # --------------------------------------------------------- model build
 def _build_model(args, caches, col_stats_per_ds, type_to_index, num_nodes_total, device):
     """Build RelGT(out_channels=channels) so its output is an embedding."""
@@ -474,6 +521,15 @@ def run(args, local_rank: int, device, gpu_handle):
     # Model + heads.
     model = _build_model(args, caches, col_stats_per_ds, type_to_index,
                          num_nodes_total, device)
+    # OOM mitigation: free cache.data NOW that _build_model has read
+    # what it needs. Workers fork from the parent rank below; if we
+    # don't drop here, every fork inherits per-type time tensors and
+    # stale HeteroData metadata that COW-duplicates on first ref-count
+    # write (Python objects in workers can't COW-share long).
+    _release_cache_data(args, caches, task_tokens, local_rank)
+    # col_stats_per_ds is no longer needed -- _build_model copied what
+    # it needed into the backbone. Free it pre-fork too.
+    col_stats_per_ds.clear()
     for n, p in model.named_parameters():
         if p.dtype == torch.int16:
             p.data = p.data.to(torch.int64)
