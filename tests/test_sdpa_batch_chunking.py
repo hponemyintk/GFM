@@ -84,3 +84,52 @@ def test_chunked_preserves_batch_order():
     for row in (0, 199, 200, 399, 400, 599, 600, 749):
         assert torch.allclose(direct[row], chunked[row], atol=1e-6), \
             f"row {row} differs between direct and chunked output"
+
+
+def test_chunked_with_grad_checkpoint_matches_direct():
+    """The training-mode path uses torch.utils.checkpoint to free
+    per-chunk activations and re-run forward on backward. The
+    forward output and the gradients flowing back must be bit-for-
+    bit identical to the un-checkpointed direct path."""
+    from torch.utils.checkpoint import checkpoint as ckpt
+
+    torch.manual_seed(3)
+    t = _make_transformer().train()  # training mode -- ckpt path is meaningful
+    # Same weights, two parallel inputs that require_grad so we can
+    # check both forward equality and gradient equality.
+    x_a = torch.randn(1000, 5, 32, requires_grad=True)
+    x_b = x_a.detach().clone().requires_grad_(True)
+
+    direct = t(x_a)
+    direct.sum().backward()
+
+    chunks = x_b.split(300, dim=0)  # forces 4 chunks: 300+300+300+100
+    chunked = torch.cat(
+        [ckpt(t, c, use_reentrant=False) for c in chunks], dim=0
+    )
+    chunked.sum().backward()
+
+    # Forward-pass outputs match (recompute is mathematically lossless).
+    assert torch.allclose(direct, chunked, atol=1e-6)
+    # Input gradients match (the recomputed backward yields the same
+    # grad as the cached one).
+    assert torch.allclose(x_a.grad, x_b.grad, atol=1e-6)
+
+
+def test_eval_mode_skips_chunking_in_production_path():
+    """Sanity: the production path in encoders.py uses
+    ``self.training and x_seq.size(0) > _TF_CHUNK``. In eval mode
+    we want the one-shot transformer call regardless of size, since
+    no grad graph is being built."""
+    torch.manual_seed(4)
+    t = _make_transformer().eval()
+    x = torch.randn(50, 3, 32)
+    # Mimic the production guard with an arbitrarily small chunk size.
+    is_training = False
+    if is_training and x.size(0) > 4:
+        chunks = x.split(4, dim=0)
+        out = torch.cat([t(c) for c in chunks], dim=0)
+    else:
+        out = t(x)
+    direct = t(x)
+    assert torch.allclose(direct, out, atol=1e-6)

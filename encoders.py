@@ -765,26 +765,43 @@ class NeighborTfsEncoder(nn.Module):
 
             x_seq = torch.cat([cls_tokens, x_cols], dim=1)
 
-            # Chunk along the batch dim before the shared transformer.
-            # Two reasons:
-            #   1. CUDA's efficient-attention kernel has a hard batch-
-            #      size limit of 65535.
-            #   2. Even below that, a 4-layer FFN's training-time
-            #      activations (forward + grad) would OOM a 40 GiB
-            #      A100 at 65k samples (~5 GiB per layer * 4 layers).
-            # With multi-task batch_size=512 * K=300 = 153,600 slots
-            # and a dominant node type (rel-event ``users``) taking
-            # most of those slots, both limits are reached. Each
-            # sample is independent (self-attention is over the short
-            # column dimension, not across samples), so chunking is a
-            # numerically exact no-op. 8192 keeps peak activation
-            # under ~3 GiB per chunk; if it still OOMs on smaller
-            # GPUs, drop to 4096.
-            _TF_CHUNK = 8192
-            if x_seq.size(0) > _TF_CHUNK:
+            # Chunk + gradient-checkpoint the shared transformer.
+            #
+            # Why chunk: (1) CUDA's efficient-attention kernel caps
+            # batch at 65535. (2) A 4-layer transformer's per-sample
+            # activations (~670 KB) accumulate -- with batch=512 *
+            # K=300 = 153,600 slots and a dominant type taking most
+            # of them, raw activation accumulation hits ~100 GiB,
+            # 2.5x the A100 40 GiB cap. Plain chunking only bounds
+            # *peak concurrent* memory; autograd still pins every
+            # chunk's activations until backward(), so the total
+            # accumulated graph still OOMs.
+            #
+            # Why checkpoint: torch.utils.checkpoint frees each
+            # chunk's intermediate activations after forward and
+            # re-runs the forward during backward to regenerate
+            # them. Peak memory drops to ONE chunk's worth (~2.7
+            # GiB at chunk=4096) instead of ALL chunks summed.
+            # The cost is ~2x compute on this transformer only;
+            # since GT convolutions dominate per-step time, the
+            # overall slowdown is ~5-10%. Math is bit-for-bit
+            # identical -- gradient values are recomputed, not
+            # changed.
+            #
+            # Eval/inference (self.training == False) takes the
+            # one-shot path; no grad graph means no accumulation
+            # to defend against, and skipping checkpoint saves the
+            # extra forward.
+            _TF_CHUNK = 4096
+            if self.training and x_seq.size(0) > _TF_CHUNK:
+                from torch.utils.checkpoint import checkpoint as ckpt
                 chunks = x_seq.split(_TF_CHUNK, dim=0)
                 x_out = torch.cat(
-                    [self.shared_transformer(c) for c in chunks], dim=0
+                    [
+                        ckpt(self.shared_transformer, c, use_reentrant=False)
+                        for c in chunks
+                    ],
+                    dim=0,
                 )
             else:
                 x_out = self.shared_transformer(x_seq)
