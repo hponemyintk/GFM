@@ -96,6 +96,18 @@
 #                            and truncates train.log mid-write, but the
 #                            watchdog gives python 30s to flush.
 #   MEM_WATCHDOG_INTERVAL    Watchdog poll interval in seconds (default 3)
+#   SKIP_BUILD               Skip phases 1 and 2 entirely; jump straight
+#                            to phase 3 training. Use when TF stores
+#                            and shards already exist on disk and you
+#                            only want to re-run training (e.g., after
+#                            a code change in the model / encoders).
+#                            The launcher still verifies the per-
+#                            dataset / per-task .done sentinels exist
+#                            and aborts early if they don't, so a
+#                            partial build won't silently break phase 3.
+#                            (Equivalent: SKIP_PHASE_1=1 SKIP_PHASE_2=1)
+#   SKIP_PHASE_1             Skip phase 1 (TF memmap build) only.
+#   SKIP_PHASE_2             Skip phase 2 (sample shard build) only.
 #
 # Why these defaults will NOT OOM on p4d.24xlarge:
 #
@@ -362,26 +374,38 @@ prune_pids() {
 # ------------------------------------------------------------------
 # Phase 1: TF memmap stores (parallel, GPU-pinned per dataset)
 # ------------------------------------------------------------------
-# Clamp phase-1 concurrency to the physical GPU count so we never set
-# CUDA_VISIBLE_DEVICES to a non-existent device.
-P1_CONCURRENCY=$(( PARALLEL_TF_BUILDS < NPROC ? PARALLEL_TF_BUILDS : NPROC ))
-echo "[1/3] Building TF memmap stores ($P1_CONCURRENCY concurrent, one GPU each)"
-declare -a P1_PIDS=()
-P1_IDX=0
-for ds in "${DATASETS_SELECTED[@]}"; do
-    while [ ${#P1_PIDS[@]} -ge "$P1_CONCURRENCY" ]; do
-        wait -n 2>/dev/null || true
-        prune_pids P1_PIDS
+# SKIP_BUILD or SKIP_PHASE_1 jumps straight past the build loop and
+# only verifies the per-dataset .done sentinels. Phase 3 needs the
+# memmap files to exist; aborting early here is much friendlier than
+# letting torchrun crash with a cryptic FileNotFoundError later.
+SKIP_PHASE_1="${SKIP_PHASE_1:-${SKIP_BUILD:-0}}"
+SKIP_PHASE_2="${SKIP_PHASE_2:-${SKIP_BUILD:-0}}"
+
+if [ "$SKIP_PHASE_1" = "1" ]; then
+    echo "[1/3] SKIP_PHASE_1=1 -- skipping TF memmap build (verifying .done sentinels)"
+else
+    # Clamp phase-1 concurrency to the physical GPU count so we never set
+    # CUDA_VISIBLE_DEVICES to a non-existent device.
+    P1_CONCURRENCY=$(( PARALLEL_TF_BUILDS < NPROC ? PARALLEL_TF_BUILDS : NPROC ))
+    echo "[1/3] Building TF memmap stores ($P1_CONCURRENCY concurrent, one GPU each)"
+    declare -a P1_PIDS=()
+    P1_IDX=0
+    for ds in "${DATASETS_SELECTED[@]}"; do
+        while [ ${#P1_PIDS[@]} -ge "$P1_CONCURRENCY" ]; do
+            wait -n 2>/dev/null || true
+            prune_pids P1_PIDS
+        done
+        GPU_ID=$(( P1_IDX % P1_CONCURRENCY ))
+        phase1_build_one "$ds" "$GPU_ID" &
+        P1_PIDS+=("$!")
+        P1_IDX=$(( P1_IDX + 1 ))
     done
-    GPU_ID=$(( P1_IDX % P1_CONCURRENCY ))
-    phase1_build_one "$ds" "$GPU_ID" &
-    P1_PIDS+=("$!")
-    P1_IDX=$(( P1_IDX + 1 ))
-done
-wait
+    wait
+fi
 
 # Verify phase 1 outputs exist before moving on -- a silent build
-# failure would otherwise propagate into phase 2 and torchrun.
+# failure (or a SKIP_PHASE_1 with missing artifacts) would otherwise
+# propagate into phase 2 and torchrun.
 P1_MISSING=()
 for ds in "${DATASETS_SELECTED[@]}"; do
     if [ ! -f "$TF_STORE/$ds/.done" ]; then
@@ -389,8 +413,14 @@ for ds in "${DATASETS_SELECTED[@]}"; do
     fi
 done
 if [ ${#P1_MISSING[@]} -gt 0 ]; then
-    echo "ERROR: phase 1 failed to produce TF stores for: ${P1_MISSING[*]}" >&2
-    echo "  see $OUT_DIR/build_tf_*.log for details" >&2
+    if [ "$SKIP_PHASE_1" = "1" ]; then
+        echo "ERROR: SKIP_PHASE_1=1 but TF stores are missing for: ${P1_MISSING[*]}" >&2
+        echo "  rerun without SKIP_PHASE_1 / SKIP_BUILD to build them, or" >&2
+        echo "  check that TF_STORE=$TF_STORE points at the right location" >&2
+    else
+        echo "ERROR: phase 1 failed to produce TF stores for: ${P1_MISSING[*]}" >&2
+        echo "  see $OUT_DIR/build_tf_*.log for details" >&2
+    fi
     exit 2
 fi
 echo
@@ -398,18 +428,22 @@ echo
 # ------------------------------------------------------------------
 # Phase 2: precomputed sample shards (parallel, CPU-only)
 # ------------------------------------------------------------------
-echo "[2/3] Building precomputed sample shards ($PARALLEL_SHARD_BUILDS "\
+if [ "$SKIP_PHASE_2" = "1" ]; then
+    echo "[2/3] SKIP_PHASE_2=1 -- skipping shard build (verifying .done sentinels)"
+else
+    echo "[2/3] Building precomputed sample shards ($PARALLEL_SHARD_BUILDS "\
 "concurrent, K=$K, shard=$SHARD_SIZE)"
-declare -a P2_PIDS=()
-for spec in "${TASKS[@]}"; do
-    while [ ${#P2_PIDS[@]} -ge "$PARALLEL_SHARD_BUILDS" ]; do
-        wait -n 2>/dev/null || true
-        prune_pids P2_PIDS
+    declare -a P2_PIDS=()
+    for spec in "${TASKS[@]}"; do
+        while [ ${#P2_PIDS[@]} -ge "$PARALLEL_SHARD_BUILDS" ]; do
+            wait -n 2>/dev/null || true
+            prune_pids P2_PIDS
+        done
+        phase2_build_one "$spec" &
+        P2_PIDS+=("$!")
     done
-    phase2_build_one "$spec" &
-    P2_PIDS+=("$!")
-done
-wait
+    wait
+fi
 
 # Verify phase 2 outputs exist before launching the training run.
 P2_MISSING=()
@@ -422,8 +456,14 @@ for spec in "${TASKS[@]}"; do
     fi
 done
 if [ ${#P2_MISSING[@]} -gt 0 ]; then
-    echo "ERROR: phase 2 failed to produce shards for: ${P2_MISSING[*]}" >&2
-    echo "  see $OUT_DIR/build_shard_*.log for details" >&2
+    if [ "$SKIP_PHASE_2" = "1" ]; then
+        echo "ERROR: SKIP_PHASE_2=1 but shards are missing for: ${P2_MISSING[*]}" >&2
+        echo "  rerun without SKIP_PHASE_2 / SKIP_BUILD to build them, or" >&2
+        echo "  check that SHARDS=$SHARDS points at the right location" >&2
+    else
+        echo "ERROR: phase 2 failed to produce shards for: ${P2_MISSING[*]}" >&2
+        echo "  see $OUT_DIR/build_shard_*.log for details" >&2
+    fi
     exit 3
 fi
 echo
