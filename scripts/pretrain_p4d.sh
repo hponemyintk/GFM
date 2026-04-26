@@ -424,6 +424,22 @@ echo
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_SILENT="${WANDB_SILENT:-true}"
 
+# HuggingFace + sentence_transformers can still ping the Hub for model
+# metadata even when the model itself is cached locally. To avoid hangs
+# on offline pods we auto-set the offline flags only WHEN the GloVe
+# model is already cached -- otherwise the first run wouldn't be able
+# to download. User can force either behavior:
+#   HF_HUB_OFFLINE=0  -> allow Hub access even if cached
+#   HF_HUB_OFFLINE=1  -> require cache (will error if missing)
+_GLOVE_CACHE="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--sentence-transformers--average_word_embeddings_glove.6B.300d"
+if [ -d "$_GLOVE_CACHE" ]; then
+    export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+    export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+    echo "[hf] GloVe cache present -> HF_HUB_OFFLINE=$HF_HUB_OFFLINE"
+else
+    echo "[hf] GloVe cache NOT found at $_GLOVE_CACHE -- first run will download"
+fi
+
 LOG="$OUT_DIR/train.log"
 torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --tasks "$TASKS_CSV" \
