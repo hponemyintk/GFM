@@ -418,11 +418,10 @@ TASKS_CSV=$(IFS=,; echo "${TASKS[*]}")
 echo "  tasks=$TASKS_CSV"
 echo
 
-# WANDB defaults to OFFLINE so the script works on AWS pods without
-# wandb auth or external connectivity. Override with WANDB_MODE=online
-# in the shell if you have a real wandb account configured.
-export WANDB_MODE="${WANDB_MODE:-offline}"
-export WANDB_SILENT="${WANDB_SILENT:-true}"
+# WANDB defaults to ONLINE -- this user has a WANDB_API_KEY configured
+# in the shell. Override with WANDB_MODE=offline at launch if running
+# on a pod without outbound internet (or set WANDB_API_KEY="" first).
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 # HuggingFace + sentence_transformers can still ping the Hub for model
 # metadata even when the model itself is cached locally. To avoid hangs
