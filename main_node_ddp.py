@@ -228,6 +228,48 @@ graph_cache = DatasetGraphCache(
     tf_store_root=args.tf_store_dir,  # None = in-RAM TFs (default)
 )
 
+# Capture col_names_dict per node type BEFORE dropping tf -- the
+# model construction below needs it but doesn't need the actual TF
+# tensors.
+_captured_col_names = {
+    nt: data[nt].tf.col_names_dict
+    for nt in data.node_types
+    if hasattr(data[nt], "tf")
+}
+
+# OOM mitigation: edge_index tensors are dead weight after CSR is
+# built; if tf_store_dir is set, in-RAM tf is also dead weight (reads
+# go through TFStoreReader). Pin num_nodes before dropping tf so the
+# NodeStorage property doesn't start returning None.
+import gc as _gc
+for _nt in list(data.node_types):
+    _store = data[_nt]
+    try:
+        _n = _store.num_nodes
+        if _n is not None:
+            _store.num_nodes = int(_n)
+    except Exception:
+        pass
+    if args.tf_store_dir is not None and hasattr(_store, "tf"):
+        try:
+            del _store["tf"]
+        except Exception:
+            try:
+                delattr(_store, "tf")
+            except Exception:
+                pass
+for _et in list(data.edge_types):
+    _es = data[_et]
+    if "edge_index" in _es:
+        try:
+            del _es["edge_index"]
+        except Exception:
+            try:
+                delattr(_es, "edge_index")
+            except Exception:
+                pass
+_gc.collect()
+
 data = {
     split: TaskTokens(
         cache=graph_cache,
@@ -331,8 +373,7 @@ model = RelGT(
     num_nodes=data["train"].data.num_nodes,
     max_neighbor_hop=data["train"].max_neighbor_hop,
     node_type_map=data["train"].node_type_to_index,
-    col_names_dict={node_type: data["train"].data[node_type].tf.col_names_dict 
-                    for node_type in data["train"].data.node_types},
+    col_names_dict=_captured_col_names,
     col_stats_dict=col_stats_dict,
     local_num_layers=args.num_layers,
     channels=args.channels,

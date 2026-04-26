@@ -150,6 +150,56 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
         )
         col_stats_per_ds[ds_name] = col_stats
 
+        # Capture col_names_dict per (prefixed_type) BEFORE dropping
+        # tf. _build_model needs it to construct RelGT but doesn't
+        # need the actual TF tensors.
+        caches[ds_name]._captured_col_names_dict = {}
+        for _prefixed in caches[ds_name].node_types:
+            _raw = caches[ds_name].prefixed_to_raw[_prefixed]
+            _store = caches[ds_name].data[_raw]
+            if hasattr(_store, "tf"):
+                caches[ds_name]._captured_col_names_dict[_prefixed] = \
+                    _store.tf.col_names_dict
+
+        # OOM mitigation: now that the cache holds the CSR adjacency
+        # AND we've captured col_names_dict, the raw HeteroData's
+        # edge_index tensors and (when tf_store_root is set) tf
+        # tensors are dead weight. With 8 DDP ranks each holding
+        # rel-event's ~25 GB of in-RAM tensors, peak RAM blew past
+        # pod limits and got OOM-killed in phase 3.
+        # Pin num_nodes BEFORE dropping tf -- NodeStorage.num_nodes
+        # is a property that infers from tf and returns None once tf
+        # is gone unless we pin it (same gotcha as
+        # tools/precompute_shards.py).
+        import gc as _gc
+        for _nt in list(data.node_types):
+            store = data[_nt]
+            try:
+                n = store.num_nodes
+                if n is not None:
+                    store.num_nodes = int(n)
+            except Exception:
+                pass
+            if cache_root is not None and hasattr(store, "tf"):
+                try:
+                    del store["tf"]
+                except Exception:
+                    try:
+                        delattr(store, "tf")
+                    except Exception:
+                        pass
+        for _et in list(data.edge_types):
+            estore = data[_et]
+            if "edge_index" in estore:
+                try:
+                    del estore["edge_index"]
+                except Exception:
+                    try:
+                        delattr(estore, "edge_index")
+                    except Exception:
+                        pass
+        _gc.collect()
+
     # PR4: pre-compute the unified type map ONCE here so every TaskTokens
     # gets the same global vocabulary at construction. This makes HDF5 /
     # precomputed-shards correct under multi-dataset training (otherwise
@@ -242,17 +292,25 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
 # --------------------------------------------------------- model build
 def _build_model(args, caches, col_stats_per_ds, type_to_index, num_nodes_total, device):
     """Build RelGT(out_channels=channels) so its output is an embedding."""
-    # Union col_names_dict over all datasets/tables (raw type -> col_names_dict).
-    # The encoder iterates raw type names; PR1 prefixing means cache keys are
-    # prefixed, so we need a flat mapping that the encoder will see.
+    # Union col_names_dict over all datasets/tables.
+    # NOTE: we use cache._captured_col_names_dict (stashed at cache
+    # construction time in _build_caches_and_tokens) so this still
+    # works after the OOM mitigation drops the tf tensors.
     col_names_dict: Dict[str, dict] = {}
     col_stats_unified: Dict[str, dict] = {}
     for ds_name, cache in caches.items():
+        captured = getattr(cache, "_captured_col_names_dict", {})
         for prefixed in cache.node_types:
+            if prefixed in captured:
+                col_names_dict[prefixed] = captured[prefixed]
+            else:
+                # Fallback for code paths that didn't capture (single-task,
+                # tests, etc.) -- read directly from data while available.
+                raw = cache.prefixed_to_raw[prefixed]
+                store = cache.data[raw]
+                if hasattr(store, "tf"):
+                    col_names_dict[prefixed] = store.tf.col_names_dict
             raw = cache.prefixed_to_raw[prefixed]
-            tf = cache.data[raw].tf
-            col_names_dict[prefixed] = tf.col_names_dict
-            # col_stats from each dataset use raw type names.
             if raw in col_stats_per_ds[ds_name]:
                 col_stats_unified[prefixed] = col_stats_per_ds[ds_name][raw]
     backbone = RelGT(
