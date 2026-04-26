@@ -296,7 +296,14 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
             # invocations in TaskTokens / eval are pure dict lookups.
             for _split in ("train", "val", "test"):
                 try:
-                    task_obj.get_table(_split)
+                    # IMPORTANT: pass split as a KEYWORD arg so the
+                    # @lru_cache key matches TaskTokens.__init__'s
+                    # ``task.get_table(split=split)`` -- functools
+                    # keys positional and keyword args separately,
+                    # so a positional pre-warm would miss the cache
+                    # and force a redundant parquet re-read inside
+                    # TaskTokens.
+                    task_obj.get_table(split=_split)
                 except Exception as e:
                     # Don't let a single split failure blow up startup;
                     # TaskTokens construction below will surface a real

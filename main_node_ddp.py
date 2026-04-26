@@ -238,9 +238,13 @@ def _do_load_db_and_graph():
     # is missing, ``task.get_table`` falls into ``_get_table`` which
     # calls ``self.dataset.get_db()`` -- doing it here keeps that
     # cache-miss bounded to one rank, not all 8.
+    # IMPORTANT: pass split as a KEYWORD arg so the @lru_cache key
+    # matches downstream callers (TaskTokens / eval) which use the
+    # keyword form -- functools keys positional and keyword args
+    # separately and a positional pre-warm would miss the cache.
     for _split in ("train", "val", "test"):
         try:
-            task.get_table(_split)
+            task.get_table(split=_split)
         except Exception as e:
             print(
                 f"[single-task] WARN: pre-warm get_table({_split}) "

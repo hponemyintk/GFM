@@ -445,14 +445,17 @@ echo
 # torchrun launchers that target it. ``|| true`` guards against
 # pkill rc=1 ("no processes matched") under set -e.
 echo "[3/3] pre-flight: reaping any stale torchrun / main_node_ddp.py procs"
-pkill -TERM -f "main_node_ddp\.py" 2>/dev/null || true
-pkill -TERM -f "torchrun.*main_node_ddp" 2>/dev/null || true
+# Match python interpreters running main_node_ddp.py (NOT, e.g., a
+# user's "vim main_node_ddp.py" in another terminal whose argv just
+# contains the filename). Both patterns require python in argv[0].
+pkill -TERM -f "python[0-9.]* .*main_node_ddp\.py" 2>/dev/null || true
+pkill -TERM -f "python[0-9.]* .*torchrun.*main_node_ddp" 2>/dev/null || true
 # Brief wait for sockets to clear (TIME_WAIT on the rdzv port can hold
 # bind() for ~60s on default sysctls; SIGKILL after 5s if anything is
 # still up).
 sleep 5
-pkill -KILL -f "main_node_ddp\.py" 2>/dev/null || true
-pkill -KILL -f "torchrun.*main_node_ddp" 2>/dev/null || true
+pkill -KILL -f "python[0-9.]* .*main_node_ddp\.py" 2>/dev/null || true
+pkill -KILL -f "python[0-9.]* .*torchrun.*main_node_ddp" 2>/dev/null || true
 
 # Default rdzv port (overridable). Bumping this on a stuck-port retry
 # is faster than waiting for TIME_WAIT to clear:
