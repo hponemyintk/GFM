@@ -88,6 +88,19 @@ def parse_tasks(spec: str) -> List[Tuple[str, str, float]]:
 
 # --------------------------------------------------------------- data
 def _load_dataset(name: str, cache_dir: str, device: str):
+    """Load one dataset's HeteroData + col_stats.
+
+    Routes stypes loading through gfm_data.stypes.load_or_generate_stypes
+    so we get the same defensive behavior as the offline tools (validates
+    JSON, regenerates on corrupt NaN/float entries, writes clean .value
+    serialization). Then filters the stypes dict against the DB's actual
+    columns -- RelBench tasks like results-position strip leakage-risk
+    columns; without filtering, torch_frame.Dataset.__init__ raises.
+    """
+    from gfm_data.stypes import (
+        filter_to_db_columns as _filter_stypes,
+        load_or_generate_stypes as _load_stypes,
+    )
     dset = get_dataset(name, download=True)
     stypes_path = Path(cache_dir) / name / "stypes.json"
     # IMPORTANT: pass upto_test_timestamp=False here. Otherwise the
@@ -96,21 +109,8 @@ def _load_dataset(name: str, cache_dir: str, device: str):
     # bounds in the CSR adjacency. Temporal leakage is still prevented
     # by the per-row seed_time filter in the sampler -- the materialized
     # graph just needs to *contain* all entities the task tables reference.
+    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=False)
     db = dset.get_db(upto_test_timestamp=False)
-    try:
-        with open(stypes_path) as f:
-            cs = json.load(f)
-    except FileNotFoundError:
-        cs = get_stype_proposal(db)
-        stypes_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stypes_path, "w") as f:
-            json.dump(cs, f, indent=2, default=str)
-    for tab, c2s in cs.items():
-        for col, st in c2s.items():
-            c2s[col] = stype(st) if isinstance(st, str) else st
-    # Drop stype entries for task-stripped columns (see
-    # gfm_data/stypes.py:filter_to_db_columns rationale).
-    from gfm_data.stypes import filter_to_db_columns as _filter_stypes
     cs = _filter_stypes(cs, db)
     data, col_stats = make_pkey_fkey_graph(
         db,
