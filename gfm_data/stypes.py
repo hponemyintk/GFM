@@ -83,6 +83,44 @@ def to_stype_enums(cs: dict):
     return out
 
 
+def filter_to_db_columns(cs, db, log_stream=sys.stderr):
+    """Drop stype entries for columns that don't exist in the actual DB.
+
+    RelBench task-aware loaders sometimes strip leakage-risk columns
+    from a table before handing it to ``make_pkey_fkey_graph`` (e.g.,
+    the ``position``, ``positionOrder``, ``statusId``, ``points``, ...
+    columns are removed from the ``results`` table when the active task
+    is ``results-position``). The cached ``stypes.json`` still
+    references those columns from the FULL schema, and torch_frame's
+    ``Dataset.__init__`` validates ``col_to_stype`` keys against
+    ``df.columns`` before doing anything else. Pass-through with the
+    full schema therefore raises::
+
+        ValueError: The column(s) '{...}' are specified
+                    but missing in the data frame
+
+    Filter the stypes dict against the actual DB columns to avoid
+    that. Keeps an entry only if the column is present in the
+    corresponding table's df. Tables missing from the DB are dropped
+    entirely.
+    """
+    out = {}
+    for tab, c2s in cs.items():
+        if tab not in db.table_dict:
+            print(f"[stypes] table {tab!r} missing from DB; dropping",
+                  file=log_stream)
+            continue
+        df_cols = set(db.table_dict[tab].df.columns)
+        kept = {col: st for col, st in c2s.items() if col in df_cols}
+        dropped = set(c2s) - set(kept)
+        if dropped:
+            print(f"[stypes] {tab}: dropping {sorted(dropped)} "
+                  f"(not in DB, likely task-stripped leakage cols)",
+                  file=log_stream)
+        out[tab] = kept
+    return out
+
+
 def load_or_generate_stypes(
     stypes_path: Path,
     dataset,

@@ -14,6 +14,7 @@ import pytest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from gfm_data.stypes import (  # noqa: E402
+    filter_to_db_columns,
     is_valid_raw_stypes,
     normalize_for_write,
     load_or_generate_stypes,
@@ -142,6 +143,71 @@ def test_load_or_generate_stypes_regenerates_corrupt_file():
         # Returned dict is keyed by stype enum.
         from torch_frame import stype
         assert out["users"]["age"] == stype.numerical
+
+
+def test_filter_to_db_columns_drops_task_stripped_cols():
+    """Regression: torch_frame.Dataset.__init__ rejects col_to_stype keys
+    not in df.columns. RelBench tasks like rel-f1.results-position strip
+    leakage-risk columns from the source table; the filter must drop
+    those entries from the stypes dict before make_pkey_fkey_graph.
+    """
+    import io
+    import pandas as pd
+    from torch_frame import stype
+
+    cs = {
+        "results": {
+            "constructorId": stype.numerical,
+            "driverId": stype.numerical,
+            "position": stype.numerical,         # task-stripped
+            "positionOrder": stype.numerical,    # task-stripped
+            "statusId": stype.numerical,         # task-stripped
+            "raceId": stype.numerical,
+        },
+    }
+
+    class _FakeDB:
+        def __init__(self):
+            df = pd.DataFrame({
+                "constructorId": [1],
+                "driverId": [1],
+                # position/positionOrder/statusId omitted (stripped by task)
+                "raceId": [1],
+            })
+            from types import SimpleNamespace
+            self.table_dict = {"results": SimpleNamespace(df=df)}
+
+    log = io.StringIO()
+    out = filter_to_db_columns(cs, _FakeDB(), log_stream=log)
+
+    assert set(out["results"].keys()) == {"constructorId", "driverId", "raceId"}
+    msg = log.getvalue()
+    # Diagnostic mentions every dropped column.
+    for col in ("position", "positionOrder", "statusId"):
+        assert col in msg
+
+
+def test_filter_to_db_columns_drops_table_missing_from_db():
+    import io
+    import pandas as pd
+    from torch_frame import stype
+
+    cs = {
+        "results": {"x": stype.numerical},
+        "phantom_table": {"y": stype.numerical},
+    }
+
+    class _FakeDB:
+        def __init__(self):
+            from types import SimpleNamespace
+            self.table_dict = {
+                "results": SimpleNamespace(df=pd.DataFrame({"x": [1]})),
+            }
+
+    log = io.StringIO()
+    out = filter_to_db_columns(cs, _FakeDB(), log_stream=log)
+    assert "phantom_table" not in out
+    assert "missing from DB" in log.getvalue()
 
 
 def test_load_or_generate_stypes_creates_when_missing():

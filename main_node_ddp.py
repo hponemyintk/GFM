@@ -201,11 +201,18 @@ except FileNotFoundError:
     with open(stypes_cache_path, "w") as f:
         json.dump(col_to_stype_dict, f, indent=2, default=str)
 
+# upto_test_timestamp=False so entity tables contain all rows the
+# test seeds reference. Temporal leakage is enforced at sampling
+# time (per-row seed_time filter), not via materialization cutoff.
+_db = dataset.get_db(upto_test_timestamp=False)
+# Drop stype entries for columns the active task strips for leakage
+# prevention (e.g., results-position removes 'position' / 'statusId'
+# / 'points' from results.df). Without this the torch_frame
+# Dataset.__init__ inside make_pkey_fkey_graph raises ValueError.
+from gfm_data.stypes import filter_to_db_columns as _filter_stypes
+col_to_stype_dict = _filter_stypes(col_to_stype_dict, _db)
 data, col_stats_dict = make_pkey_fkey_graph(
-    # upto_test_timestamp=False so entity tables contain all rows the
-    # test seeds reference. Temporal leakage is enforced at sampling
-    # time (per-row seed_time filter), not via materialization cutoff.
-    dataset.get_db(upto_test_timestamp=False),
+    _db,
     col_to_stype_dict=col_to_stype_dict,
     text_embedder_cfg=TextEmbedderConfig(
         text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"), batch_size=256

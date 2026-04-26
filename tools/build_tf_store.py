@@ -23,7 +23,7 @@ from torch_frame.config.text_embedder import TextEmbedderConfig
 from relbench.datasets import get_dataset
 from relbench.modeling.graph import make_pkey_fkey_graph
 
-from gfm_data.stypes import load_or_generate_stypes
+from gfm_data.stypes import filter_to_db_columns, load_or_generate_stypes
 from gfm_data.tf_store import build_dataset_tf_store
 from utils import GloveTextEmbedding
 
@@ -53,10 +53,11 @@ def main():
     # upto_test_timestamp=False: entity tables must contain all rows the
     # test split references; temporal leakage is enforced at sampling
     # time via per-row seed_time filtering, not via materialization
-    # cutoff. (RelBench's default True drops post-train-cutoff entities
-    # which then crash test eval with IndexError.)
+    # cutoff.
+    db = dataset.get_db(upto_test_timestamp=False)
+    cs = filter_to_db_columns(cs, db)
     data, _ = make_pkey_fkey_graph(
-        dataset.get_db(upto_test_timestamp=False),
+        db,
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device=embed_device),

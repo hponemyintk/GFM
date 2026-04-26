@@ -36,7 +36,7 @@ from relbench.tasks import get_task
 from gfm_data.graph_cache import DatasetGraphCache
 from gfm_data.sampler import sample_local_subgraph
 from gfm_data.shard_io import ShardWriter
-from gfm_data.stypes import load_or_generate_stypes
+from gfm_data.stypes import filter_to_db_columns, load_or_generate_stypes
 from utils import GloveTextEmbedding
 
 
@@ -68,8 +68,14 @@ def load_data(args):
     # upto_test_timestamp=False so test seed indices don't overflow the
     # entity tables. Temporal leakage is prevented at sampling time via
     # per-row seed_time filtering.
+    db = dataset.get_db(upto_test_timestamp=False)
+    # RelBench tasks (e.g., results-position) strip leakage-risk
+    # columns from the source table; the stypes JSON still references
+    # the full schema. Filter so make_pkey_fkey_graph's torch_frame
+    # Dataset.__init__ doesn't ValueError on missing columns.
+    cs = filter_to_db_columns(cs, db)
     data, _ = make_pkey_fkey_graph(
-        dataset.get_db(upto_test_timestamp=False),
+        db,
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device=embed_device),

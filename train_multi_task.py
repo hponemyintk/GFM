@@ -108,6 +108,10 @@ def _load_dataset(name: str, cache_dir: str, device: str):
     for tab, c2s in cs.items():
         for col, st in c2s.items():
             c2s[col] = stype(st) if isinstance(st, str) else st
+    # Drop stype entries for task-stripped columns (see
+    # gfm_data/stypes.py:filter_to_db_columns rationale).
+    from gfm_data.stypes import filter_to_db_columns as _filter_stypes
+    cs = _filter_stypes(cs, db)
     data, col_stats = make_pkey_fkey_graph(
         db,
         col_to_stype_dict=cs,
