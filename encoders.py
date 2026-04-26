@@ -765,19 +765,24 @@ class NeighborTfsEncoder(nn.Module):
 
             x_seq = torch.cat([cls_tokens, x_cols], dim=1)
 
-            # CUDA efficient-attention kernel (sdpa) has a hard batch-
-            # size limit of 65535. With multi-task batch_size=512 *
-            # K=300 = 153,600 neighbor slots and a dominant node type
-            # (e.g., rel-event ``users``) taking most of those slots,
-            # this kernel overflow crashes the first training step.
-            # Chunk along the batch dim to keep the fast kernels on
-            # smaller pieces; sequences are short (num_columns + 1
-            # CLS ~= 5-20 tokens) so the chunking overhead is
-            # unmeasurable. Single-task / smaller-batch runs hit the
-            # one-shot path below.
-            _SDPA_BATCH_LIMIT = 65535
-            if x_seq.size(0) > _SDPA_BATCH_LIMIT:
-                chunks = x_seq.split(_SDPA_BATCH_LIMIT, dim=0)
+            # Chunk along the batch dim before the shared transformer.
+            # Two reasons:
+            #   1. CUDA's efficient-attention kernel has a hard batch-
+            #      size limit of 65535.
+            #   2. Even below that, a 4-layer FFN's training-time
+            #      activations (forward + grad) would OOM a 40 GiB
+            #      A100 at 65k samples (~5 GiB per layer * 4 layers).
+            # With multi-task batch_size=512 * K=300 = 153,600 slots
+            # and a dominant node type (rel-event ``users``) taking
+            # most of those slots, both limits are reached. Each
+            # sample is independent (self-attention is over the short
+            # column dimension, not across samples), so chunking is a
+            # numerically exact no-op. 8192 keeps peak activation
+            # under ~3 GiB per chunk; if it still OOMs on smaller
+            # GPUs, drop to 4096.
+            _TF_CHUNK = 8192
+            if x_seq.size(0) > _TF_CHUNK:
+                chunks = x_seq.split(_TF_CHUNK, dim=0)
                 x_out = torch.cat(
                     [self.shared_transformer(c) for c in chunks], dim=0
                 )
