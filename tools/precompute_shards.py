@@ -36,61 +36,8 @@ from relbench.tasks import get_task
 from gfm_data.graph_cache import DatasetGraphCache
 from gfm_data.sampler import sample_local_subgraph
 from gfm_data.shard_io import ShardWriter
+from gfm_data.stypes import load_or_generate_stypes
 from utils import GloveTextEmbedding
-
-
-def _load_or_generate_stypes(stypes_path: Path, dataset):
-    """Load stypes.json defensively; regenerate if missing or corrupt.
-
-    See ``tools/build_tf_store.py:_load_or_generate_stypes`` for the
-    full rationale -- both tools deliberately keep the same defensive
-    loader so either one can be the first to materialize ``stypes.json``
-    on a fresh box.
-    """
-    cs = None
-    if stypes_path.exists():
-        try:
-            with open(stypes_path) as f:
-                raw = json.load(f)
-            ok = isinstance(raw, dict) and all(
-                isinstance(c2s, dict)
-                and all(isinstance(v, (str, type(None))) for v in c2s.values())
-                for c2s in raw.values()
-            )
-            if ok:
-                cs = raw
-            else:
-                print(f"[stypes] {stypes_path} has non-string entries; regenerating",
-                      file=sys.stderr)
-        except Exception as e:
-            print(f"[stypes] {stypes_path} unreadable ({e}); regenerating",
-                  file=sys.stderr)
-
-    if cs is None:
-        from relbench.modeling.utils import get_stype_proposal
-        cs_raw = get_stype_proposal(dataset.get_db(upto_test_timestamp=False))
-        cs = {}
-        for tab, c2s in cs_raw.items():
-            cs[tab] = {}
-            for col, st in c2s.items():
-                if hasattr(st, "value"):
-                    cs[tab][col] = st.value
-                elif isinstance(st, str):
-                    cs[tab][col] = st
-        stypes_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(stypes_path, "w") as f:
-            json.dump(cs, f, indent=2)
-
-    out = {}
-    for tab, c2s in cs.items():
-        out[tab] = {}
-        for col, st in c2s.items():
-            if isinstance(st, str):
-                try:
-                    out[tab][col] = stype(st)
-                except ValueError:
-                    pass
-    return out
 
 
 def parse_args():
@@ -111,7 +58,7 @@ def load_data(args):
     task = get_task(args.dataset, args.task, download=True)
 
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    cs = _load_or_generate_stypes(stypes_path, dataset)
+    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=False)
 
     # Use GPU for text embedding when available; major speedup on big
     # datasets (rel-event ~41M rows).

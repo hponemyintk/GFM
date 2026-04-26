@@ -19,6 +19,7 @@ _HEAVY_MODULES = [
     "relbench.base",
     "relbench.modeling",
     "relbench.modeling.graph",
+    "relbench.modeling.utils",
     "h5py",
 ]
 
