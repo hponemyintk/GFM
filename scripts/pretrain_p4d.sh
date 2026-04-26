@@ -436,6 +436,31 @@ TASKS_CSV=$(IFS=,; echo "${TASKS[*]}")
 echo "  tasks=$TASKS_CSV"
 echo
 
+# Pre-flight cleanup: kill any stale torchrun / worker processes from a
+# prior aborted run (e.g., the watchdog SIGTERM'd a previous attempt
+# but the C10d rendezvous server's listening socket lingered, leaving
+# the next torchrun crashing with EADDRINUSE on the rdvz port). We
+# don't want to wipe unrelated python jobs the user might have running,
+# so we match precisely on this script's main_node_ddp.py and on
+# torchrun launchers that target it. ``|| true`` guards against
+# pkill rc=1 ("no processes matched") under set -e.
+echo "[3/3] pre-flight: reaping any stale torchrun / main_node_ddp.py procs"
+pkill -TERM -f "main_node_ddp\.py" 2>/dev/null || true
+pkill -TERM -f "torchrun.*main_node_ddp" 2>/dev/null || true
+# Brief wait for sockets to clear (TIME_WAIT on the rdzv port can hold
+# bind() for ~60s on default sysctls; SIGKILL after 5s if anything is
+# still up).
+sleep 5
+pkill -KILL -f "main_node_ddp\.py" 2>/dev/null || true
+pkill -KILL -f "torchrun.*main_node_ddp" 2>/dev/null || true
+
+# Default rdzv port (overridable). Bumping this on a stuck-port retry
+# is faster than waiting for TIME_WAIT to clear:
+#   MASTER_PORT=29501 ./scripts/pretrain_p4d.sh
+export MASTER_PORT="${MASTER_PORT:-29500}"
+echo "[3/3] rdzv MASTER_PORT=$MASTER_PORT"
+
+
 # WANDB defaults to ONLINE -- this user has a WANDB_API_KEY configured
 # in the shell. Override with WANDB_MODE=offline at launch if running
 # on a pod without outbound internet (or set WANDB_API_KEY="" first).
