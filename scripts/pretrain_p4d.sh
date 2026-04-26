@@ -572,6 +572,13 @@ TAIL_PID=$!
                 END                  { print (a + i) * 1024 }
             ' /proc/meminfo)
         fi
+        # Defensive: awk can produce empty output if the expected key
+        # is missing (older kernels, exotic cgroup configs); the
+        # subsequent ``[ "" -ge N ]`` test would syntax-error and
+        # ``set -e`` (inherited by this subshell) would silently kill
+        # the watchdog. Coerce empty/whitespace to 0.
+        cur="${cur:-0}"
+        case "$cur" in (''|*[!0-9]*) cur=0 ;; esac
         if [ "$cur" -ge "$_MEM_THRESHOLD" ]; then
             cur_h=$(numfmt --to=iec --suffix=B "$cur" 2>/dev/null || echo "$cur")
             lim_h=$(numfmt --to=iec --suffix=B "$_MEM_LIMIT" 2>/dev/null || echo "$_MEM_LIMIT")
@@ -613,8 +620,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Wait for torchrun; capture its exit code so the script propagates it.
-wait "$TORCHRUN_PID"
-TORCHRUN_RC=$?
+# IMPORTANT: ``wait`` returns torchrun's exit code; with ``set -e`` a
+# non-zero return would kill the script before we read $?. The
+# watchdog explicitly SIGTERMs torchrun (rc != 0) on memory pressure
+# -- if we don't guard the wait, the diagnostic banner below is never
+# printed and the script exits with no message.
+TORCHRUN_RC=0
+wait "$TORCHRUN_PID" || TORCHRUN_RC=$?
 
 # Stop the tail + watchdog now that torchrun is done.
 cleanup
