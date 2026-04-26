@@ -51,7 +51,12 @@ class GloveTextEmbedding:
                     safe.append(str(s))
             else:
                 safe.append(str(s))
-        return torch.from_numpy(self.model.encode(safe))
+        # Show a progress bar for big batches (rel-event has ~41M rows
+        # of text -- without progress, the offline build looks 'stuck').
+        show_progress = len(safe) >= 10_000
+        return torch.from_numpy(
+            self.model.encode(safe, show_progress_bar=show_progress)
+        )
 
 def build_adjacency_hetero(hetero_data: HeteroData, undirected: bool = True):
     adjacency = {

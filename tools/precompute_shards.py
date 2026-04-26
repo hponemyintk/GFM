@@ -113,6 +113,11 @@ def load_data(args):
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
     cs = _load_or_generate_stypes(stypes_path, dataset)
 
+    # Use GPU for text embedding when available; major speedup on big
+    # datasets (rel-event ~41M rows).
+    import torch as _torch
+    embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
+
     # upto_test_timestamp=False so test seed indices don't overflow the
     # entity tables. Temporal leakage is prevented at sampling time via
     # per-row seed_time filtering.
@@ -120,8 +125,8 @@ def load_data(args):
         dataset.get_db(upto_test_timestamp=False),
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
-            text_embedder=GloveTextEmbedding(device="cpu"),
-            batch_size=256,
+            text_embedder=GloveTextEmbedding(device=embed_device),
+            batch_size=512,
         ),
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )

@@ -104,6 +104,13 @@ def main():
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
     cs = _load_or_generate_stypes(stypes_path, dataset)
 
+    # Use GPU for text embedding when available -- CPU GloVe on the big
+    # datasets (rel-event has ~41M rows) is the difference between a
+    # 5-minute and an 11-hour build.
+    import torch as _torch
+    embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
+    print(f"[tf_store] text embedder device: {embed_device}")
+
     # upto_test_timestamp=False: entity tables must contain all rows the
     # test split references; temporal leakage is enforced at sampling
     # time via per-row seed_time filtering, not via materialization
@@ -113,8 +120,8 @@ def main():
         dataset.get_db(upto_test_timestamp=False),
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
-            text_embedder=GloveTextEmbedding(device="cpu"),
-            batch_size=256,
+            text_embedder=GloveTextEmbedding(device=embed_device),
+            batch_size=512,
         ),
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )
