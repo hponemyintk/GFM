@@ -39,12 +39,20 @@ def main():
     args = parse_args()
     dataset = get_dataset(args.dataset, download=True)
 
+    # Pre-generate stypes.json if it's missing (e.g., fresh AWS box).
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    with open(stypes_path) as f:
-        cs = json.load(f)
+    if stypes_path.exists():
+        with open(stypes_path) as f:
+            cs = json.load(f)
+    else:
+        from relbench.modeling.utils import get_stype_proposal
+        cs = get_stype_proposal(dataset.get_db(upto_test_timestamp=False))
+        stypes_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stypes_path, "w") as f:
+            json.dump(cs, f, indent=2, default=str)
     for tab, c2s in cs.items():
         for col, st in c2s.items():
-            c2s[col] = stype(st)
+            c2s[col] = stype(st) if isinstance(st, str) else st
 
     # upto_test_timestamp=False: entity tables must contain all rows the
     # test split references; temporal leakage is enforced at sampling

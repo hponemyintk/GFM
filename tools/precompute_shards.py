@@ -56,21 +56,32 @@ def load_data(args):
     dataset = get_dataset(args.dataset, download=True)
     task = get_task(args.dataset, args.task, download=True)
 
+    # Pre-generate stypes.json if missing (fresh AWS box).
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    with open(stypes_path) as f:
-        cs = json.load(f)
+    if stypes_path.exists():
+        with open(stypes_path) as f:
+            cs = json.load(f)
+    else:
+        from relbench.modeling.utils import get_stype_proposal
+        cs = get_stype_proposal(dataset.get_db(upto_test_timestamp=False))
+        stypes_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(stypes_path, "w") as f:
+            json.dump(cs, f, indent=2, default=str)
     for tab, c2s in cs.items():
         for col, st in c2s.items():
-            c2s[col] = stype(st)
+            c2s[col] = stype(st) if isinstance(st, str) else st
 
+    # upto_test_timestamp=False so test seed indices don't overflow the
+    # entity tables. Temporal leakage is prevented at sampling time via
+    # per-row seed_time filtering.
     data, _ = make_pkey_fkey_graph(
-        dataset.get_db(),
+        dataset.get_db(upto_test_timestamp=False),
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device="cpu"),
             batch_size=256,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )
     return data, task
 
