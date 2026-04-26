@@ -27,6 +27,26 @@
 #   DATASETS=rel-f1 STEPS_PER_TASK=500 EPOCHS=10 \
 #       ./scripts/pretrain_p4d.sh
 #
+# Offline / no-internet AWS pods:
+#
+# This script downloads two things on first run that you should
+# pre-cache if the pod has no outbound internet:
+#
+#   1. RelBench raw data (~/.cache/relbench/<ds>/db/) -- triggered by
+#      relbench's get_dataset(name, download=True). Pre-populate by
+#      running once on a box with internet, then rsync/copy the
+#      ~/.cache/relbench tree to the pod.
+#
+#   2. SentenceTransformer GloVe model (~/.cache/huggingface/hub/) --
+#      downloaded by sentence_transformers on first SentenceTransformer
+#      call. Pre-cache via:
+#         huggingface-cli download \
+#           sentence-transformers/average_word_embeddings_glove.6B.300d
+#      then rsync ~/.cache/huggingface to the pod.
+#
+# Once both caches are populated, every subsequent run is fully offline.
+# WANDB_MODE defaults to 'offline' so wandb.init never reaches out.
+#
 # Phases:
 #   0. enumerate tasks from relbench dynamically (filter to binary +
 #      regression, skip link-prediction / multi-class)
@@ -128,9 +148,21 @@ SHARD_SIZE="${SHARD_SIZE:-50000}"
 # datasets / tasks in parallel up to PARALLEL_BUILDS. Default = $NPROC
 # = number of GPUs on the box; phase 1 round-robins datasets across
 # GPUs via CUDA_VISIBLE_DEVICES, phase 2 just runs N CPU processes.
+# Phase 1 will be clamped to <= $NPROC at runtime so we never assign a
+# CUDA_VISIBLE_DEVICES id beyond what physically exists.
 PARALLEL_BUILDS="${PARALLEL_BUILDS:-$NPROC}"
 
 mkdir -p "$OUT_DIR" "$TF_STORE" "$SHARDS"
+
+# Validate concurrency knobs early (catch typos like PARALLEL_BUILDS=0).
+if ! [[ "$PARALLEL_BUILDS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_BUILDS" -lt 1 ]; then
+    echo "ERROR: PARALLEL_BUILDS must be a positive integer (got '$PARALLEL_BUILDS')." >&2
+    exit 1
+fi
+if ! [[ "$NPROC" =~ ^[0-9]+$ ]] || [ "$NPROC" -lt 1 ]; then
+    echo "ERROR: NPROC must be a positive integer (got '$NPROC')." >&2
+    exit 1
+fi
 
 # Default RelBench v2 dataset list (overridden by $DATASETS env var).
 V2_DATASETS_DEFAULT="rel-amazon,rel-avito,rel-event,rel-f1,rel-hm,rel-stack,rel-trial"
@@ -302,21 +334,37 @@ prune_pids() {
 # ------------------------------------------------------------------
 # Phase 1: TF memmap stores (parallel, GPU-pinned per dataset)
 # ------------------------------------------------------------------
-echo "[1/3] Building TF memmap stores ($PARALLEL_BUILDS concurrent, "\
-"one GPU each)"
+# Clamp phase-1 concurrency to the physical GPU count so we never set
+# CUDA_VISIBLE_DEVICES to a non-existent device.
+P1_CONCURRENCY=$(( PARALLEL_BUILDS < NPROC ? PARALLEL_BUILDS : NPROC ))
+echo "[1/3] Building TF memmap stores ($P1_CONCURRENCY concurrent, one GPU each)"
 declare -a P1_PIDS=()
 P1_IDX=0
 for ds in "${DATASETS_SELECTED[@]}"; do
-    while [ ${#P1_PIDS[@]} -ge "$PARALLEL_BUILDS" ]; do
+    while [ ${#P1_PIDS[@]} -ge "$P1_CONCURRENCY" ]; do
         wait -n 2>/dev/null || true
         prune_pids P1_PIDS
     done
-    GPU_ID=$(( P1_IDX % PARALLEL_BUILDS ))
+    GPU_ID=$(( P1_IDX % P1_CONCURRENCY ))
     phase1_build_one "$ds" "$GPU_ID" &
     P1_PIDS+=("$!")
     P1_IDX=$(( P1_IDX + 1 ))
 done
 wait
+
+# Verify phase 1 outputs exist before moving on -- a silent build
+# failure would otherwise propagate into phase 2 and torchrun.
+P1_MISSING=()
+for ds in "${DATASETS_SELECTED[@]}"; do
+    if [ ! -f "$TF_STORE/$ds/.done" ]; then
+        P1_MISSING+=("$ds")
+    fi
+done
+if [ ${#P1_MISSING[@]} -gt 0 ]; then
+    echo "ERROR: phase 1 failed to produce TF stores for: ${P1_MISSING[*]}" >&2
+    echo "  see $OUT_DIR/build_tf_*.log for details" >&2
+    exit 2
+fi
 echo
 
 # ------------------------------------------------------------------
@@ -334,6 +382,22 @@ for spec in "${TASKS[@]}"; do
     P2_PIDS+=("$!")
 done
 wait
+
+# Verify phase 2 outputs exist before launching the training run.
+P2_MISSING=()
+for spec in "${TASKS[@]}"; do
+    full="${spec%%:*}"
+    ds="${full%%.*}"
+    task="${full#*.}"
+    if [ ! -f "$SHARDS/$ds/$task/.done" ]; then
+        P2_MISSING+=("$ds.$task")
+    fi
+done
+if [ ${#P2_MISSING[@]} -gt 0 ]; then
+    echo "ERROR: phase 2 failed to produce shards for: ${P2_MISSING[*]}" >&2
+    echo "  see $OUT_DIR/build_shard_*.log for details" >&2
+    exit 3
+fi
 echo
 
 # ------------------------------------------------------------------
@@ -344,8 +408,11 @@ TASKS_CSV=$(IFS=,; echo "${TASKS[*]}")
 echo "  tasks=$TASKS_CSV"
 echo
 
-# WANDB env -- user can override.
-export WANDB_MODE="${WANDB_MODE:-online}"
+# WANDB defaults to OFFLINE so the script works on AWS pods without
+# wandb auth or external connectivity. Override with WANDB_MODE=online
+# in the shell if you have a real wandb account configured.
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_SILENT="${WANDB_SILENT:-true}"
 
 LOG="$OUT_DIR/train.log"
 torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
