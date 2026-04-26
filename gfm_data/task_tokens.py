@@ -201,12 +201,24 @@ class TaskTokens(Dataset):
 
         Used by main_node_ddp.py via ``data["train"].data.num_nodes`` and the
         seed-node global index lookup in collate. Identical to dev-kyaw's
-        ``RelGTTokens._create_global_mappings``.
+        ``RelGTTokens._create_global_mappings`` for single-dataset runs.
+
+        Multi-dataset note: when ``unified_type_map`` is provided, this
+        instance's ``index_to_node_type`` covers types from EVERY dataset,
+        but ``self.cache`` only knows about THIS dataset's types
+        (``self.cache.prefixed_to_raw`` is per-cache). We iterate only the
+        cache's own types and use the unified map for the type id.
+        Cross-dataset global indices are not strictly unique here -- each
+        TaskTokens numbers its own dataset's nodes from 0 -- but the seed
+        of every batch always belongs to that batch's task's dataset, so
+        in single-task-per-batch DDP this is consistent. Cross-dataset
+        codebook collisions are a known soft issue tracked separately.
         """
         self.type_local_to_global: Dict[Tuple[int, int], int] = {}
         self.global_to_type_local: Dict[int, Tuple[int, int]] = {}
         g = 0
-        for type_idx, prefixed_type in self.index_to_node_type.items():
+        for prefixed_type in self.cache.node_types:
+            type_idx = self.node_type_to_index[prefixed_type]
             raw_type = self.cache.prefixed_to_raw[prefixed_type]
             n = self.cache._num_nodes_of(self.cache.data, raw_type)
             for local_idx in range(n):
