@@ -41,6 +41,66 @@ TASK_TYPE_BINARY = 1
 TASK_TYPE_MULTILABEL = 2
 
 
+# OOM mitigation: arithmetic proxies for the (type, local) <-> global
+# mapping. The previous dict-based implementation stored ONE entry per
+# node across all types -- ~100M entries on rel-event * ~110 bytes each
+# = ~22 GiB per TaskTokens instance. With 6 rel-event tasks * 3 splits
+# = 18 instances per rank * 8 ranks = ~3.2 TB of pure CPython
+# overhead. The mapping is just a contiguous stacked layout, so we
+# store only a small offset table (~10 entries) and compute on the fly.
+class _OffsetProxy:
+    """Dict-like proxy: ``(type_idx, local_idx) -> global_idx`` via offsets."""
+    __slots__ = ("_off",)
+
+    def __init__(self, offset: Dict[int, int]):
+        self._off = offset
+
+    def __getitem__(self, key):
+        type_idx, local_idx = key
+        return self._off[type_idx] + local_idx
+
+    def __contains__(self, key):
+        type_idx, _local_idx = key
+        return type_idx in self._off
+
+    def __len__(self):
+        raise NotImplementedError(
+            "Use TaskTokens._total_global_nodes instead of "
+            "len(type_local_to_global)"
+        )
+
+    def __iter__(self):
+        raise NotImplementedError(
+            "Iterating type_local_to_global is not supported; use _type_offset"
+        )
+
+
+class _ReverseOffsetProxy:
+    """Dict-like proxy: ``global_idx -> (type_idx, local_idx)`` via offsets."""
+    __slots__ = ("_off", "_sizes", "_sorted")
+
+    def __init__(self, offset: Dict[int, int], sizes: Dict[int, int]):
+        self._off = offset
+        self._sizes = sizes
+        # Sorted list of (offset, type_idx) for bisect lookup.
+        self._sorted = sorted((o, t) for t, o in offset.items())
+
+    def __getitem__(self, global_idx: int):
+        import bisect
+        pos = bisect.bisect_right(self._sorted, (global_idx,)) - 1
+        if pos < 0:
+            raise KeyError(global_idx)
+        off, type_idx = self._sorted[pos]
+        local_idx = global_idx - off
+        return (type_idx, local_idx)
+
+    def __len__(self):
+        raise NotImplementedError(
+            "Use TaskTokens._total_global_nodes instead of "
+            "len(global_to_type_local)"
+        )
+
+
 class TaskTokens(Dataset):
     """Single-task token dataset reading from a shared ``DatasetGraphCache``.
 
@@ -197,37 +257,53 @@ class TaskTokens(Dataset):
 
     # ------------------------------------------------------------ id maps
     def _create_global_mappings(self):
-        """Stable ``(type_idx, local_idx) -> global_idx`` map.
+        """Stable ``(type_idx, local_idx) -> global_idx`` map via offsets.
 
-        Used by main_node_ddp.py via ``data["train"].data.num_nodes`` and the
-        seed-node global index lookup in collate. Identical to dev-kyaw's
-        ``RelGTTokens._create_global_mappings`` for single-dataset runs.
+        The mapping is a contiguous stacked layout: for each type in
+        ``self.cache.node_types`` order, global indices start at a
+        cumulative offset. ``global_idx = _type_offset[type_idx] + local_idx``.
 
-        Multi-dataset note: when ``unified_type_map`` is provided, this
-        instance's ``index_to_node_type`` covers types from EVERY dataset,
-        but ``self.cache`` only knows about THIS dataset's types
-        (``self.cache.prefixed_to_raw`` is per-cache). We iterate only the
-        cache's own types and use the unified map for the type id.
-        Cross-dataset global indices are not strictly unique here -- each
-        TaskTokens numbers its own dataset's nodes from 0 -- but the seed
-        of every batch always belongs to that batch's task's dataset, so
-        in single-task-per-batch DDP this is consistent. Cross-dataset
-        codebook collisions are a known soft issue tracked separately.
+        Previous implementation stored two Python dicts with ONE entry
+        per node across all types (~100M for rel-event). At ~110
+        bytes/entry that's ~22 GiB per TaskTokens instance -- 6 rel-
+        event tasks * 3 splits = 18 instances per rank * 8 ranks =
+        ~3.2 TB of pure CPython overhead. This version stores only a
+        small offset table (~one entry per type, ~10 entries total).
+
+        Used by main_node_ddp.py via ``data["train"].data.num_nodes``
+        and the seed-node global index lookup in collate. Multi-
+        dataset note: when ``unified_type_map`` is provided, this
+        instance's ``index_to_node_type`` covers types from EVERY
+        dataset, but ``self.cache`` only knows about THIS dataset's
+        types (``self.cache.prefixed_to_raw`` is per-cache). We
+        iterate only the cache's own types and use the unified map
+        for the type id.
         """
-        self.type_local_to_global: Dict[Tuple[int, int], int] = {}
-        self.global_to_type_local: Dict[int, Tuple[int, int]] = {}
+        self._type_offset: Dict[int, int] = {}
+        self._type_size: Dict[int, int] = {}
         g = 0
         for prefixed_type in self.cache.node_types:
             type_idx = self.node_type_to_index[prefixed_type]
             raw_type = self.cache.prefixed_to_raw[prefixed_type]
             n = self.cache._num_nodes_of(self.cache.data, raw_type)
-            for local_idx in range(n):
-                self.type_local_to_global[(type_idx, local_idx)] = g
-                self.global_to_type_local[g] = (type_idx, local_idx)
-                g += 1
+            self._type_offset[type_idx] = g
+            self._type_size[type_idx] = n
+            g += n
+        self._total_global_nodes = g
+
+    @property
+    def type_local_to_global(self) -> _OffsetProxy:
+        """Backward-compat: arithmetic proxy that behaves like the old dict."""
+        return _OffsetProxy(self._type_offset)
+
+    @property
+    def global_to_type_local(self) -> _ReverseOffsetProxy:
+        """Backward-compat: arithmetic proxy for the reverse mapping."""
+        return _ReverseOffsetProxy(self._type_offset, self._type_size)
 
     def get_global_index(self, type_idxs: List[int], local_idxs: List[int]) -> List[int]:
-        return [self.type_local_to_global[(t, l)] for t, l in zip(type_idxs, local_idxs)]
+        off = self._type_offset
+        return [off[t] + l for t, l in zip(type_idxs, local_idxs)]
 
     # ------------------------------------------------- regression target ops
     def adopt_target_stats(self, mean: Optional[float], std: Optional[float]):

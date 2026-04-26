@@ -55,13 +55,16 @@ def test_unified_type_map_does_not_iterate_other_datasets():
     tok._create_global_mappings()
 
     # Verify the mapping covers exactly the foo cache's nodes.
+    # NOTE: ``_total_global_nodes`` replaced the old
+    # ``len(type_local_to_global)`` / ``len(global_to_type_local)``
+    # check after the dict was switched to a (small) offset table to
+    # avoid the rel-event 22 GiB-per-instance OOM.
     foo_total = cache_foo.num_nodes_total()
-    assert len(tok.type_local_to_global) == foo_total
-    assert len(tok.global_to_type_local) == foo_total
+    assert tok._total_global_nodes == foo_total
 
-    # Every (type_idx, local_idx) entry uses a UNIFIED type id (i.e., the
-    # same id this type would have in the rel-bar TaskTokens).
-    for (type_idx, _local_idx) in tok.type_local_to_global:
+    # Every type id in the offset table uses a UNIFIED type id (i.e.,
+    # the same id this type would have in the rel-bar TaskTokens).
+    for type_idx in tok._type_offset:
         prefixed = tok.index_to_node_type[type_idx]
         assert prefixed in cache_foo.node_types  # was iterated correctly
         assert tok.node_type_to_index[prefixed] == type_idx
@@ -80,4 +83,4 @@ def test_single_dataset_path_unaffected():
     tok.node_types = list(cache.node_types)
 
     tok._create_global_mappings()
-    assert len(tok.type_local_to_global) == cache.num_nodes_total()
+    assert tok._total_global_nodes == cache.num_nodes_total()
