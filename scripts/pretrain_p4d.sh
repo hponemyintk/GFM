@@ -345,10 +345,16 @@ phase2_build_one() {
     echo "  $ds.$task: building ... (log: $log)"
     # CPU-bound -- explicitly hide GPUs so a stray torch.cuda call in
     # the offline script doesn't reserve VRAM uselessly.
+    # IMPORTANT: --name_prefix MUST match the prefix the multi-task
+    # trainer uses at runtime (train_multi_task.py:148 passes
+    # ``name_prefix=ds_name``). Without this, shard type ids are
+    # un-prefixed (``users``, ``events``) while the runtime expects
+    # prefixed (``rel-event::users``) and lookups KeyError.
     if CUDA_VISIBLE_DEVICES="" python3 tools/precompute_shards.py \
         --dataset "$ds" --task "$task" \
         --K "$K" --shard_size "$SHARD_SIZE" \
         --out_dir "$out" \
+        --name_prefix "$ds" \
         --splits train val test > "$log" 2>&1; then
         touch "$out/.done"
         echo "  $ds.$task: done in $(( $(date +%s) - t0 ))s"

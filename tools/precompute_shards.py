@@ -50,6 +50,17 @@ def parse_args():
     p.add_argument("--splits", nargs="+", default=["train", "val", "test"])
     p.add_argument("--cache_dir", default=os.path.expanduser("~/.cache/relbench_examples"))
     p.add_argument("--undirected", action="store_true", default=True)
+    p.add_argument(
+        "--name_prefix",
+        default=None,
+        help="Prefix for node type names (e.g. dataset name). MUST match "
+             "the name_prefix the multi-task trainer uses at runtime, "
+             "otherwise the shard type ids won't match the unified type "
+             "map and TaskTokens._sample_from_shards will KeyError. "
+             "For the launcher's multi-task path, pass the dataset name "
+             "(e.g. 'rel-f1', 'rel-event'). Single-task / dev-kyaw "
+             "compatible runs leave it None.",
+    )
     return p.parse_args()
 
 
@@ -171,7 +182,9 @@ def precompute_split(cache, task, split, K, out_dir, shard_size):
 def main():
     args = parse_args()
     data, task = load_data(args)
-    cache = DatasetGraphCache(data=data, undirected=args.undirected, name_prefix=None)
+    cache = DatasetGraphCache(
+        data=data, undirected=args.undirected, name_prefix=args.name_prefix,
+    )
     for split in args.splits:
         precompute_split(cache, task, split, args.K, args.out_dir, args.shard_size)
 
