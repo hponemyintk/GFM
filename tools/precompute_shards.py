@@ -77,6 +77,24 @@ def load_data(args):
         ),
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )
+
+    # Shard building only needs the structural part (CSR adjacency +
+    # per-node timestamps). The TF columns can be tens of GB on big
+    # datasets (rel-event ~25 GB) and are never read during sampling,
+    # so drop them right after load to keep per-process RAM bounded.
+    # The training run loads its own TF later via TFStoreReader.
+    import gc as _gc
+    for _nt in list(data.node_types):
+        store = data[_nt]
+        if hasattr(store, "tf"):
+            try:
+                del store["tf"]
+            except Exception:
+                try:
+                    delattr(store, "tf")
+                except Exception:
+                    pass
+    _gc.collect()
     return data, task
 
 

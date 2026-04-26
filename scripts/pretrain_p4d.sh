@@ -144,25 +144,34 @@ NPROC="${NPROC:-8}"
 OUT_DIR="${OUT_DIR:-results/p4d_pretrain}"
 RUN_NAME="${RUN_NAME:-p4d_alltasks}"
 SHARD_SIZE="${SHARD_SIZE:-50000}"
-# Phase 1 (TF memmap, GPU-bound) and Phase 2 (shards, CPU-bound) build
-# datasets / tasks in parallel up to PARALLEL_BUILDS. Default = $NPROC
-# = number of GPUs on the box; phase 1 round-robins datasets across
-# GPUs via CUDA_VISIBLE_DEVICES, phase 2 just runs N CPU processes.
-# Phase 1 will be clamped to <= $NPROC at runtime so we never assign a
-# CUDA_VISIBLE_DEVICES id beyond what physically exists.
+# Phase 1 (TF memmap) and Phase 2 (shards) have different bottlenecks:
+#   * Phase 1 is GPU-bound (text embedding). Default concurrency
+#     PARALLEL_TF_BUILDS = NPROC, one A100 per dataset.
+#   * Phase 2 is RAM-bound. Each process loads make_pkey_fkey_graph
+#     and even with the post-load TF drop, peak per-process RSS can
+#     still hit ~5-10 GB on rel-event during seed-pass-build. With
+#     PARALLEL_BUILDS=8 concurrent shard builders that's 40-80 GB --
+#     fine on p4d's 1.1 TB but easy to OOM on smaller pods. Default
+#     PARALLEL_SHARD_BUILDS = min(NPROC, 4) keeps it conservative.
+#
+# Both can be overridden independently. PARALLEL_BUILDS is kept as a
+# back-compat catch-all that overrides BOTH if neither phase-specific
+# var is set.
 PARALLEL_BUILDS="${PARALLEL_BUILDS:-$NPROC}"
+PARALLEL_TF_BUILDS="${PARALLEL_TF_BUILDS:-$PARALLEL_BUILDS}"
+_default_shard_builds=$(( NPROC < 4 ? NPROC : 4 ))
+PARALLEL_SHARD_BUILDS="${PARALLEL_SHARD_BUILDS:-$_default_shard_builds}"
 
 mkdir -p "$OUT_DIR" "$TF_STORE" "$SHARDS"
 
 # Validate concurrency knobs early (catch typos like PARALLEL_BUILDS=0).
-if ! [[ "$PARALLEL_BUILDS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_BUILDS" -lt 1 ]; then
-    echo "ERROR: PARALLEL_BUILDS must be a positive integer (got '$PARALLEL_BUILDS')." >&2
-    exit 1
-fi
-if ! [[ "$NPROC" =~ ^[0-9]+$ ]] || [ "$NPROC" -lt 1 ]; then
-    echo "ERROR: NPROC must be a positive integer (got '$NPROC')." >&2
-    exit 1
-fi
+for _name in PARALLEL_BUILDS PARALLEL_TF_BUILDS PARALLEL_SHARD_BUILDS NPROC; do
+    _val="${!_name}"
+    if ! [[ "$_val" =~ ^[0-9]+$ ]] || [ "$_val" -lt 1 ]; then
+        echo "ERROR: $_name must be a positive integer (got '$_val')." >&2
+        exit 1
+    fi
+done
 
 # Default RelBench v2 dataset list (overridden by $DATASETS env var).
 V2_DATASETS_DEFAULT="rel-amazon,rel-avito,rel-event,rel-f1,rel-hm,rel-stack,rel-trial"
@@ -175,6 +184,7 @@ echo "  datasets filter: $DATASETS_FILTER"
 echo "  K=$K  batch=$BATCH  channels=$CHANNELS  layers=$NUM_LAYERS  heads=$HEADS"
 echo "  ff_dropout=$FF_DROPOUT  attn_dropout=$ATTN_DROPOUT"
 echo "  epochs=$EPOCHS  steps_per_task=$STEPS_PER_TASK  workers=$WORKERS  nproc=$NPROC"
+echo "  parallel_tf=$PARALLEL_TF_BUILDS  parallel_shard=$PARALLEL_SHARD_BUILDS"
 echo "  lr=$LR  warmup=$WARMUP  loss_balance=$LOSS_BALANCE"
 echo "  cache=$CACHE  out=$OUT_DIR"
 echo
@@ -336,7 +346,7 @@ prune_pids() {
 # ------------------------------------------------------------------
 # Clamp phase-1 concurrency to the physical GPU count so we never set
 # CUDA_VISIBLE_DEVICES to a non-existent device.
-P1_CONCURRENCY=$(( PARALLEL_BUILDS < NPROC ? PARALLEL_BUILDS : NPROC ))
+P1_CONCURRENCY=$(( PARALLEL_TF_BUILDS < NPROC ? PARALLEL_TF_BUILDS : NPROC ))
 echo "[1/3] Building TF memmap stores ($P1_CONCURRENCY concurrent, one GPU each)"
 declare -a P1_PIDS=()
 P1_IDX=0
@@ -370,11 +380,11 @@ echo
 # ------------------------------------------------------------------
 # Phase 2: precomputed sample shards (parallel, CPU-only)
 # ------------------------------------------------------------------
-echo "[2/3] Building precomputed sample shards ($PARALLEL_BUILDS "\
+echo "[2/3] Building precomputed sample shards ($PARALLEL_SHARD_BUILDS "\
 "concurrent, K=$K, shard=$SHARD_SIZE)"
 declare -a P2_PIDS=()
 for spec in "${TASKS[@]}"; do
-    while [ ${#P2_PIDS[@]} -ge "$PARALLEL_BUILDS" ]; do
+    while [ ${#P2_PIDS[@]} -ge "$PARALLEL_SHARD_BUILDS" ]; do
         wait -n 2>/dev/null || true
         prune_pids P2_PIDS
     done
