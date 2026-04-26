@@ -78,6 +78,17 @@
 #   OUT_DIR                  results dir (default results/p4d_pretrain)
 #   RUN_NAME                 wandb run name (default p4d_alltasks)
 #   SHARD_SIZE               samples per memmap shard (default 50000)
+#   LOAD_CONCURRENCY         DDP ranks that may load a dataset at the
+#                            same time (default 1 = strict serial; bump
+#                            for faster startup if you have RAM headroom)
+#   MEM_WATCHDOG_PCT         Memory threshold (% of cgroup limit) at
+#                            which the watchdog SIGTERMs torchrun
+#                            BEFORE the kubelet OOMKills the pod
+#                            (default 92). Lower it if you keep getting
+#                            killed -- the kubelet kills with SIGKILL
+#                            and truncates train.log mid-write, but the
+#                            watchdog gives python 30s to flush.
+#   MEM_WATCHDOG_INTERVAL    Watchdog poll interval in seconds (default 3)
 #
 # Why these defaults will NOT OOM on p4d.24xlarge:
 #
@@ -445,6 +456,55 @@ LOG="$OUT_DIR/train.log"
 # startup, lowest peak RAM). Bump to 2 or 4 if pod has headroom.
 LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-1}"
 
+# Memory watchdog: in a Kubernetes pod, when total memory hits the
+# cgroup limit the kubelet reaps the entire container with
+# OOMKilled. The kernel oom-killer's SIGKILL gives the python
+# processes zero time to flush stdout, so the train.log on the PVC
+# is truncated mid-line and post-mortem is impossible. The watchdog
+# samples cgroup memory.current (v2) or memory.usage_in_bytes (v1)
+# every few seconds and SIGTERMs torchrun's process group when usage
+# exceeds MEM_WATCHDOG_PCT of the limit -- giving python a chance to
+# flush the [rss r<rank>] lines and write a clean error.
+MEM_WATCHDOG_PCT="${MEM_WATCHDOG_PCT:-92}"
+MEM_WATCHDOG_INTERVAL="${MEM_WATCHDOG_INTERVAL:-3}"
+
+# Locate cgroup memory current / max. Try cgroup v2 first; fall back
+# to cgroup v1; fall back to /proc/meminfo MemAvailable.
+_MEM_CURRENT=""
+_MEM_LIMIT=""
+if [ -r /sys/fs/cgroup/memory.current ] && [ -r /sys/fs/cgroup/memory.max ]; then
+    _MEM_CURRENT="/sys/fs/cgroup/memory.current"
+    _MEM_LIMIT_FILE="/sys/fs/cgroup/memory.max"
+    _MEM_LIMIT_RAW=$(cat "$_MEM_LIMIT_FILE")
+    if [ "$_MEM_LIMIT_RAW" = "max" ]; then
+        # No cgroup limit; fall back to MemTotal.
+        _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
+    else
+        _MEM_LIMIT="$_MEM_LIMIT_RAW"
+    fi
+elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ] \
+     && [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    _MEM_CURRENT="/sys/fs/cgroup/memory/memory.usage_in_bytes"
+    _MEM_LIMIT_FILE="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+    _MEM_LIMIT=$(cat "$_MEM_LIMIT_FILE")
+    # cgroup v1 sometimes reports an absurd "no limit" sentinel
+    # (~9.2 EiB on 64-bit). Fall back to MemTotal in that case.
+    if [ "$_MEM_LIMIT" -gt $((1 << 62)) ]; then
+        _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
+    fi
+else
+    _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
+fi
+
+echo "[watchdog] limit=$(numfmt --to=iec --suffix=B $_MEM_LIMIT 2>/dev/null || echo "$_MEM_LIMIT")"
+echo "[watchdog] threshold=${MEM_WATCHDOG_PCT}%  poll=${MEM_WATCHDOG_INTERVAL}s"
+
+# Compute byte threshold once.
+_MEM_THRESHOLD=$(( _MEM_LIMIT * MEM_WATCHDOG_PCT / 100 ))
+
+# Launch torchrun in its own process group so we can signal it
+# cleanly (kill the whole tree, not just the bash subshell).
+set -m
 torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --tasks "$TASKS_CSV" \
     --mode precomputed_shards \
@@ -467,7 +527,78 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --load_concurrency "$LOAD_CONCURRENCY" \
     --out_dir "$OUT_DIR" \
     --run_name "$RUN_NAME" \
-    2>&1 | tee "$LOG"
+    > "$LOG" 2>&1 &
+TORCHRUN_PID=$!
+set +m
+
+# Tail the log to the user's terminal in the background so they see
+# progress live (same UX as the previous `| tee`).
+tail -F "$LOG" &
+TAIL_PID=$!
+
+# Watchdog loop: sample memory; if over threshold, SIGTERM the
+# torchrun process group, then escalate to SIGKILL after a grace.
+(
+    while kill -0 "$TORCHRUN_PID" 2>/dev/null; do
+        if [ -n "$_MEM_CURRENT" ] && [ -r "$_MEM_CURRENT" ]; then
+            cur=$(cat "$_MEM_CURRENT" 2>/dev/null || echo 0)
+        else
+            # Fall back to MemTotal - MemAvailable.
+            avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo)
+            total=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
+            cur=$(( total - avail ))
+        fi
+        if [ "$cur" -ge "$_MEM_THRESHOLD" ]; then
+            cur_h=$(numfmt --to=iec --suffix=B "$cur" 2>/dev/null || echo "$cur")
+            lim_h=$(numfmt --to=iec --suffix=B "$_MEM_LIMIT" 2>/dev/null || echo "$_MEM_LIMIT")
+            {
+                echo
+                echo "================================================================"
+                echo "[watchdog] MEMORY THRESHOLD EXCEEDED at $(date -Is)"
+                echo "[watchdog]   used=${cur_h}  limit=${lim_h}  threshold=${MEM_WATCHDOG_PCT}%"
+                echo "[watchdog] sending SIGTERM to torchrun pgid $TORCHRUN_PID"
+                echo "[watchdog] (avoids kubelet OOMKilled which would truncate this log)"
+                echo "================================================================"
+            } >> "$LOG"
+            # SIGTERM the torchrun process group; python's signal handler
+            # (or default) will exit cleanly enough to flush stdout/stderr.
+            kill -TERM -"$TORCHRUN_PID" 2>/dev/null || kill -TERM "$TORCHRUN_PID" 2>/dev/null
+            # Give python 30s to flush + cleanup, then escalate.
+            for _ in $(seq 1 30); do
+                kill -0 "$TORCHRUN_PID" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 "$TORCHRUN_PID" 2>/dev/null; then
+                echo "[watchdog] grace expired; SIGKILL" >> "$LOG"
+                kill -KILL -"$TORCHRUN_PID" 2>/dev/null || kill -KILL "$TORCHRUN_PID" 2>/dev/null
+            fi
+            exit 0
+        fi
+        sleep "$MEM_WATCHDOG_INTERVAL"
+    done
+) &
+WATCHDOG_PID=$!
+
+# Make sure the watchdog and tail die when this script exits for ANY
+# reason (success, ctrl-c, watchdog-triggered termination).
+cleanup() {
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+    kill "$TAIL_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+# Wait for torchrun; capture its exit code so the script propagates it.
+wait "$TORCHRUN_PID"
+TORCHRUN_RC=$?
+
+# Stop the tail + watchdog now that torchrun is done.
+cleanup
+trap - EXIT INT TERM
+
+if [ "$TORCHRUN_RC" -ne 0 ]; then
+    echo
+    echo "[watchdog] torchrun exited rc=$TORCHRUN_RC (see $LOG for details)"
+fi
 
 echo
 echo "================================================================"

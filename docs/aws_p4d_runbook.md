@@ -200,3 +200,12 @@ Mitigations baked in:
   break COW). It is only used by the streaming sampler's fallback
   path; ``--mode precomputed_shards`` (the launcher default) never
   touches it.
+- **Memory watchdog**: the launcher samples cgroup `memory.current`
+  (v2) or `memory.usage_in_bytes` (v1) every 3s. When usage exceeds
+  `MEM_WATCHDOG_PCT` (default 92%) of the cgroup limit, it SIGTERMs
+  torchrun's process group and gives python 30s to flush before
+  SIGKILL. This avoids the kubelet's `OOMKilled` reaper, which
+  SIGKILLs the entire container and truncates `train.log` mid-line --
+  with the watchdog you keep the `[rss r<rank>]` lines and the actual
+  Python traceback. Tunable via `MEM_WATCHDOG_PCT` and
+  `MEM_WATCHDOG_INTERVAL` env vars.
