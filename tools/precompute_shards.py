@@ -83,10 +83,24 @@ def load_data(args):
     # datasets (rel-event ~25 GB) and are never read during sampling,
     # so drop them right after load to keep per-process RAM bounded.
     # The training run loads its own TF later via TFStoreReader.
+    #
+    # IMPORTANT: torch_geometric's NodeStorage.num_nodes is a property
+    # that infers the count from whatever tensors the store has --
+    # often the TensorFrame itself. Once we delete .tf, tables without
+    # an explicit num_nodes or fallback tensor (like x) start returning
+    # None for num_nodes and crash gfm_data/graph_cache.py:_num_nodes_of
+    # with TypeError: int() argument ... not 'NoneType'. Pin the count
+    # explicitly before dropping the TF.
     import gc as _gc
     for _nt in list(data.node_types):
         store = data[_nt]
         if hasattr(store, "tf"):
+            try:
+                n = store.num_nodes
+                if n is not None:
+                    store.num_nodes = int(n)
+            except Exception:
+                pass
             try:
                 del store["tf"]
             except Exception:
