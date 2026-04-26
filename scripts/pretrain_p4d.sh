@@ -461,43 +461,55 @@ LOAD_CONCURRENCY="${LOAD_CONCURRENCY:-1}"
 # OOMKilled. The kernel oom-killer's SIGKILL gives the python
 # processes zero time to flush stdout, so the train.log on the PVC
 # is truncated mid-line and post-mortem is impossible. The watchdog
-# samples cgroup memory.current (v2) or memory.usage_in_bytes (v1)
-# every few seconds and SIGTERMs torchrun's process group when usage
-# exceeds MEM_WATCHDOG_PCT of the limit -- giving python a chance to
-# flush the [rss r<rank>] lines and write a clean error.
+# samples ANONYMOUS memory only (excludes page cache, which is
+# reclaimable) from cgroup memory.stat and SIGTERMs torchrun's process
+# group when anon usage exceeds MEM_WATCHDOG_PCT of the limit -- giving
+# python a chance to flush the [rss r<rank>] lines and write a clean
+# error. We monitor anon (not memory.current) because our workload is
+# memmap-heavy: TF stores + sample shards add tens of GiB of file-
+# backed page cache that the kernel will evict before OOMing, so
+# memory.current trips spuriously while real anonymous heap is fine.
 MEM_WATCHDOG_PCT="${MEM_WATCHDOG_PCT:-92}"
 MEM_WATCHDOG_INTERVAL="${MEM_WATCHDOG_INTERVAL:-3}"
 
-# Locate cgroup memory current / max. Try cgroup v2 first; fall back
-# to cgroup v1; fall back to /proc/meminfo MemAvailable.
-_MEM_CURRENT=""
+# Locate cgroup memory.stat + memory.max (v2) / memory.limit (v1).
+# We grep one line out of memory.stat per poll: cheap.
+_MEM_STAT=""
+_MEM_STAT_KEY=""   # "anon" on v2, "rss" on v1
 _MEM_LIMIT=""
-if [ -r /sys/fs/cgroup/memory.current ] && [ -r /sys/fs/cgroup/memory.max ]; then
-    _MEM_CURRENT="/sys/fs/cgroup/memory.current"
-    _MEM_LIMIT_FILE="/sys/fs/cgroup/memory.max"
-    _MEM_LIMIT_RAW=$(cat "$_MEM_LIMIT_FILE")
+if [ -r /sys/fs/cgroup/memory.stat ] && [ -r /sys/fs/cgroup/memory.max ]; then
+    # cgroup v2
+    _MEM_STAT="/sys/fs/cgroup/memory.stat"
+    _MEM_STAT_KEY="anon"
+    _MEM_LIMIT_RAW=$(cat /sys/fs/cgroup/memory.max)
     if [ "$_MEM_LIMIT_RAW" = "max" ]; then
-        # No cgroup limit; fall back to MemTotal.
         _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
     else
         _MEM_LIMIT="$_MEM_LIMIT_RAW"
     fi
-elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ] \
+elif [ -r /sys/fs/cgroup/memory/memory.stat ] \
      && [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
-    _MEM_CURRENT="/sys/fs/cgroup/memory/memory.usage_in_bytes"
-    _MEM_LIMIT_FILE="/sys/fs/cgroup/memory/memory.limit_in_bytes"
-    _MEM_LIMIT=$(cat "$_MEM_LIMIT_FILE")
-    # cgroup v1 sometimes reports an absurd "no limit" sentinel
-    # (~9.2 EiB on 64-bit). Fall back to MemTotal in that case.
+    # cgroup v1 -- "rss" in memory.stat is anon RSS (despite the name),
+    # NOT including kernel page cache (which is "cache").
+    _MEM_STAT="/sys/fs/cgroup/memory/memory.stat"
+    _MEM_STAT_KEY="rss"
+    _MEM_LIMIT=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
     if [ "$_MEM_LIMIT" -gt $((1 << 62)) ]; then
         _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
     fi
 else
+    # No cgroup; we'll compute anon from /proc/meminfo at poll time
+    # as Active(anon) + Inactive(anon).
     _MEM_LIMIT=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
 fi
 
+if [ -n "$_MEM_STAT" ]; then
+    echo "[watchdog] anon source: $_MEM_STAT (key=$_MEM_STAT_KEY)"
+else
+    echo "[watchdog] anon source: /proc/meminfo Active(anon)+Inactive(anon)"
+fi
 echo "[watchdog] limit=$(numfmt --to=iec --suffix=B $_MEM_LIMIT 2>/dev/null || echo "$_MEM_LIMIT")"
-echo "[watchdog] threshold=${MEM_WATCHDOG_PCT}%  poll=${MEM_WATCHDOG_INTERVAL}s"
+echo "[watchdog] threshold=${MEM_WATCHDOG_PCT}% (anon only; page cache excluded)  poll=${MEM_WATCHDOG_INTERVAL}s"
 
 # Compute byte threshold once.
 _MEM_THRESHOLD=$(( _MEM_LIMIT * MEM_WATCHDOG_PCT / 100 ))
@@ -540,13 +552,18 @@ TAIL_PID=$!
 # torchrun process group, then escalate to SIGKILL after a grace.
 (
     while kill -0 "$TORCHRUN_PID" 2>/dev/null; do
-        if [ -n "$_MEM_CURRENT" ] && [ -r "$_MEM_CURRENT" ]; then
-            cur=$(cat "$_MEM_CURRENT" 2>/dev/null || echo 0)
+        if [ -n "$_MEM_STAT" ] && [ -r "$_MEM_STAT" ]; then
+            # Read anon (cgroup v2) or rss (cgroup v1) -- both are
+            # bytes of anonymous memory, EXCLUDING page cache.
+            cur=$(awk -v key="$_MEM_STAT_KEY" '$1 == key { print $2; exit }' \
+                  "$_MEM_STAT" 2>/dev/null || echo 0)
         else
-            # Fall back to MemTotal - MemAvailable.
-            avail=$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo)
-            total=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo)
-            cur=$(( total - avail ))
+            # No cgroup: anon ~= Active(anon) + Inactive(anon).
+            cur=$(awk '
+                /^Active\(anon\):/   { a = $2 }
+                /^Inactive\(anon\):/ { i = $2 }
+                END                  { print (a + i) * 1024 }
+            ' /proc/meminfo)
         fi
         if [ "$cur" -ge "$_MEM_THRESHOLD" ]; then
             cur_h=$(numfmt --to=iec --suffix=B "$cur" 2>/dev/null || echo "$cur")
@@ -554,8 +571,9 @@ TAIL_PID=$!
             {
                 echo
                 echo "================================================================"
-                echo "[watchdog] MEMORY THRESHOLD EXCEEDED at $(date -Is)"
-                echo "[watchdog]   used=${cur_h}  limit=${lim_h}  threshold=${MEM_WATCHDOG_PCT}%"
+                echo "[watchdog] ANON MEMORY THRESHOLD EXCEEDED at $(date -Is)"
+                echo "[watchdog]   anon=${cur_h}  limit=${lim_h}  threshold=${MEM_WATCHDOG_PCT}%"
+                echo "[watchdog]   (page cache excluded -- this is real heap pressure)"
                 echo "[watchdog] sending SIGTERM to torchrun pgid $TORCHRUN_PID"
                 echo "[watchdog] (avoids kubelet OOMKilled which would truncate this log)"
                 echo "================================================================"
