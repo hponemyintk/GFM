@@ -17,7 +17,9 @@ Single-task ``__getitem__`` output is otherwise identical to dev-kyaw.
 
 from __future__ import annotations
 
+import bisect
 import gc
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -49,19 +51,34 @@ TASK_TYPE_MULTILABEL = 2
 # overhead. The mapping is just a contiguous stacked layout, so we
 # store only a small offset table (~10 entries) and compute on the fly.
 class _OffsetProxy:
-    """Dict-like proxy: ``(type_idx, local_idx) -> global_idx`` via offsets."""
-    __slots__ = ("_off",)
+    """Dict-like proxy: ``(type_idx, local_idx) -> global_idx`` via offsets.
 
-    def __init__(self, offset: Dict[int, int]):
+    Bounds-checked to mirror the old dict's KeyError semantics: the
+    previous implementation stored one entry per node, so any
+    ``(t, l)`` outside ``[0, num_nodes_of(t))`` raised ``KeyError``.
+    Without bounds checks the proxy would silently alias into the
+    next/previous type's range -- a footgun for any future caller.
+    """
+    __slots__ = ("_off", "_sizes")
+
+    def __init__(self, offset: Dict[int, int], sizes: Dict[int, int]):
         self._off = offset
+        self._sizes = sizes
 
     def __getitem__(self, key):
         type_idx, local_idx = key
+        if type_idx not in self._off:
+            raise KeyError(key)
+        if local_idx < 0 or local_idx >= self._sizes[type_idx]:
+            raise KeyError(key)
         return self._off[type_idx] + local_idx
 
     def __contains__(self, key):
-        type_idx, _local_idx = key
-        return type_idx in self._off
+        type_idx, local_idx = key
+        return (
+            type_idx in self._off
+            and 0 <= local_idx < self._sizes[type_idx]
+        )
 
     def __len__(self):
         raise NotImplementedError(
@@ -76,7 +93,18 @@ class _OffsetProxy:
 
 
 class _ReverseOffsetProxy:
-    """Dict-like proxy: ``global_idx -> (type_idx, local_idx)`` via offsets."""
+    """Dict-like proxy: ``global_idx -> (type_idx, local_idx)`` via offsets.
+
+    Bisect note: the sorted table holds ``(offset, type_idx)`` pairs,
+    so we MUST search with a 2-tuple ``(global_idx, math.inf)`` --
+    Python tuple comparison treats ``(5,) < (5, 2)`` as True (shorter
+    tuple is less when prefix is equal), so a bare ``(global_idx,)``
+    lands BEFORE ``(global_idx, type_idx)`` and bisect_right - 1
+    returns the WRONG entry at every type boundary (including
+    global_idx == 0). Using ``math.inf`` as the second element
+    forces strict-greater comparison so the bisect lands AFTER the
+    matching offset, and pos-1 selects the right slot.
+    """
     __slots__ = ("_off", "_sizes", "_sorted")
 
     def __init__(self, offset: Dict[int, int], sizes: Dict[int, int]):
@@ -86,12 +114,13 @@ class _ReverseOffsetProxy:
         self._sorted = sorted((o, t) for t, o in offset.items())
 
     def __getitem__(self, global_idx: int):
-        import bisect
-        pos = bisect.bisect_right(self._sorted, (global_idx,)) - 1
+        pos = bisect.bisect_right(self._sorted, (global_idx, math.inf)) - 1
         if pos < 0:
             raise KeyError(global_idx)
         off, type_idx = self._sorted[pos]
         local_idx = global_idx - off
+        if local_idx >= self._sizes[type_idx]:
+            raise KeyError(global_idx)
         return (type_idx, local_idx)
 
     def __len__(self):
@@ -294,7 +323,7 @@ class TaskTokens(Dataset):
     @property
     def type_local_to_global(self) -> _OffsetProxy:
         """Backward-compat: arithmetic proxy that behaves like the old dict."""
-        return _OffsetProxy(self._type_offset)
+        return _OffsetProxy(self._type_offset, self._type_size)
 
     @property
     def global_to_type_local(self) -> _ReverseOffsetProxy:
