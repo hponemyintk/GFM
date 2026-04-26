@@ -191,3 +191,12 @@ Mitigations baked in:
 - Per-rank RSS is logged at `[rss r0] pre-load <ds>` and
   `[rss r0] post-load <ds>`; grep for `\[rss` in the train log to see
   which dataset's load is the peak.
+- `DatasetGraphCache.all_nodes` is now a lazy ``@property``. The
+  previous eager construction materialized a Python
+  ``List[Tuple[str, int]]`` with one entry per node across every type
+  -- on rel-event (~100M+ nodes) that was ~8 GiB of *Python tuple
+  objects* per dataset, replicated on every DDP rank, and further
+  duplicated by every DataLoader worker fork (CPython ref-count writes
+  break COW). It is only used by the streaming sampler's fallback
+  path; ``--mode precomputed_shards`` (the launcher default) never
+  touches it.

@@ -134,14 +134,34 @@ class DatasetGraphCache:
         # Per-source-type CSR blocks. Key is the **prefixed** type name.
         self.csr: Dict[str, CSRBlock] = self._build_csr(data, raw_types, undirected)
 
-        # All-nodes fallback list (matches utils.local_nodes_hetero
-        # ``GLOBAL_ALL_NODES``). Stored as a Python list of (prefixed_type, idx)
-        # for direct use with random.sample / random.choices in the sampler.
-        self.all_nodes: List[Tuple[str, int]] = []
-        for nt in self.node_types:
-            raw = self.prefixed_to_raw[nt]
-            n = self._num_nodes_of(data, raw)
-            self.all_nodes.extend((nt, i) for i in range(n))
+        # OOM mitigation: ``all_nodes`` used to be eagerly materialized as a
+        # ``List[Tuple[str, int]]`` with ONE entry per node across all
+        # types -- on rel-event (~100M+ nodes) that's ~8 GiB of Python
+        # tuple objects per dataset, replicated on every DDP rank, and
+        # further duplicated by every DataLoader worker fork (CPython
+        # ref-count writes break COW). It is only used by the streaming
+        # sampler's fallback path; ``precomputed_shards`` mode never
+        # touches it. Cache only the per-type sizes here -- materialize
+        # the full list lazily when ``self.all_nodes`` is first accessed.
+        self._all_nodes_counts: List[Tuple[str, int]] = [
+            (self._with_prefix(t), self._num_nodes_of(data, t)) for t in raw_types
+        ]
+        self._all_nodes_cached: Optional[List[Tuple[str, int]]] = None
+
+    @property
+    def all_nodes(self) -> List[Tuple[str, int]]:
+        """Lazy ``[(prefixed_type, idx), ...]`` over every node.
+
+        Built on first access; only the streaming sampler's fallback
+        needs it. Skipping eager construction saves ~8 GiB per dataset
+        per rank on rel-event.
+        """
+        if self._all_nodes_cached is None:
+            out: List[Tuple[str, int]] = []
+            for nt, n in self._all_nodes_counts:
+                out.extend((nt, i) for i in range(n))
+            self._all_nodes_cached = out
+        return self._all_nodes_cached
 
     # ------------------------------------------------------------------ build
     def _with_prefix(self, t: str) -> str:
