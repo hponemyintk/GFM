@@ -268,6 +268,55 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
             if prefixed not in unified_type_map:
                 unified_type_map[prefixed] = len(unified_type_map)
 
+    # OOM mitigation: pre-load EntityTask objects with the same chunked
+    # DDP-barrier serialization used for _load_dataset. Without this,
+    # all 8 ranks call ``get_task(ds, tk, download=True)`` simultaneously
+    # and each call internally invokes ``get_dataset(ds).get_db()`` --
+    # which constructs a NEW Dataset instance separate from the one
+    # _load_dataset already freed, reloading the raw pickle into memory.
+    # For rel-event that's ~25 GiB per rank; 8 ranks x 25 GiB = ~200 GiB
+    # transient spike on top of the ~176 GiB steady-state HeteroData.
+    # Serializing into chunks of ``args.load_concurrency`` bounds the
+    # transient to 1 rank x 25 GiB at a time, and we ``cache_clear()``
+    # the lru-cached raw DB after each slot so it doesn't accumulate.
+    import gc as _gc_tasks
+    task_objs_by_key: Dict[Tuple[str, str], EntityTask] = {}
+
+    def _load_tasks_for_dataset(ds_name: str) -> None:
+        for (tk_name, _w) in by_ds[ds_name]:
+            task_obj = get_task(ds_name, tk_name, download=True)
+            task_objs_by_key[(ds_name, tk_name)] = task_obj
+        # Free the raw DB pickle that get_task's internal get_dataset()
+        # populated via lru_cache. The Dataset instance itself is
+        # process-local cheap metadata; we just want the multi-GiB
+        # pickle reference dropped before the next rank loads.
+        try:
+            _dset = get_dataset(ds_name, download=False)
+            _dset.get_db.cache_clear()
+            del _dset
+        except Exception:
+            pass
+        _gc_tasks.collect()
+
+    for ds_name in by_ds:
+        if local_rank == 0:
+            print(
+                f"[multi-task] loading task objects for '{ds_name}' "
+                f"({len(by_ds[ds_name])} tasks) ...",
+                flush=True,
+            )
+        if dist.is_initialized() and ddp_world > chunk:
+            for slot in range(0, ddp_world, chunk):
+                if slot <= ddp_rank < slot + chunk:
+                    _log_rss("pre-task-load", ds_name)
+                    _load_tasks_for_dataset(ds_name)
+                    _log_rss("post-task-load", ds_name)
+                dist.barrier()
+        else:
+            _log_rss("pre-task-load", ds_name)
+            _load_tasks_for_dataset(ds_name)
+            _log_rss("post-task-load", ds_name)
+
     # Build TaskTokens per (dataset, task, split). task_id is the global
     # index of the (ds, tk) pair in tasks_spec order.
     task_tokens: Dict[str, List[TaskTokens]] = {"train": [], "val": [], "test": []}
@@ -276,7 +325,7 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
     weights: List[float] = []
 
     for ti, (ds_name, tk_name, w) in enumerate(tasks_spec):
-        task = get_task(ds_name, tk_name, download=True)
+        task = task_objs_by_key[(ds_name, tk_name)]
         task_objs.append(task)
         task_names.append(f"{ds_name}.{tk_name}")
         weights.append(w)
