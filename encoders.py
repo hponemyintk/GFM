@@ -765,7 +765,24 @@ class NeighborTfsEncoder(nn.Module):
 
             x_seq = torch.cat([cls_tokens, x_cols], dim=1)
 
-            x_out = self.shared_transformer(x_seq)
+            # CUDA efficient-attention kernel (sdpa) has a hard batch-
+            # size limit of 65535. With multi-task batch_size=512 *
+            # K=300 = 153,600 neighbor slots and a dominant node type
+            # (e.g., rel-event ``users``) taking most of those slots,
+            # this kernel overflow crashes the first training step.
+            # Chunk along the batch dim to keep the fast kernels on
+            # smaller pieces; sequences are short (num_columns + 1
+            # CLS ~= 5-20 tokens) so the chunking overhead is
+            # unmeasurable. Single-task / smaller-batch runs hit the
+            # one-shot path below.
+            _SDPA_BATCH_LIMIT = 65535
+            if x_seq.size(0) > _SDPA_BATCH_LIMIT:
+                chunks = x_seq.split(_SDPA_BATCH_LIMIT, dim=0)
+                x_out = torch.cat(
+                    [self.shared_transformer(c) for c in chunks], dim=0
+                )
+            else:
+                x_out = self.shared_transformer(x_seq)
 
             x_final = x_out[:, 0, :]
 
