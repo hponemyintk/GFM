@@ -149,29 +149,41 @@ echo "[0/3] Enumerating RelBench tasks (binary + regression only)"
 
 # Pass DATASETS_FILTER into Python; emit a list of "ds.task:1.0" strings.
 TASKS_RAW=$(DATASETS_FILTER="$DATASETS_FILTER" python3 - <<'PY'
-import os, sys
-from relbench.tasks import get_task_names, get_task
-from relbench.base import TaskType
+import contextlib
+import os
+import sys
 
-ALLOWED = {TaskType.BINARY_CLASSIFICATION, TaskType.REGRESSION}
-filt = os.environ["DATASETS_FILTER"].strip()
-datasets = [d.strip() for d in filt.split(",") if d.strip()]
+# CRITICAL: relbench prints "Loading Database... Done in X seconds." to
+# STDOUT every time a dataset is loaded. We capture this heredoc's
+# stdout into a bash array, so any stray relbench print contaminates
+# the task list (the famous "File 'Done/db.zip' is not in the registry"
+# error). Redirect ALL print output during loading to stderr; emit only
+# the final clean list to stdout at the end.
+with contextlib.redirect_stdout(sys.stderr):
+    from relbench.tasks import get_task_names, get_task
+    from relbench.base import TaskType
 
-out = []
-for ds in datasets:
-    try:
-        names = get_task_names(ds)
-    except Exception as e:
-        print(f"# WARN: cannot list tasks for {ds}: {e}", file=sys.stderr)
-        continue
-    for tn in names:
+    ALLOWED = {TaskType.BINARY_CLASSIFICATION, TaskType.REGRESSION}
+    filt = os.environ["DATASETS_FILTER"].strip()
+    datasets = [d.strip() for d in filt.split(",") if d.strip()]
+
+    out = []
+    for ds in datasets:
         try:
-            t = get_task(ds, tn)
-            if t.task_type in ALLOWED:
-                out.append(f"{ds}.{tn}:1.0")
+            names = get_task_names(ds)
         except Exception as e:
-            print(f"# WARN: cannot load {ds}.{tn}: {e}", file=sys.stderr)
-print("\n".join(out))
+            print(f"# WARN: cannot list tasks for {ds}: {e}", file=sys.stderr)
+            continue
+        for tn in names:
+            try:
+                t = get_task(ds, tn)
+                if t.task_type in ALLOWED:
+                    out.append(f"{ds}.{tn}:1.0")
+            except Exception as e:
+                print(f"# WARN: cannot load {ds}.{tn}: {e}", file=sys.stderr)
+
+# Only the final list goes to stdout (captured by the bash $(...)).
+sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 PY
 )
 
