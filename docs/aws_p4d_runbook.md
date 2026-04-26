@@ -208,6 +208,27 @@ Mitigations baked in:
   COW-duplicates them on first ref-count write. The release happens
   *before* the model is wrapped in DDP / DataLoader is constructed,
   so workers fork with minimal anon memory.
+- **All multi-GiB DB-load entry points are now serialized.** A
+  full audit of relbench's `Database.load` callers found three
+  paths that can pickle-load the multi-GiB raw DB:
+  1. `dataset.get_db(...)` directly — covered by `_load_dataset()`
+     and `_do_load_db_and_graph()` chunked-barrier slots.
+  2. `get_task(ds, tk, download=True)` — covered by the per-dataset
+     pre-flight `_load_tasks_for_dataset()` slot.
+  3. `task.get_table(split)` cache miss — falls into `_get_table()`
+     which calls `dataset.get_db()`. Now pre-warmed for all three
+     splits inside the same serialized slot in both multi-task
+     (`_load_tasks_for_dataset`) and single-task
+     (`_do_load_db_and_graph`) paths. After pre-warm,
+     `task.get_table` is lru-cached on the task object; later
+     invocations (TaskTokens.__init__, eval loop) are pure dict
+     lookups with no I/O.
+
+  Also: single-task path's `stypes.json` regeneration on cold
+  cache (`main_node_ddp.py:209`) was previously fired by all 8
+  ranks in parallel; it now runs inside the same load-concurrency
+  slot via `gfm_data.stypes.load_or_generate_stypes`.
+
 - **`WORKERS` default lowered from 4 to 2**: each DataLoader worker
   is a forked Python process; CPython ref-counting breaks COW so each
   fork's anon RSS grows toward parent-rank size. With 8 ranks * 2

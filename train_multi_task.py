@@ -285,6 +285,27 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
     def _load_tasks_for_dataset(ds_name: str) -> None:
         for (tk_name, _w) in by_ds[ds_name]:
             task_obj = get_task(ds_name, tk_name, download=True)
+            # Pre-warm the per-split parquet caches INSIDE the serialized
+            # slot. ``task.get_table(split)`` reads {cache_dir}/{split}.parquet
+            # if present; if missing it falls into ``_get_table`` ->
+            # ``dataset.get_db()`` which would otherwise fire on all 8
+            # ranks simultaneously the first time TaskTokens.__init__
+            # runs. Doing it here ensures any DB pickle load is bounded
+            # by ``args.load_concurrency``. After this call,
+            # task.get_table is lru-cached on the task object; later
+            # invocations in TaskTokens / eval are pure dict lookups.
+            for _split in ("train", "val", "test"):
+                try:
+                    task_obj.get_table(_split)
+                except Exception as e:
+                    # Don't let a single split failure blow up startup;
+                    # TaskTokens construction below will surface a real
+                    # error if this turns out to be load-blocking.
+                    print(
+                        f"[multi-task] WARN: pre-warm get_table({_split}) "
+                        f"failed for {ds_name}.{tk_name}: {e}",
+                        flush=True,
+                    )
             task_objs_by_key[(ds_name, tk_name)] = task_obj
         # Free the raw DB pickle that get_task's internal get_dataset()
         # populated via lru_cache. The Dataset instance itself is

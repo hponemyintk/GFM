@@ -199,22 +199,17 @@ dataset: Dataset = get_dataset(args.dataset, download=True)
 task: EntityTask = get_task(args.dataset, args.task, download=True)
 
 stypes_cache_path = Path(f"{args.cache_dir}/{args.dataset}/stypes.json")
-try:
-    with open(stypes_cache_path, "r") as f:
-        col_to_stype_dict = json.load(f)
-    for table, col_to_stype in col_to_stype_dict.items():
-        for col, stype_str in col_to_stype.items():
-            col_to_stype[col] = stype(stype_str)
-except FileNotFoundError:
-    col_to_stype_dict = get_stype_proposal(dataset.get_db())
-    Path(stypes_cache_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(stypes_cache_path, "w") as f:
-        json.dump(col_to_stype_dict, f, indent=2, default=str)
 
-# upto_test_timestamp=False so entity tables contain all rows the
-# test seeds reference. Temporal leakage is enforced at sampling
-# time (per-row seed_time filter), not via materialization cutoff.
-from gfm_data.stypes import filter_to_db_columns as _filter_stypes
+# Route stypes through the safe helper rather than reading json
+# inline. The helper validates the file and regenerates on corrupt
+# NaN content (the AWS bug fixed by gfm_data.stypes). It only
+# touches dataset.get_db() WHEN regeneration is needed -- and that
+# get_db call is folded into the chunked load slot below, so even
+# the cold-cache regen path is bounded by args.load_concurrency.
+from gfm_data.stypes import (
+    filter_to_db_columns as _filter_stypes,
+    load_or_generate_stypes as _load_stypes,
+)
 
 # OOM mitigation: serialize get_db + make_pkey_fkey_graph across ranks
 # (chunks of args.load_concurrency, default 1). Otherwise 8 GPUs all
@@ -225,8 +220,11 @@ _chunk = max(1, int(args.load_concurrency))
 
 
 def _do_load_db_and_graph():
+    # stypes load+regen lives INSIDE the slot so the cold-cache
+    # regen path's get_db() doesn't fan out across ranks.
+    cs_loaded = _load_stypes(stypes_cache_path, dataset, upto_test_timestamp=False)
     db_local = dataset.get_db(upto_test_timestamp=False)
-    cs_local = _filter_stypes(col_to_stype_dict, db_local)
+    cs_local = _filter_stypes(cs_loaded, db_local)
     d_local, cs_dict_local = make_pkey_fkey_graph(
         db_local,
         col_to_stype_dict=cs_local,
@@ -236,6 +234,19 @@ def _do_load_db_and_graph():
         ),
         cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
     )
+    # Pre-warm the task parquet caches inside the slot. If a parquet
+    # is missing, ``task.get_table`` falls into ``_get_table`` which
+    # calls ``self.dataset.get_db()`` -- doing it here keeps that
+    # cache-miss bounded to one rank, not all 8.
+    for _split in ("train", "val", "test"):
+        try:
+            task.get_table(_split)
+        except Exception as e:
+            print(
+                f"[single-task] WARN: pre-warm get_table({_split}) "
+                f"failed: {e}",
+                flush=True,
+            )
     return db_local, d_local, cs_dict_local
 
 
