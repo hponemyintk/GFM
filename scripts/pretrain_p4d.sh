@@ -81,20 +81,26 @@ CACHE="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 TF_STORE="$CACHE/tf_store"
 SHARDS="$CACHE/shards"
 K="${K:-300}"
+# Defaults match expts/run-large-base-experiments.sh per-task budget,
+# adjusted for batch=512 (half of expts' 1024) on 8-GPU DDP.
 BATCH="${BATCH:-512}"
-CHANNELS="${CHANNELS:-256}"
-NUM_LAYERS="${NUM_LAYERS:-2}"
+CHANNELS="${CHANNELS:-512}"
+NUM_LAYERS="${NUM_LAYERS:-4}"
 HEADS="${HEADS:-4}"
 CENTROIDS="${CENTROIDS:-4096}"
-EPOCHS="${EPOCHS:-30}"
-# MAX_STEPS sizing for full RelBench v2 (~25-30 binary+regression tasks):
-#   80 steps/task/epoch * 25 tasks = 2000 (this default)
-#   Total budget = 30 epochs * 2000 steps * 512 batch * 8 ranks
-#                ~= 246M sample-passes (~19x RT paper's 50k * 256 = 12.8M).
-# If you cut DATASETS to a single dataset, drop MAX_STEPS proportionally:
-#   for example rel-f1 alone has ~5 tasks, so MAX_STEPS=400 would match
-#   the 80 steps/task/epoch density above.
-MAX_STEPS="${MAX_STEPS:-2000}"
+FF_DROPOUT="${FF_DROPOUT:-0.3}"
+ATTN_DROPOUT="${ATTN_DROPOUT:-0.3}"
+EPOCHS="${EPOCHS:-10}"
+
+# Per-task step budget. expts/run-large-base-experiments.sh uses 500
+# (single-task, batch=1024 single-GPU). With our equal-weighted multi-
+# task sampler, total MAX_STEPS scales linearly with task count so each
+# task gets the same per-epoch density it would in the single-task run:
+#
+#   MAX_STEPS_total = STEPS_PER_TASK x N_tasks
+#
+# Auto-computed below. Override MAX_STEPS directly to bypass the auto.
+STEPS_PER_TASK="${STEPS_PER_TASK:-500}"
 WORKERS="${WORKERS:-4}"
 LR="${LR:-1e-4}"
 WARMUP="${WARMUP:-1000}"
@@ -115,7 +121,8 @@ echo "GFM multi-task pretraining (p4d.24xlarge)"
 echo "================================================================"
 echo "  datasets filter: $DATASETS_FILTER"
 echo "  K=$K  batch=$BATCH  channels=$CHANNELS  layers=$NUM_LAYERS  heads=$HEADS"
-echo "  epochs=$EPOCHS  max_steps=$MAX_STEPS  workers=$WORKERS  nproc=$NPROC"
+echo "  ff_dropout=$FF_DROPOUT  attn_dropout=$ATTN_DROPOUT"
+echo "  epochs=$EPOCHS  steps_per_task=$STEPS_PER_TASK  workers=$WORKERS  nproc=$NPROC"
 echo "  lr=$LR  warmup=$WARMUP  loss_balance=$LOSS_BALANCE"
 echo "  cache=$CACHE  out=$OUT_DIR"
 echo
@@ -179,6 +186,16 @@ for ds in "${DATASETS_SELECTED[@]}"; do
         fi
     done
 done
+
+# Compute total MAX_STEPS = STEPS_PER_TASK x N_tasks unless user pinned it.
+N_TASKS=${#TASKS[@]}
+if [ -z "${MAX_STEPS:-}" ]; then
+    MAX_STEPS=$(( STEPS_PER_TASK * N_TASKS ))
+fi
+echo
+echo "  per-task budget: ${STEPS_PER_TASK} steps/epoch, ${EPOCHS} epochs"
+echo "  total MAX_STEPS = ${STEPS_PER_TASK} x ${N_TASKS} = ${MAX_STEPS} (override via MAX_STEPS env)"
+echo "  total optimizer steps over the run: $((MAX_STEPS * EPOCHS))"
 echo
 
 # ------------------------------------------------------------------
@@ -250,6 +267,8 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --num_layers "$NUM_LAYERS" \
     --num_heads "$HEADS" \
     --num_centroids "$CENTROIDS" \
+    --ff_dropout "$FF_DROPOUT" \
+    --attn_dropout "$ATTN_DROPOUT" \
     --epochs "$EPOCHS" \
     --max_steps_per_epoch "$MAX_STEPS" \
     --num_workers "$WORKERS" \
