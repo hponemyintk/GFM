@@ -81,13 +81,20 @@ CACHE="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 TF_STORE="$CACHE/tf_store"
 SHARDS="$CACHE/shards"
 K="${K:-300}"
-BATCH="${BATCH:-128}"
+BATCH="${BATCH:-512}"
 CHANNELS="${CHANNELS:-256}"
 NUM_LAYERS="${NUM_LAYERS:-2}"
 HEADS="${HEADS:-4}"
 CENTROIDS="${CENTROIDS:-4096}"
 EPOCHS="${EPOCHS:-30}"
-MAX_STEPS="${MAX_STEPS:-3000}"
+# MAX_STEPS sizing for full RelBench v2 (~25-30 binary+regression tasks):
+#   80 steps/task/epoch * 25 tasks = 2000 (this default)
+#   Total budget = 30 epochs * 2000 steps * 512 batch * 8 ranks
+#                ~= 246M sample-passes (~19x RT paper's 50k * 256 = 12.8M).
+# If you cut DATASETS to a single dataset, drop MAX_STEPS proportionally:
+#   for example rel-f1 alone has ~5 tasks, so MAX_STEPS=400 would match
+#   the 80 steps/task/epoch density above.
+MAX_STEPS="${MAX_STEPS:-2000}"
 WORKERS="${WORKERS:-4}"
 LR="${LR:-1e-4}"
 WARMUP="${WARMUP:-1000}"
