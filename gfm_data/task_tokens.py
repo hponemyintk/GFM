@@ -295,10 +295,39 @@ class TaskTokens(Dataset):
             # KeyError or mis-route. Build a small int64 lookup table
             # once here so __getitem__ can vectorize the remap.
             if unified_type_map is not None:
+                if not cache.node_type_to_index:
+                    raise RuntimeError(
+                        "cache.node_type_to_index is empty; cannot build "
+                        "shard type remap"
+                    )
                 max_local = max(cache.node_type_to_index.values()) + 1
-                remap = np.zeros(max_local, dtype=np.int64)
+                # Sentinel-fill with a negative id so a shard referencing
+                # any local id NOT in cache.node_type_to_index (schema
+                # drift, stale shards, or a bug) trips a loud failure
+                # instead of silently aliasing into unified id 0.
+                _SENTINEL = -1
+                remap = np.full(max_local, _SENTINEL, dtype=np.int64)
                 for prefixed, local_idx in cache.node_type_to_index.items():
+                    if prefixed not in unified_type_map:
+                        raise RuntimeError(
+                            f"prefixed type {prefixed!r} (local id "
+                            f"{local_idx}) is in cache.node_type_to_index "
+                            f"but missing from unified_type_map -- the "
+                            f"unified map must cover every type in every "
+                            f"cache. Check train_multi_task.py's union "
+                            f"construction."
+                        )
                     remap[local_idx] = unified_type_map[prefixed]
+                # Sanity: every slot must have been populated (gaps would
+                # mean cache.node_type_to_index has non-contiguous local
+                # ids, violating the DatasetGraphCache contract).
+                if (remap == _SENTINEL).any():
+                    bad = np.where(remap == _SENTINEL)[0].tolist()
+                    raise RuntimeError(
+                        f"shard remap has gaps at local ids {bad}; "
+                        f"cache.node_type_to_index must produce contiguous "
+                        f"0..N-1 ids"
+                    )
                 self._shard_type_remap = remap
         # streaming: no setup needed; sampler runs in __getitem__
 
@@ -506,8 +535,23 @@ class TaskTokens(Dataset):
         s = self._shard_reader.read(idx)
         types = s["types"].astype(np.int64, copy=False)
         if self._shard_type_remap is not None:
-            # Local (per-cache) id -> unified id. Vectorized fancy
-            # index -- effectively free for K=300 sized arrays.
+            # Local (per-cache) id -> unified id. Defensive bounds
+            # check: numpy fancy indexing wraps negative ids and
+            # IndexErrors on out-of-range ids. Stale shards (built
+            # before the --name_prefix change OR with a different
+            # cache schema) can silently produce wrong types --
+            # detect and fail loudly.
+            n_local = self._shard_type_remap.shape[0]
+            if types.size and (types.min() < 0 or types.max() >= n_local):
+                raise RuntimeError(
+                    f"shard type id out of range: shard idx={idx}, "
+                    f"observed range [{int(types.min())}, "
+                    f"{int(types.max())}], remap size={n_local}. "
+                    f"This usually means shards on disk were built with "
+                    f"a different cache schema (e.g., a stale shard from "
+                    f"before --name_prefix was added). Delete and rebuild: "
+                    f"  rm -rf {self.shards_dir}"
+                )
             types = self._shard_type_remap[types]
         return {
             "types": torch.from_numpy(types),

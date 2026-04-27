@@ -156,6 +156,41 @@ def test_no_unified_map_means_no_remap():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_sample_from_shards_rejects_stale_oversize_type_id():
+    """A shard built with more types than the current cache knows
+    about (e.g., a stale shard from a previous cache schema) must
+    fail loudly at read time -- not silently alias or wrap."""
+    K = 4
+    g = make_toy_graph()
+    cache = DatasetGraphCache(data=g, undirected=True, name_prefix="rel-foo")
+    tmp = tempfile.mkdtemp(prefix="remap_stale_")
+    try:
+        # Hand-craft a shard whose 'types' contains an id beyond the
+        # current cache's local space.
+        from gfm_data.shard_io import ShardWriter
+        split_dir = os.path.join(tmp, str(K), "val")
+        os.makedirs(split_dir, exist_ok=True)
+        n_local = len(cache.node_types)
+        bad_id = n_local + 7
+        types = np.full((1, K), bad_id, dtype=np.int16)
+        indices = np.zeros((1, K), dtype=np.int32)
+        hops = np.zeros((1, K), dtype=np.int8)
+        times = np.zeros((1, K), dtype=np.float32)
+        edges = [np.zeros((2, 0), dtype=np.int16)]
+        w = ShardWriter(split_dir, K=K, total_samples=1, shard_size=1)
+        w.write_shard(0, types, indices, hops, times, edges)
+        w.finalize()
+
+        unified = {t: i + 100 for i, t in enumerate(cache.node_types)}
+        tok = _make_task_tokens(cache, K, tmp, unified_type_map=unified,
+                                num_seeds=1)
+        import pytest
+        with pytest.raises(RuntimeError, match="shard type id out of range"):
+            tok._sample_from_shards(0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_sample_from_shards_applies_remap():
     """Production path: ``_sample_from_shards`` returns remapped types
     when a unified map is in play."""
