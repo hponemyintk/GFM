@@ -480,8 +480,18 @@ def _release_cache_data(args, caches, task_tokens, local_rank: int) -> None:
 
 
 # --------------------------------------------------------- model build
-def _build_model(args, caches, col_stats_per_ds, type_to_index, num_nodes_total, device):
-    """Build RelGT(out_channels=channels) so its output is an embedding."""
+def _build_model(
+    args,
+    caches,
+    col_stats_per_ds,
+    type_to_index,
+    num_nodes_total,
+    device,
+    task_type_ids,
+):
+    """Build RelGT(out_channels=channels) so its output is an embedding,
+    then wrap with per-task heads keyed by ``task_type_ids``.
+    """
     # Union col_names_dict over all datasets/tables.
     # NOTE: we use cache._captured_col_names_dict (stashed at cache
     # construction time in _build_caches_and_tokens) so this still
@@ -523,7 +533,12 @@ def _build_model(args, caches, col_stats_per_ds, type_to_index, num_nodes_total,
         sample_node_len=args.num_neighbors,
         args=args,
     ).to(device)
-    wrapper = MultiTaskRelGT(backbone=backbone, channels=args.channels).to(device)
+    wrapper = MultiTaskRelGT(
+        backbone=backbone,
+        channels=args.channels,
+        num_tasks=len(task_type_ids),
+        task_type_ids=list(task_type_ids),
+    ).to(device)
     return wrapper
 
 
@@ -603,9 +618,15 @@ def run(args, local_rank: int, device, gpu_handle):
                 pin_memory=True,
             )
 
-    # Model + heads.
+    # Model + heads. Per-task heads need each task's type id at
+    # construction so they can be introspected later (e.g., for the
+    # type buffer the head registers).
+    task_type_ids = [
+        int(task_tokens["train"][ti].task_type_id)
+        for ti in range(len(tasks_spec))
+    ]
     model = _build_model(args, caches, col_stats_per_ds, type_to_index,
-                         num_nodes_total, device)
+                         num_nodes_total, device, task_type_ids)
     # OOM mitigation: free cache.data NOW that _build_model has read
     # what it needs. Workers fork from the parent rank below; if we
     # don't drop here, every fork inherits per-type time tensors and
@@ -678,18 +699,23 @@ def run(args, local_rank: int, device, gpu_handle):
             optim.zero_grad()
             pred = model(n_types, n_idx, n_hop, n_t, grouped,
                          edge_index=edge_index, batch=batch_v,
-                         task_type_id=task_type)
+                         task_id=task_id)
             loss, info = loss_fn(pred.float(), labels, task_id, task_type)
             loss.backward()
 
-            # ML6 (plan §6.3.2): per-datatype head grad norms. Log them
-            # so head-starvation surfaces immediately (one head receiving
-            # ~zero grad while the other dominates).
-            head_module = model.module.head
-            num_g = head_module.numeric_head.weight.grad
-            bool_g = head_module.boolean_head.weight.grad
-            num_norm = float(num_g.norm().item()) if num_g is not None else 0.0
-            bool_norm = float(bool_g.norm().item()) if bool_g is not None else 0.0
+            # Per-task head grad norm. With per-task heads only the
+            # active task's head receives gradients per step (collate
+            # invariant: single task per batch), so one scalar per
+            # step is the right amount of detail. Surfaces head-
+            # starvation by task: if a particular task_idx's head
+            # consistently logs near-zero norms over many steps, it
+            # means that task's loss isn't backpropagating.
+            ti = int(task_id[0].item())
+            task_head = model.module.head.task_heads[ti]
+            tg = task_head.weight.grad
+            task_grad_norm = (
+                float(tg.norm().item()) if tg is not None else 0.0
+            )
 
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
@@ -703,8 +729,8 @@ def run(args, local_rank: int, device, gpu_handle):
                            "lr": optim.param_groups[0]["lr"],
                            "gpu_util_percent": gpu_util,
                            "gpu_mem_allocated_MB": mem_a,
-                           "head_grad_norm_numeric": num_norm,
-                           "head_grad_norm_boolean": bool_norm}
+                           "head_grad_norm": task_grad_norm,
+                           "head_task_idx": ti}
                 for k, t in info.items():
                     if k.startswith("task_"):
                         payload[k] = float(t.item() if isinstance(t, torch.Tensor) else t)
@@ -737,9 +763,10 @@ def run(args, local_rank: int, device, gpu_handle):
                     "flat_nbr_idx": batch["flat_nbr_idx"],
                 }
                 task_type = batch["task_type_id"].to(device)
+                task_id_v = batch["task_id"].to(device)
                 pred = model.module(n_types, n_idx, n_hop, n_t, grouped,
                                     edge_index=edge_index, batch=batch_v,
-                                    task_type_id=task_type)
+                                    task_id=task_id_v)
                 # Denormalize regression preds; sigmoid binary preds.
                 tok = task_tokens[split][ti]
                 if tok.task_type_id == TASK_TYPE_REGRESSION:
