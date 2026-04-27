@@ -335,14 +335,20 @@ phase2_build_one() {
     local ds="${full%%.*}"
     local task="${full#*.}"
     local out="$SHARDS/$ds/$task"
-    if [ -f "$out/.done" ]; then
-        echo "  $ds.$task: cached"
+    # K-aware sentinel: tools/precompute_shards.py writes shards to
+    # <out>/<K>/<split>/, so the per-K .done belongs at <out>/<K>/.
+    # The earlier <out>/.done was K-blind -- a K=16 build would
+    # falsely satisfy a K=300 launch's check, then training would
+    # crash with "shards not found at .../300/train".
+    local k_dir="$out/$K"
+    if [ -f "$k_dir/.done" ]; then
+        echo "  $ds.$task: cached (K=$K)"
         return 0
     fi
     local log="$OUT_DIR/build_shard_${ds}_${task}.log"
     local t0
     t0=$(date +%s)
-    echo "  $ds.$task: building ... (log: $log)"
+    echo "  $ds.$task: building K=$K ... (log: $log)"
     # CPU-bound -- explicitly hide GPUs so a stray torch.cuda call in
     # the offline script doesn't reserve VRAM uselessly.
     # IMPORTANT: --name_prefix MUST match the prefix the multi-task
@@ -356,8 +362,9 @@ phase2_build_one() {
         --out_dir "$out" \
         --name_prefix "$ds" \
         --splits train val test > "$log" 2>&1; then
-        touch "$out/.done"
-        echo "  $ds.$task: done in $(( $(date +%s) - t0 ))s"
+        mkdir -p "$k_dir"
+        touch "$k_dir/.done"
+        echo "  $ds.$task: done in $(( $(date +%s) - t0 ))s (K=$K)"
     else
         echo "  $ds.$task: FAILED -- see $log" >&2
         return 1
@@ -452,12 +459,14 @@ else
 fi
 
 # Verify phase 2 outputs exist before launching the training run.
+# Sentinel is K-aware (under <ds>/<task>/<K>/.done) so a stale
+# .done from a different K won't pass.
 P2_MISSING=()
 for spec in "${TASKS[@]}"; do
     full="${spec%%:*}"
     ds="${full%%.*}"
     task="${full#*.}"
-    if [ ! -f "$SHARDS/$ds/$task/.done" ]; then
+    if [ ! -f "$SHARDS/$ds/$task/$K/.done" ]; then
         P2_MISSING+=("$ds.$task")
     fi
 done
