@@ -261,6 +261,7 @@ class TaskTokens(Dataset):
         # Per-mode setup.
         self.precomputed_path = None
         self._shard_reader = None
+        self._shard_type_remap: Optional[np.ndarray] = None
         if self.mode == "hdf5":
             self.precomputed_path = self._construct_precomputed_path() if precompute else None
             if self.precompute:
@@ -282,6 +283,23 @@ class TaskTokens(Dataset):
                 f"shards has {len(self._shard_reader)} samples, "
                 f"task split has {len(self.node_idxs)}"
             )
+            # Shards store type ids in the per-cache LOCAL index space
+            # (tools/precompute_shards.py iterates cache.node_type_to_index
+            # and stores its 0..N-1 ids). When unified_type_map is active
+            # (multi-dataset training), the unified ids differ from the
+            # per-cache local ids -- the union is sorted across datasets,
+            # so e.g. shard local id 0 = "rel-event::users" might map to
+            # unified id 3. Without remap, the runtime decodes the shard's
+            # 0 as whatever sits at unified index 0 ("rel-event::event_-
+            # attendees" perhaps), and self.index_to_node_type lookups
+            # KeyError or mis-route. Build a small int64 lookup table
+            # once here so __getitem__ can vectorize the remap.
+            if unified_type_map is not None:
+                max_local = max(cache.node_type_to_index.values()) + 1
+                remap = np.zeros(max_local, dtype=np.int64)
+                for prefixed, local_idx in cache.node_type_to_index.items():
+                    remap[local_idx] = unified_type_map[prefixed]
+                self._shard_type_remap = remap
         # streaming: no setup needed; sampler runs in __getitem__
 
     # ------------------------------------------------------------ id maps
@@ -486,8 +504,13 @@ class TaskTokens(Dataset):
 
     def _sample_from_shards(self, idx: int):
         s = self._shard_reader.read(idx)
+        types = s["types"].astype(np.int64, copy=False)
+        if self._shard_type_remap is not None:
+            # Local (per-cache) id -> unified id. Vectorized fancy
+            # index -- effectively free for K=300 sized arrays.
+            types = self._shard_type_remap[types]
         return {
-            "types": torch.from_numpy(s["types"].astype(np.int64, copy=False)),
+            "types": torch.from_numpy(types),
             "indices": torch.from_numpy(s["indices"].astype(np.int64, copy=False)),
             "hops": torch.from_numpy(s["hops"].astype(np.int64, copy=False)),
             "times": torch.from_numpy(s["times"]),
