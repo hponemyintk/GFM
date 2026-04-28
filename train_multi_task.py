@@ -490,7 +490,6 @@ def _build_model(
     caches,
     col_stats_per_ds,
     type_to_index,
-    num_nodes_total,
     device,
     task_type_ids,
 ):
@@ -519,7 +518,6 @@ def _build_model(
             if raw in col_stats_per_ds[ds_name]:
                 col_stats_unified[prefixed] = col_stats_per_ds[ds_name][raw]
     backbone = RelGT(
-        num_nodes=num_nodes_total,
         max_neighbor_hop=3,  # 0,1,2 + fallback (3)
         node_type_map=type_to_index,
         col_names_dict=col_names_dict,
@@ -593,7 +591,6 @@ def run(args, local_rank: int, device, gpu_handle):
     # construction (see _build_caches_and_tokens). Pull it back out here
     # for the model construction.
     type_to_index = task_tokens["train"][0].node_type_to_index
-    num_nodes_total = sum(c.num_nodes_total() for c in caches.values())
 
     # DataLoaders
     train_sampler = DistributedMultiTaskSampler(
@@ -631,7 +628,7 @@ def run(args, local_rank: int, device, gpu_handle):
         for ti in range(len(tasks_spec))
     ]
     model = _build_model(args, caches, col_stats_per_ds, type_to_index,
-                         num_nodes_total, device, task_type_ids)
+                         device, task_type_ids)
     # OOM mitigation: free cache.data NOW that _build_model has read
     # what it needs. Workers fork from the parent rank below; if we
     # don't drop here, every fork inherits per-type time tensors and

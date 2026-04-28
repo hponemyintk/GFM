@@ -442,7 +442,6 @@ else:
 # 6. Build and wrap the model in DDP
 ############################
 model = RelGT(
-    num_nodes=data["train"].data.num_nodes,
     max_neighbor_hop=data["train"].max_neighbor_hop,
     node_type_map=data["train"].node_type_to_index,
     col_names_dict=_captured_col_names,

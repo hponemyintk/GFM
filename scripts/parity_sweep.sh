@@ -38,17 +38,35 @@ mkdir -p "$RESULTS_ROOT/devkyaw" "$RESULTS_ROOT/new"
 DEVKYAW_CACHE="$HOME/.cache/relbench_examples_parity_devkyaw"
 NEW_CACHE="$HOME/.cache/relbench_examples_parity_new"
 
-# Wipe stale results unless explicitly preserved. Stale .json from a
-# killed prior sweep (with broken code) would otherwise be skipped as
-# "already done" and pollute the new comparison. Same for HDF5: stale
-# precomputed shards from a different code state would carry stale
-# indices into the comparison.
+# Wipe stale "new" results + cache. The dev-kyaw side is the
+# historical baseline -- it doesn't change across PRs, so we keep
+# its results + materialized/HDF5 cache across sweeps to save ~10
+# runs per sweep (~15 min wallclock).
+#
+# Stale .json from a killed prior sweep (with broken code) on the
+# "new" side would otherwise be skipped as "already done" and
+# pollute the new comparison; same for HDF5/materialized. So we
+# unconditionally wipe the "new" side by default.
+#
+# Two opt-out / opt-in env vars:
+#   KEEP_CACHE=1            -- skip ALL wipes (dangerous; use only
+#                              when manually iterating without code
+#                              changes)
+#   FORCE_REWIPE_DEVKYAW=1  -- also wipe dev-kyaw (rare; only when
+#                              rebuilding the historical baseline,
+#                              e.g. dev-kyaw branch advanced or the
+#                              relbench data changed)
 if [ "${KEEP_CACHE:-0}" != "1" ]; then
-  echo "=== wiping prior parity results + per-pipeline caches (KEEP_CACHE!=1) ==="
-  rm -rf "$RESULTS_ROOT/devkyaw/rel-f1" "$RESULTS_ROOT/new/rel-f1"
-  rm -f "$RESULTS_ROOT/devkyaw"/*.log "$RESULTS_ROOT/new"/*.log
-  rm -rf "$DEVKYAW_CACHE/precomputed/rel-f1" "$NEW_CACHE/precomputed/rel-f1"
-  rm -rf "$DEVKYAW_CACHE/rel-f1" "$NEW_CACHE/rel-f1"
+  echo "=== wiping NEW parity results + cache (dev-kyaw kept) ==="
+  rm -rf "$RESULTS_ROOT/new/rel-f1"
+  rm -f "$RESULTS_ROOT/new"/*.log
+  rm -rf "$NEW_CACHE/precomputed/rel-f1" "$NEW_CACHE/rel-f1"
+  if [ "${FORCE_REWIPE_DEVKYAW:-0}" = "1" ]; then
+    echo "=== also wiping dev-kyaw (FORCE_REWIPE_DEVKYAW=1) ==="
+    rm -rf "$RESULTS_ROOT/devkyaw/rel-f1"
+    rm -f "$RESULTS_ROOT/devkyaw"/*.log
+    rm -rf "$DEVKYAW_CACHE/precomputed/rel-f1" "$DEVKYAW_CACHE/rel-f1"
+  fi
 fi
 mkdir -p "$DEVKYAW_CACHE" "$NEW_CACHE"
 

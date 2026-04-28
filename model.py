@@ -23,7 +23,6 @@ class RelGTLayer(nn.Module):
         out_channels,
         local_num_layers,
         global_dim,
-        num_nodes,
         heads=1,
         concat=True,
         ff_dropout=0.0,
@@ -61,9 +60,13 @@ class RelGTLayer(nn.Module):
         self.layer_norm_local = nn.LayerNorm(out_channels)
 
         if self.conv_type != "local":
+            # Cluster popularity bias for global attention reads from
+            # ``self.vq._ema_cluster_size`` -- the codebook's own EMA over
+            # per-batch hard-assignment counts (codebook.py:106-114).
+            # No separate ``c_idx`` buffer: the VQ already tracks this
+            # consistently with the current codebook (drift-aware), is
+            # DDP-synced (codebook.py:99-104), and Laplace-smoothed.
             self.vq = VectorQuantizerEMA(num_centroids, global_dim, decay=0.99)
-            c = torch.randint(0, num_centroids, (num_nodes,), dtype=torch.long)
-            self.register_buffer("c_idx", c)
             self.attn_fn = F.softmax
 
             attn_channels = out_channels // heads
@@ -130,12 +133,13 @@ class RelGTLayer(nn.Module):
         q, k, v = map(lambda t: rearrange(t, "n (h d) -> h n d", h=h), (q, k, v))
         dots = torch.einsum("h i d, h j d -> h i j", q, k) * scale
 
-        c, c_count = self.c_idx.unique(return_counts=True)
-
-        centroid_count = torch.zeros(self.num_centroids, dtype=torch.float32, device=x.device)
-        centroid_count[c.to(torch.long)] = c_count.float()
-
-        dots = dots + torch.log(centroid_count.clamp(min=1).view(1, 1, -1))
+        # Popularity bias from the VQ's EMA cluster-size buffer.
+        # ``_ema_cluster_size`` is updated every step from the *current*
+        # codebook's hard-assignments, so the bias tracks centroid drift
+        # consistently. Replaces the old ``c_idx`` buffer which mapped
+        # node ids -> stale assignment labels.
+        centroid_count = self.vq._ema_cluster_size.clamp(min=1)
+        dots = dots + torch.log(centroid_count).view(1, 1, -1)
 
         attn = self.attn_fn(dots, dim=-1)
         attn = F.dropout(attn, p=self.attn_dropout, training=self.training)
@@ -143,10 +147,11 @@ class RelGTLayer(nn.Module):
         out = torch.einsum("h i j, h j d -> h i d", attn, v)
         out = rearrange(out, "h n d -> n (h d)")
 
-        # Update the centroids
+        # Update the codebook EMA. ``vq.update`` also refreshes
+        # ``_ema_cluster_size`` (codebook.py:106-114) which feeds the
+        # popularity bias above on the *next* batch.
         if self.training:
-            x_idx = self.vq.update(q_x)
-            self.c_idx[batch_idx] = x_idx.squeeze().to(torch.long)
+            self.vq.update(q_x)
 
         return out
 
@@ -164,7 +169,6 @@ class RelGTLayer(nn.Module):
 class RelGT(torch.nn.Module):
     def __init__(
         self,
-        num_nodes: int,
         max_neighbor_hop: int,
         node_type_map: Dict[str, int],
         col_names_dict: Dict[str, Dict[str, List[str]]],
@@ -231,7 +235,6 @@ class RelGT(torch.nn.Module):
                     out_channels=hidden_channels,
                     local_num_layers=local_num_layers,
                     global_dim=global_dim,
-                    num_nodes=num_nodes,
                     heads=heads,
                     ff_dropout=ff_dropout,
                     attn_dropout=attn_dropout,
