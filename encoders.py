@@ -458,14 +458,26 @@ class TableAgnosticStypeEncoder(nn.Module):
 # ============================================================
 
 class NeighborTfsEncoder(nn.Module):
-    """
-    Table agnostic transformer encoder for neighbor TensorFrames.
+    """Table-agnostic transformer encoder for neighbor TensorFrames.
+
+    Schema state (per-prefixed-type Z-score buffers, column-name GloVe
+    embeddings, the inverse type-id map) is **not** baked into
+    ``__init__`` -- it's installed via :meth:`register_dataset`, which
+    can be called multiple times to extend the encoder's known schema
+    (e.g. at adoption time on a new dataset).
+
+    For backward compatibility, ``__init__`` still accepts
+    ``node_type_map`` + ``col_names_dict`` + ``col_stats_dict``: when
+    all three are provided it auto-calls :meth:`register_dataset` once.
+    Phase-4 cross-dataset adoption will instead construct with
+    architectural args only and call :meth:`register_dataset` per
+    incoming dataset.
     """
 
     def __init__(
         self,
         channels: int,
-        node_type_map: Dict[str, int],
+        node_type_map: Optional[Dict[str, int]] = None,
         col_names_dict: Optional[Dict] = None,
         col_stats_dict: Optional[Dict] = None,
         default_stype_encoder_cls_kwargs: Optional[Dict] = None,
@@ -477,22 +489,28 @@ class NeighborTfsEncoder(nn.Module):
 
         super().__init__()
 
-        self.node_type_map = node_type_map
-        self.inv_node_type_map = {idx: nt for nt, idx in node_type_map.items()}
         self.channels = channels
 
-        # Discover all unique embedding dimensions from col_stats_dict
-        emb_dims = set()
-        if col_names_dict and col_stats_dict:
-            for node_type, stype_dict in col_names_dict.items():
-                for col in stype_dict.get(torch_frame.embedding, []):
-                    table_stats = col_stats_dict.get(node_type, {})
-                    cs = table_stats.get(col, {})
-                    dim = cs.get(StatType.EMB_DIM)
-                    if dim is not None and dim > 0:
-                        emb_dims.add(dim)
+        # ------------------------------------------------- schema state
+        # Empty until register_dataset() is called. Populated incrementally
+        # so the encoder can accept additional datasets at adoption time.
+        self.node_type_map: Dict[str, int] = {}
+        self.inv_node_type_map: Dict[int, str] = {}
+        self._node_type_to_safe: Dict[str, str] = {}
+        self._col_name_to_idx: Dict[str, int] = {}
+        # Runtime cache for GloVe vectors of column names that arrive at
+        # forward time but weren't in any register_dataset call. Populated
+        # lazily; per-rank (GloVe is deterministic so DDP ranks agree).
+        self._col_unseen_cache: Dict[str, Tensor] = {}
+        self._glove_embedder = None  # constructed on first register_dataset
 
-        self.table_agnostic_encoder = TableAgnosticStypeEncoder(channels, emb_dims=emb_dims)
+        # ----------------------------------------- architectural state
+        # Shared across registered datasets. Built with empty emb_dims;
+        # _extend_emb_dims() adds Linear projectors for new dims as
+        # register_dataset() encounters them.
+        self.table_agnostic_encoder = TableAgnosticStypeEncoder(
+            channels, emb_dims=set(),
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=channels,
@@ -511,91 +529,177 @@ class NeighborTfsEncoder(nn.Module):
             torch.randn(1, 1, channels)
         )
 
-        self.reset_parameters()
-
-        # Register per-table numerical mean/std as buffers for Z-score normalization
-        self._node_type_to_safe = {}
-        _safe_to_node_type = {}  # reverse map for collision detection
-        zscore_table_count = 0
-        if col_names_dict and col_stats_dict:
-            for node_type, stype_dict in col_names_dict.items():
-                safe_name = re.sub(r'[^a-zA-Z0-9]', '_', node_type)
-                if safe_name in _safe_to_node_type:
-                    raise ValueError(
-                        f"Z-score buffer name collision: '{node_type}' and "
-                        f"'{_safe_to_node_type[safe_name]}' both sanitize to "
-                        f"'{safe_name}'. Rename one of the tables to avoid ambiguity."
-                    )
-                _safe_to_node_type[safe_name] = node_type
-                self._node_type_to_safe[node_type] = safe_name
-                num_cols = stype_dict.get(torch_frame.numerical, [])
-                if not num_cols:
-                    continue
-                table_stats = col_stats_dict.get(node_type, {})
-                means = []
-                stds = []
-                for col in num_cols:
-                    cs = table_stats.get(col, {})
-                    means.append(float(cs.get(StatType.MEAN, 0.0) or 0.0))
-                    stds.append(float(cs.get(StatType.STD, 1.0) or 1.0))
-                self.register_buffer(
-                    f'_num_mean_{safe_name}',
-                    torch.tensor(means, dtype=torch.float32),
-                )
-                self.register_buffer(
-                    f'_num_std_{safe_name}',
-                    torch.tensor(stds, dtype=torch.float32),
-                )
-                zscore_table_count += 1
-
-        # Persists through save/load — used to detect missing col_names_dict at inference
-        self.register_buffer(
-            '_num_zscore_tables',
-            torch.tensor(zscore_table_count, dtype=torch.long),
-        )
-
-        # Precompute GloVe embeddings for column names (semantic column identity)
-        all_col_names: List[str] = []
-        col_name_set: set = set()
-        if col_names_dict:
-            for node_type, stype_dict in col_names_dict.items():
-                for stype, col_list in stype_dict.items():
-                    for col_name in col_list:
-                        if col_name not in col_name_set:
-                            all_col_names.append(col_name)
-                            col_name_set.add(col_name)
-
-        self._col_name_to_idx: Dict[str, int] = {
-            name: i for i, name in enumerate(all_col_names)
-        }
-
-        if all_col_names:
-            col_embedder = GloveTextEmbedding(device="cpu")
-            with torch.no_grad():
-                col_embeddings = col_embedder(all_col_names)  # [N_unique, 300]
-            self.register_buffer("_col_glove_embeddings", col_embeddings)
-            # Kept for on-the-fly embedding of unseen columns. Plain Python
-            # object — not in state_dict, but each DDP rank creates its own
-            # during __init__ so no pickle/broadcast needed. GloVe is
-            # deterministic, so all ranks produce identical vectors.
-            self._glove_embedder = col_embedder
-        else:
-            self.register_buffer("_col_glove_embeddings", torch.zeros(0, 300))
-            self._glove_embedder = None
-
-        # Runtime cache for unseen column GloVe vectors. Populated lazily
-        # during forward — avoids repeated CPU inference across batches.
-        # Per-rank dict (fine for DDP since GloVe is deterministic).
-        self._col_unseen_cache: Dict[str, Tensor] = {}
-
         self.col_name_proj = nn.Linear(300, channels)
 
-        # Guard: detect when model trained with column semantics is loaded
-        # without col_names_dict (analogous to _num_zscore_tables guard)
+        self.reset_parameters()
+
+        # Empty schema-buffers. register_dataset() either re-registers
+        # them at full size or appends + re-registers.
         self.register_buffer(
-            '_num_col_semantic_cols',
-            torch.tensor(len(all_col_names), dtype=torch.long),
+            "_col_glove_embeddings", torch.zeros(0, 300),
         )
+        self.register_buffer(
+            "_num_zscore_tables", torch.tensor(0, dtype=torch.long),
+        )
+        self.register_buffer(
+            "_num_col_semantic_cols", torch.tensor(0, dtype=torch.long),
+        )
+
+        # Backward-compat: if a full schema was passed at construction,
+        # register it now. This preserves the dev-kyaw / pre-PR-1.2
+        # call signature used by main_node_ddp.py + train_multi_task.py
+        # + the existing test files.
+        if col_names_dict is not None and col_stats_dict is not None:
+            if node_type_map is None:
+                raise ValueError(
+                    "When col_names_dict and col_stats_dict are provided "
+                    "to NeighborTfsEncoder.__init__, node_type_map must "
+                    "also be provided. Either pass all three or call "
+                    "register_dataset() explicitly after construction."
+                )
+            self.register_dataset(
+                node_type_map, col_names_dict, col_stats_dict,
+            )
+        elif node_type_map is not None:
+            # Type-map-only registration. Mirrors the pre-refactor
+            # __init__ behavior where ``self.node_type_map`` /
+            # ``inv_node_type_map`` were always set from the
+            # constructor arg even when col_names_dict / col_stats_dict
+            # were None. forward()'s ``inv_node_type_map[t_int]`` lookup
+            # requires this to be populated.
+            for nt, idx in node_type_map.items():
+                self.node_type_map[nt] = idx
+                self.inv_node_type_map[idx] = nt
+
+    def register_dataset(
+        self,
+        node_type_map: Dict[str, int],
+        col_names_dict: Dict[str, Dict[Any, List[str]]],
+        col_stats_dict: Dict[str, Dict[str, Dict[StatType, Any]]],
+    ) -> None:
+        """Register a dataset's schema. Idempotent on the same prefixed
+        types; raises ``ValueError`` on a safe-name collision.
+
+        Extends per-table Z-score buffers, the column-name GloVe table,
+        the SharedEmbeddingEncoder's per-emb-dim projectors, and the
+        node-type maps. Callable repeatedly with disjoint datasets so
+        adoption-time code can layer on new schemas without
+        reconstructing the backbone.
+        """
+        # 1. Extend node_type_map / inv_node_type_map.
+        for nt, idx in node_type_map.items():
+            existing = self.node_type_map.get(nt)
+            if existing is not None and existing != idx:
+                raise ValueError(
+                    f"node_type_map collision for '{nt}': existing "
+                    f"idx {existing}, new idx {idx}"
+                )
+            self.node_type_map[nt] = idx
+            self.inv_node_type_map[idx] = nt
+
+        # 2. Extend SharedEmbeddingEncoder projectors for any new
+        #    embedding dims discovered from col_stats_dict.
+        new_emb_dims: set = set()
+        for nt, stype_dict in col_names_dict.items():
+            for col in stype_dict.get(torch_frame.embedding, []):
+                cs = col_stats_dict.get(nt, {}).get(col, {})
+                dim = cs.get(StatType.EMB_DIM)
+                if dim is not None and dim > 0:
+                    new_emb_dims.add(dim)
+        self._extend_emb_dims(new_emb_dims)
+
+        # 3. Register per-table Z-score buffers; raise on safe-name
+        #    collision against any prefix we've already registered.
+        _safe_to_nt_seen = {
+            v: k for k, v in self._node_type_to_safe.items()
+        }
+        new_zscore_tables = 0
+        for nt, stype_dict in col_names_dict.items():
+            safe_name = re.sub(r'[^a-zA-Z0-9]', '_', nt)
+            if (
+                safe_name in _safe_to_nt_seen
+                and _safe_to_nt_seen[safe_name] != nt
+            ):
+                raise ValueError(
+                    f"Z-score buffer name collision: '{nt}' and "
+                    f"'{_safe_to_nt_seen[safe_name]}' both sanitize to "
+                    f"'{safe_name}'. Rename one of the tables."
+                )
+            if nt in self._node_type_to_safe:
+                continue  # already registered, idempotent
+            _safe_to_nt_seen[safe_name] = nt
+            self._node_type_to_safe[nt] = safe_name
+            num_cols = stype_dict.get(torch_frame.numerical, [])
+            if not num_cols:
+                continue
+            means = []
+            stds = []
+            for col in num_cols:
+                cs = col_stats_dict.get(nt, {}).get(col, {})
+                means.append(float(cs.get(StatType.MEAN, 0.0) or 0.0))
+                stds.append(float(cs.get(StatType.STD, 1.0) or 1.0))
+            self.register_buffer(
+                f'_num_mean_{safe_name}',
+                torch.tensor(means, dtype=torch.float32),
+            )
+            self.register_buffer(
+                f'_num_std_{safe_name}',
+                torch.tensor(stds, dtype=torch.float32),
+            )
+            new_zscore_tables += 1
+        self._num_zscore_tables.data = (
+            self._num_zscore_tables + new_zscore_tables
+        )
+
+        # 4. Extend column-name GloVe buffer with any new column names.
+        # Dedupe both against already-registered names AND within this
+        # call's iteration (otherwise "price" appearing under two node
+        # types in a single register_dataset() call would be embedded
+        # twice).
+        new_col_names: List[str] = []
+        new_col_name_set: set = set()
+        for nt, stype_dict in col_names_dict.items():
+            for stype, col_list in stype_dict.items():
+                for col_name in col_list:
+                    if (
+                        col_name not in self._col_name_to_idx
+                        and col_name not in new_col_name_set
+                    ):
+                        new_col_names.append(col_name)
+                        new_col_name_set.add(col_name)
+        if new_col_names:
+            if self._glove_embedder is None:
+                self._glove_embedder = GloveTextEmbedding(device="cpu")
+            with torch.no_grad():
+                new_embeds = self._glove_embedder(new_col_names)  # [N, 300]
+            existing = self._col_glove_embeddings
+            for i, name in enumerate(new_col_names):
+                self._col_name_to_idx[name] = existing.shape[0] + i
+            # Re-register with the existing buffer's device so a model
+            # already moved to GPU stays on GPU.
+            target_device = (
+                existing.device if existing.numel() > 0 else new_embeds.device
+            )
+            cat = torch.cat(
+                [existing.to(new_embeds.device), new_embeds], dim=0,
+            ).to(target_device)
+            self.register_buffer("_col_glove_embeddings", cat)
+        self._num_col_semantic_cols.data = (
+            self._num_col_semantic_cols + len(new_col_names)
+        )
+
+    def _extend_emb_dims(self, new_dims: set) -> None:
+        """Add Linear(d, channels) projectors for embedding dims that
+        aren't yet registered on the SharedEmbeddingEncoder. Untrained
+        weights -- adoption-time emb_dims pay this price (the dim's
+        projection starts at default Kaiming init)."""
+        enc = self.table_agnostic_encoder.encoders[
+            str(torch_frame.embedding)
+        ]
+        for d in new_dims:
+            key = str(d)
+            if key not in enc.projectors:
+                enc.projectors[key] = nn.Linear(d, self.channels)
 
     def reset_parameters(self):
 

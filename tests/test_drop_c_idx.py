@@ -46,10 +46,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 # package imports cleanly, and we need the real ``Linear`` /
 # ``MLP`` /``GINConv`` /``PositionalEncoding`` symbols to construct a
 # functional RelGTLayer. Pop the mocks so subsequent imports resolve
-# to the real package.
-for _k in [k for k in sys.modules if k.startswith("torch_geometric")]:
-    del sys.modules[_k]
-import torch_geometric  # noqa: F401  -- re-import the real one
+# to the real package -- but only if it's still the MagicMock. If a
+# sibling test file (e.g. test_register_dataset.py) already swapped
+# in the real torch_geometric, popping again would trigger a DataPipe
+# re-registration which torch refuses ("batch_graphs already taken").
+from unittest.mock import MagicMock as _MagicMock
+if isinstance(sys.modules.get("torch_geometric"), _MagicMock):
+    for _k in [k for k in sys.modules if k.startswith("torch_geometric")]:
+        del sys.modules[_k]
+    import torch_geometric  # noqa: F401  -- re-import the real one
 
 
 def _build_layer(num_centroids: int = 8, channels: int = 16):
