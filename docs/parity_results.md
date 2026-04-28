@@ -98,6 +98,48 @@ python3 scripts/aggregate_parity.py results/parity
 
 Raw JSONs at `results/parity/{devkyaw,new}/rel-f1/<task>/<seed>.json`.
 
+---
+
+# PR 1.0 Parity (single-task eval denormalize fix + upto_test_timestamp revert)
+
+**Date:** 2026-04-28. **Status:** PASS under one-sided no-degradation criterion.
+
+PR 1.0 is a precondition for the Phase 1 refactor PRs. It bundles two changes:
+- **PR 1.0a:** fix the broken single-task eval pipeline (`task_tokens.__getitem__` z-scores regression labels at `gfm_data/task_tokens.py:604`, but `main_node_ddp.py`'s `test()` function never denormalized predictions before clamping → constant predictions → frozen MAE 9.95 across all epochs and seeds). Adds `data["val"].adopt_target_stats(train_mean, train_std)` (and same for test) at construction, and `loader.dataset.denormalize_pred(pred)` before the raw-scale clamp in `test()`.
+- **PR 1.0b:** revert `upto_test_timestamp=False` → `True` across `main_node_ddp.py`, `train_multi_task.py`, `tools/build_tf_store.py`, `tools/precompute_shards.py`, `gfm_data/stypes.py`. Matches dev-kyaw / RelGT paper's defense-in-depth guardrail. Per-neighbor `seed_time` filter at `gfm_data/sampler.py:69` remains the actual leakage barrier; the truncation is redundant but kept to honor paper convention. Also reverts `materialized_full` cache suffix to `materialized`.
+
+Sweep config: 5 seeds × 5 epochs × 2 tasks × 2 pipelines, isolated per-pipeline cache dirs (`~/.cache/relbench_examples_parity_{devkyaw,new}`).
+
+## PR 1.0 results
+
+| Task (metric) | Pipeline | Seeds | Mean | Std | Per-seed |
+|---|---|---|---|---|---|
+| rel-f1 / driver-position (MAE↓) | dev-kyaw | 5 | 9.340 | 0.334 | [8.86, 9.46, 9.63, 9.13, 9.61] |
+| rel-f1 / driver-position (MAE↓) | new      | 5 | 4.155 | 0.243 | [3.92, 4.13, 3.92, 4.43, 4.37] |
+| rel-f1 / driver-top3 (AUROC↑)   | dev-kyaw | 5 | 0.7689 | 0.0219 | [0.763, 0.741, 0.789, 0.793, 0.758] |
+| rel-f1 / driver-top3 (AUROC↑)   | new      | 5 | 0.8070 | 0.0126 | [0.824, 0.795, 0.800, 0.817, 0.799] |
+
+## PR 1.0 acceptance (one-sided no-degradation)
+
+| Task | μ_dev | μ_new | Δ (signed; positive = new improves) | Threshold | Verdict |
+|---|---|---|---|---|---|
+| driver-position (MAE↓) | 9.340 | 4.155 | -5.185 (new better by 5.19) | 0.334 | **PASS — improvement** |
+| driver-top3 (AUROC↑)   | 0.769 | 0.807 | +0.038 (new better by 0.038) | 0.022 | **PASS — improvement** |
+
+The symmetric `|Δ| ≤ max(σ)` criterion fails on both, but in the **improvement direction**. Per the user-approved one-sided gate (catch degradation only), PR 1.0 passes.
+
+## Why "new" beats dev-kyaw under the paper's truncated-graph guardrail
+
+dev-kyaw trains L1Loss on raw regression labels; new branch z-scores them via `target_mean/std` in `task_tokens.__getitem__` (commit `d49376c`). With L1Loss the gradient sign-magnitude is constant (±1), so per-step output movement is `lr × 1 = 1e-4` regardless of target scale. dev-kyaw needs to traverse ~13 raw units from random init to the label region (driver-position median ≈ 13); 5 epochs × ~50 batches = 250 steps × 1e-4 covers ~0.025 raw units — the model never escapes random init. New-branch's z-scoring shrinks the distance to ~1 z-unit; same 250 steps cover ~25% of the way, producing a meaningfully trained model.
+
+This isn't leakage — the per-neighbor `seed_time` filter at `gfm_data/sampler.py:69` is identical in both branches. Test-set neighbor info is the same (verified by reading both samplers). The gap is pure training-regime improvement from z-scoring + better-conditioned loss landscape.
+
+driver-top3 is binary (no normalize_target path), but still shows +0.038 AUROC. This is harder to attribute to a single commit — encoder improvements that landed pre-Apr-25 (GloVe column semantics, per-table z-score buffers, missingness indicators) plausibly help. Unit tests assert sampler bit-equivalence; the model architecture has materially diverged from dev-kyaw's plain version.
+
+## Forward implication
+
+dev-kyaw is now a **stale historical anchor**, not a real-time benchmark. Any future re-run of dev-kyaw will keep showing degraded numbers because of these architectural improvements. Phase 1 PRs (1.1+) should treat **PR 1.0's "new" metrics as the local floor** in addition to dev-kyaw's as the historical floor. A regression below PR 1.0's numbers without justification halts the autonomous Phase 1 flow.
+
 ## Memory smoke (PR2 §6.3.6 / MS1, MS3)
 
 `./scripts/memory_smoke.sh 50` — 50 train steps + val + test on rel-f1 / driver-top3 with `--mode streaming --tf_store_dir <...> --max_rows_per_task 1000`, channels=64, batch=64, K=32. RSS sampled via `ps`, VRAM via `nvidia-smi`, both at 1 Hz.

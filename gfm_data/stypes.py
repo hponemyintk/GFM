@@ -125,7 +125,7 @@ def load_or_generate_stypes(
     stypes_path: Path,
     dataset,
     *,
-    upto_test_timestamp: bool = False,
+    upto_test_timestamp: bool = True,
     log_stream=sys.stderr,
 ):
     """Top-level loader. Returns ``dict[str, dict[str, stype]]``.
@@ -138,8 +138,11 @@ def load_or_generate_stypes(
         Used by ``get_stype_proposal`` only when regenerating.
     upto_test_timestamp : bool
         Forwarded to ``dataset.get_db(...)`` for the regeneration path.
-        Default ``False`` because we want full entity tables for
-        materialization.
+        Default ``True`` to match dev-kyaw / RelGT paper: entity tables
+        are truncated at train cutoff as a defense-in-depth guardrail
+        against temporal leakage. The per-neighbor seed_time filter at
+        gfm_data/sampler.py:69 is the actual leakage barrier; the
+        truncation is redundant but kept to honor the paper's convention.
     log_stream
         Where to print "regenerating" notices. Default ``sys.stderr``;
         pass ``open(os.devnull, 'w')`` to silence.

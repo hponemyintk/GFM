@@ -11,6 +11,14 @@
 # Usage: ./scripts/parity_sweep.sh [num_seeds] [epochs]
 #   num_seeds   default 5
 #   epochs      default 5  (10 in plan, 5 for laptop time budget)
+#
+# CACHE BEHAVIOR (default: WIPE BEFORE RUN):
+#   By default, both ``results/parity/{devkyaw,new}/rel-f1`` are wiped
+#   at the start of every sweep. This is the safe default after we
+#   discovered that stale .json files from a killed prior sweep were
+#   silently being treated as "already done" by the existence-check
+#   below, mixing broken old results into fresh metric tables.
+#   To preserve prior results, set ``KEEP_CACHE=1``.
 set -euo pipefail
 
 NUM_SEEDS="${1:-5}"
@@ -22,6 +30,28 @@ OLD_DIR="/home/jedi/research_repos/GFM/.claude/worktrees/dev-kyaw"
 RESULTS_ROOT="$NEW_DIR/results/parity"
 mkdir -p "$RESULTS_ROOT/devkyaw" "$RESULTS_ROOT/new"
 
+# Per-pipeline cache dirs. Even when both pipelines use the same
+# ``upto_test_timestamp`` setting, scoping caches per branch is cheap
+# defense-in-depth against subtle differences (encoder version skew,
+# precomputed-shard format drift across PRs, etc.) silently poisoning
+# the comparison.
+DEVKYAW_CACHE="$HOME/.cache/relbench_examples_parity_devkyaw"
+NEW_CACHE="$HOME/.cache/relbench_examples_parity_new"
+
+# Wipe stale results unless explicitly preserved. Stale .json from a
+# killed prior sweep (with broken code) would otherwise be skipped as
+# "already done" and pollute the new comparison. Same for HDF5: stale
+# precomputed shards from a different code state would carry stale
+# indices into the comparison.
+if [ "${KEEP_CACHE:-0}" != "1" ]; then
+  echo "=== wiping prior parity results + per-pipeline caches (KEEP_CACHE!=1) ==="
+  rm -rf "$RESULTS_ROOT/devkyaw/rel-f1" "$RESULTS_ROOT/new/rel-f1"
+  rm -f "$RESULTS_ROOT/devkyaw"/*.log "$RESULTS_ROOT/new"/*.log
+  rm -rf "$DEVKYAW_CACHE/precomputed/rel-f1" "$NEW_CACHE/precomputed/rel-f1"
+  rm -rf "$DEVKYAW_CACHE/rel-f1" "$NEW_CACHE/rel-f1"
+fi
+mkdir -p "$DEVKYAW_CACHE" "$NEW_CACHE"
+
 export WANDB_MODE=offline
 export WANDB_SILENT=true
 
@@ -31,6 +61,16 @@ run_one() {
   local task="$3"
   local seed="$4"
   local out_dir="$RESULTS_ROOT/$pipeline_tag"
+
+  # Pick the right per-pipeline cache. dev-kyaw and new branch
+  # materialize different graphs (see DEVKYAW_CACHE / NEW_CACHE comment
+  # above) so they MUST not share a cache root.
+  local cache_dir
+  if [ "$pipeline_tag" = "devkyaw" ]; then
+    cache_dir="$DEVKYAW_CACHE"
+  else
+    cache_dir="$NEW_CACHE"
+  fi
 
   local log="$out_dir/${task}_s${seed}.log"
   local result_path="$out_dir/rel-f1/${task}/${seed}.json"
@@ -49,6 +89,7 @@ run_one() {
       --channels 128 --num_layers 1 --num_heads 4 \
       --num_centroids 512 \
       --num_workers 2 \
+      --cache_dir "$cache_dir" \
       --out_dir "$out_dir" \
       --run_name "${pipeline_tag}-${task}-s${seed}" \
       > "$log" 2>&1 ) || {

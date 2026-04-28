@@ -41,7 +41,7 @@ def main():
     dataset = get_dataset(args.dataset, download=True)
 
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=False)
+    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=True)
 
     # Use GPU for text embedding when available -- CPU GloVe on the big
     # datasets (rel-event has ~41M rows) is the difference between a
@@ -50,11 +50,12 @@ def main():
     embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
     print(f"[tf_store] text embedder device: {embed_device}")
 
-    # upto_test_timestamp=False: entity tables must contain all rows the
-    # test split references; temporal leakage is enforced at sampling
-    # time via per-row seed_time filtering, not via materialization
-    # cutoff.
-    db = dataset.get_db(upto_test_timestamp=False)
+    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: truncate
+    # entity tables at train cutoff as a defense-in-depth guardrail.
+    # The per-neighbor seed_time filter at gfm_data/sampler.py:69 is
+    # the actual leakage barrier; the truncation is redundant but kept
+    # to honor the paper's convention.
+    db = dataset.get_db(upto_test_timestamp=True)
     cs = filter_to_db_columns(cs, db)
     data, _ = make_pkey_fkey_graph(
         db,
@@ -63,7 +64,7 @@ def main():
             text_embedder=GloveTextEmbedding(device=embed_device),
             batch_size=512,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
 
     print(f"Building TF store for {args.dataset} -> {args.out_dir}")

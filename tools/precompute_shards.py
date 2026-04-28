@@ -69,17 +69,19 @@ def load_data(args):
     task = get_task(args.dataset, args.task, download=True)
 
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=False)
+    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=True)
 
     # Use GPU for text embedding when available; major speedup on big
     # datasets (rel-event ~41M rows).
     import torch as _torch
     embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
 
-    # upto_test_timestamp=False so test seed indices don't overflow the
-    # entity tables. Temporal leakage is prevented at sampling time via
-    # per-row seed_time filtering.
-    db = dataset.get_db(upto_test_timestamp=False)
+    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: truncate
+    # entity tables at train cutoff as a defense-in-depth guardrail.
+    # The per-neighbor seed_time filter at gfm_data/sampler.py:69 is
+    # the actual leakage barrier; the truncation is redundant but kept
+    # to honor the paper's convention.
+    db = dataset.get_db(upto_test_timestamp=True)
     # RelBench tasks (e.g., results-position) strip leakage-risk
     # columns from the source table; the stypes JSON still references
     # the full schema. Filter so make_pkey_fkey_graph's torch_frame
@@ -92,7 +94,7 @@ def load_data(args):
             text_embedder=GloveTextEmbedding(device=embed_device),
             batch_size=512,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
 
     # Shard building only needs the structural part (CSR adjacency +

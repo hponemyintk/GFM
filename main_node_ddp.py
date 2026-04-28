@@ -222,8 +222,14 @@ _chunk = max(1, int(args.load_concurrency))
 def _do_load_db_and_graph():
     # stypes load+regen lives INSIDE the slot so the cold-cache
     # regen path's get_db() doesn't fan out across ranks.
-    cs_loaded = _load_stypes(stypes_cache_path, dataset, upto_test_timestamp=False)
-    db_local = dataset.get_db(upto_test_timestamp=False)
+    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: the
+    # entity tables are truncated at train cutoff as a defense-in-depth
+    # guardrail against temporal leakage. The per-neighbor seed_time
+    # filter at gfm_data/sampler.py:69 is the actual leakage barrier;
+    # the truncation is redundant but kept to honor the paper's
+    # guardrail convention.
+    cs_loaded = _load_stypes(stypes_cache_path, dataset, upto_test_timestamp=True)
+    db_local = dataset.get_db(upto_test_timestamp=True)
     cs_local = _filter_stypes(cs_loaded, db_local)
     d_local, cs_dict_local = make_pkey_fkey_graph(
         db_local,
@@ -232,7 +238,7 @@ def _do_load_db_and_graph():
             text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"),
             batch_size=256,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized_full",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
     )
     # Pre-warm the task parquet caches inside the slot. If a parquet
     # is missing, ``task.get_table`` falls into ``_get_table`` which
@@ -337,6 +343,19 @@ data = {
     )
     for split in ["train", "val", "test"]
 }
+
+# Adopt train target stats on val/test for regression z-score. Without
+# this each split fits its own mean/std, and the model -- trained on
+# the train distribution -- would have its predictions denormalized by
+# val/test stats (which differ from train), producing systematic
+# offsets at eval time. Mirrors train_multi_task.py:395-400.
+if data["train"].target_mean is not None:
+    data["val"].adopt_target_stats(
+        data["train"].target_mean, data["train"].target_std,
+    )
+    data["test"].adopt_target_stats(
+        data["train"].target_mean, data["train"].target_std,
+    )
 
 # Optional seed-row cap for memory-bounded laptop runs (plan §6.3.6).
 # Only cap the *train* split; val/test stay full because task.evaluate()
@@ -571,6 +590,15 @@ def test(loader: DataLoader, eval_model, epoch, desc) -> np.ndarray:
             batch=batch_vec
         )
         if task.task_type == TaskType.REGRESSION:
+            # Model was trained on z-scored targets (TaskTokens.__getitem__
+            # at gfm_data/task_tokens.py:604), so its outputs live in
+            # train z-space. Undo before clamping with raw-scale
+            # clamp_min/clamp_max and before task.evaluate -- which both
+            # expect raw-scale predictions. ``loader.dataset`` is the
+            # val or test TaskTokens; its target_mean/std were adopted
+            # from train above, so denormalize is bit-equivalent across
+            # splits. Mirrors train_multi_task.py:770-775.
+            pred = loader.dataset.denormalize_pred(pred)
             pred = torch.clamp(pred, clamp_min, clamp_max)
         if task.task_type in [TaskType.BINARY_CLASSIFICATION, TaskType.MULTILABEL_CLASSIFICATION]:
             pred = torch.sigmoid(pred)

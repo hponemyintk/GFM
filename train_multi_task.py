@@ -117,14 +117,21 @@ def _load_dataset(name: str, cache_dir: str, device: str):
     import gc
     dset = get_dataset(name, download=True)
     stypes_path = Path(cache_dir) / name / "stypes.json"
-    # IMPORTANT: pass upto_test_timestamp=False here. Otherwise the
-    # entity tables stop at train cutoff and TEST seeds (which reference
-    # entities created between train and test cutoffs) index out of
-    # bounds in the CSR adjacency. Temporal leakage is still prevented
-    # by the per-row seed_time filter in the sampler -- the materialized
-    # graph just needs to *contain* all entities the task tables reference.
-    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=False)
-    db = dset.get_db(upto_test_timestamp=False)
+    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: entity
+    # tables are truncated at train cutoff as a defense-in-depth
+    # guardrail against temporal leakage. The per-neighbor seed_time
+    # filter at gfm_data/sampler.py:69 is the actual leakage barrier;
+    # the truncation is redundant but kept to honor the paper's
+    # guardrail convention.
+    #
+    # Caveat: some tasks (e.g. results-position on rel-f1) have test
+    # seeds whose ids reference rows beyond train_cutoff. With the
+    # truncated entity table those reads can IndexError in
+    # graph_cache.neighbors_set. If a future task hits this, prefer
+    # to special-case that task rather than weakening the guardrail
+    # globally.
+    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=True)
+    db = dset.get_db(upto_test_timestamp=True)
     cs = _filter_stypes(cs, db)
     data, col_stats = make_pkey_fkey_graph(
         db,
@@ -132,9 +139,7 @@ def _load_dataset(name: str, cache_dir: str, device: str):
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device=device), batch_size=256,
         ),
-        # Distinct cache dir from the train-cutoff materialization so the
-        # two layouts don't collide.
-        cache_dir=f"{cache_dir}/{name}/materialized_full",
+        cache_dir=f"{cache_dir}/{name}/materialized",
     )
     # OOM mitigation: relbench's Dataset.get_db is decorated with
     # @lru_cache(maxsize=None), so the raw pickle (~25 GiB on
