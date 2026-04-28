@@ -1,7 +1,7 @@
 # GFM zero-shot test plan
 
 Companion to `docs/zero_shot_gfm_execution_plan.md`. Each phase's
-verification falls into three categories:
+verification falls into four categories:
 
 - **Unit tests** — narrow correctness checks. Sub-second, deterministic,
   no GPU. Live in `tests/` as `test_*.py`. Run with `pytest tests/`.
@@ -9,6 +9,12 @@ verification falls into three categories:
   distributions, gradient flow, loss curves, before/after metric
   parity. Seconds-to-minutes, GPU required. Gated behind a
   `@pytest.mark.sanity` marker; run manually before merging each PR.
+- **dev-kyaw parity sweep** (training-touching PRs only) — 5 seeds × 2
+  tasks × 5 epochs against the `dev-kyaw` reference branch. **Hard
+  gate per PR**: `|μ_new − μ_dev| ≤ max(σ_dev, σ_new)` on both
+  rel-f1 driver-position (MAE↓) and driver-top3 (AUROC↑). On failure,
+  automation halts and asks for human direction. Tools-only PRs are
+  exempt (no training code touched).
 - **Intuition checks** — exploratory experiments validating the
   *meaning* of the change: does the embedding capture structure? does
   cluster popularity look heavy-tailed? does cross-task transfer
@@ -16,9 +22,10 @@ verification falls into three categories:
   notebooks; results pasted into the PR description.
 
 The phase gate (1-epoch val-metric parity vs pre-refactor baseline) is
-the **ML sanity layer** for each PR. Unit tests catch logic errors fast;
-ML sanity catches silent regressions; intuition checks catch design
-flaws that pass both.
+the **ML sanity layer** for each PR. Unit tests catch logic errors
+fast; ML sanity catches silent regressions; the parity sweep catches
+glaring metric drift against a known-good reference; intuition checks
+catch design flaws that pass all three.
 
 ---
 
@@ -507,6 +514,59 @@ similar three-tier test plan per change:
 - **Intuition**: does SSL pretraining (without supervised) on
   rel-f1 produce embeddings that already linearly-probe for
   driver-top3? If yes, SSL is doing real work.
+
+---
+
+## dev-kyaw parity sweep (per training-touching PR)
+
+The reference baseline is `dev-kyaw` at the worktree
+`/home/jedi/research_repos/GFM/.claude/worktrees/dev-kyaw`. The sweep
+is launched via `scripts/parity_sweep.sh` and aggregated by
+`scripts/aggregate_parity.py`. Both sides write to
+`results/parity/{devkyaw,new}/rel-f1/{task}/{seed}.json`.
+
+### Per-PR flow
+
+```
+# 1. wipe stale "new" results so the sweep measures THIS PR's code
+rm -rf results/parity/new/rel-f1
+
+# 2. run the sweep (devkyaw is cached after first PR; only "new"
+#    re-runs)
+bash scripts/parity_sweep.sh 5 5
+
+# 3. aggregate + compare
+python3 scripts/aggregate_parity.py results/parity
+```
+
+### Pass / fail criterion
+
+For each task `t` in `{driver-position, driver-top3}`:
+
+- Compute `μ_dev, σ_dev` from the 5 dev-kyaw seeds.
+- Compute `μ_new, σ_new` from the 5 PR-branch seeds.
+- **PASS** iff `|μ_new − μ_dev| ≤ max(σ_dev, σ_new)`.
+- **FAIL** halts the automation and reports per-seed numbers.
+
+### Tracking
+
+After each PR's sweep, append a row to `docs/parity_results.md` with
+the PR id, both means, both stds, both gaps, both thresholds, and the
+verdict. The doc becomes the audit log of every refactor's metric
+impact.
+
+### Exemptions
+
+A PR is exempt from the parity sweep iff it touches **none** of:
+
+- `model.py`, `encoders.py`, `codebook.py`, `local_module.py`
+- `gfm_data/` (sampler, collate, task_tokens, graph_cache, tf_store,
+  multi_task_dataset, stypes)
+- `heads/multi_task_head.py`, `losses/multi_task_loss.py`
+- `train_multi_task.py`, `main_node_ddp.py`
+
+PR 1.4 (compute_dataset_stats tooling-only) is the only Phase-1 PR
+expected to qualify; all others must run the sweep.
 
 ---
 

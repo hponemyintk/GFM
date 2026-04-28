@@ -45,6 +45,30 @@ the pre-refactor baseline (same seed). Tolerance: identical-within-
 numerical-noise where the refactor is functionally equivalent (PRs 1.1,
 1.2, 1.3); deeper validation where new behavior is introduced.
 
+### Cross-branch parity gate (per PR, hard requirement)
+
+In addition to unit + ML-sanity + intuition checks, **every PR in
+Phases 1-2 must pass a parity sweep against the `dev-kyaw` baseline**
+on rel-f1 driver-position (regression) and driver-top3 (classification)
+before it merges. This is the same protocol used for PR1+PR2 (see
+`docs/parity_results.md`):
+
+- 5 seeds × 2 tasks × 5 epochs per pipeline.
+- `dev-kyaw` runs are cached at `results/parity/devkyaw/` and reused
+  across PRs (the baseline doesn't move).
+- The PR branch's runs go to `results/parity/new/`; this directory is
+  **wiped before each PR's sweep** so we measure the current code, not
+  a prior PR's cached result.
+- Aggregate via `scripts/aggregate_parity.py`.
+- **Acceptance criterion**: `|μ_new − μ_dev| ≤ max(σ_dev, σ_new)` per
+  task. This is the "1× std overlap" rule; matches PR1+PR2 protocol.
+- **On failure**: halt the automation, surface the diff, ask for
+  human direction. Do not commit a regressing PR.
+
+Tools-only PRs (e.g. PR 1.4 which adds a script and changes no
+training code) are exempt from the parity sweep but still gated on
+unit tests + a smoke run that exercises the new tooling end-to-end.
+
 ## Phase 1 — adoption-ready encoder refactor (~3-4 days, four PRs)
 
 ### PR 1.1 — drop `c_idx` (~½ day)
