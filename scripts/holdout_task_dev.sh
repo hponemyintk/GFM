@@ -56,10 +56,16 @@
 # is still useful for paper-config (K=300 / 4-layer / channels=512).
 #
 # Usage:
-#   bash scripts/holdout_task_dev.sh [EPOCHS] [MAX_STEPS]
+#   bash scripts/holdout_task_dev.sh [EPOCHS] [STEPS_PER_TASK]
 #
-#     EPOCHS        default 5
-#     MAX_STEPS     default 300
+#     EPOCHS         default 5
+#     STEPS_PER_TASK if set, forwarded to pretrain_p4d.sh (which
+#                    computes MAX_STEPS = STEPS_PER_TASK x N_tasks
+#                    so each task gets the same per-epoch density
+#                    it would in a single-task run). If unset, the
+#                    p4d backend uses its own default (500 in
+#                    pretrain_p4d.sh) and the laptop backend uses
+#                    50 (sized for laptop streaming smoke-tests).
 #
 # ---------------- Example invocations (copy-paste) ----------------
 #
@@ -113,7 +119,11 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 EPOCHS="${EPOCHS:-${1:-5}}"
-MAX_STEPS="${MAX_STEPS:-${2:-300}}"
+# STEPS_PER_TASK is the user-facing knob. When unset we leave it
+# empty here so the p4d branch can fall back to pretrain_p4d.sh's
+# own default (500); the laptop branch substitutes a smaller value
+# inline below.
+STEPS_PER_TASK="${STEPS_PER_TASK:-${2:-}}"
 DATASETS="${DATASETS:-rel-f1 rel-event}"
 # Per-dataset holdout map: "<dataset>:<task> <dataset>:<task> ..."
 # Tasks cited in RelGT paper expts (see header docstring).
@@ -283,7 +293,7 @@ echo "Phase-4 multi-dataset holdout-task"
 echo "  DATASETS:        $DATASETS"
 echo "  HOLDOUTS:        $HOLDOUTS"
 echo "  PRETRAIN tasks:  $PRETRAIN_TASKS_CSV"
-echo "  EPOCHS=$EPOCHS  MAX_STEPS=$MAX_STEPS  SEED=$SEED"
+echo "  EPOCHS=$EPOCHS  STEPS_PER_TASK=${STEPS_PER_TASK:-<default>}  SEED=$SEED"
 echo "  PRETRAIN_BACKEND=$PRETRAIN_BACKEND  NPROC=$NPROC"
 echo "  FULL_GRAPH=$FULL_GRAPH  TF_STORE=$TF_STORE"
 echo "  OUT_DIR:         $OUT_DIR_BASE"
@@ -314,11 +324,20 @@ elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
   echo "=== [1+2/4] Delegating to pretrain_p4d.sh (NPROC=$NPROC) ==="
   echo "  log: $PRETRAIN_LOG"
   DS_CSV=$(echo "$DATASETS" | tr ' ' ',')
-  TASKS_CSV="$PRETRAIN_TASKS_CSV" \
+  # STEPS_PER_TASK is forwarded ONLY when set so an unset launcher
+  # caller falls through to pretrain_p4d.sh's own default (500).
+  # Forwarding STEPS_PER_TASK="" would clobber that default with an
+  # empty string and pretrain_p4d.sh would compute MAX_STEPS=0.
+  _STEPS_FWD=()
+  if [ -n "${STEPS_PER_TASK:-}" ]; then
+    _STEPS_FWD+=("STEPS_PER_TASK=$STEPS_PER_TASK")
+  fi
+  env \
+    TASKS_CSV="$PRETRAIN_TASKS_CSV" \
     DATASETS="$DS_CSV" \
     NPROC="$NPROC" \
     EPOCHS="$EPOCHS" \
-    MAX_STEPS="$MAX_STEPS" \
+    "${_STEPS_FWD[@]}" \
     OUT_DIR="$PRETRAIN_DIR" \
     RUN_NAME="${RUN_NAME:-phase4_multi_holdout_pretrain}" \
     K="$K" \
@@ -349,8 +368,14 @@ else
   done
 
   N_TASKS=$(echo "$PRETRAIN_TASKS_CSV" | tr ',' '\n' | wc -l)
+  # Laptop default: 50 steps/task/epoch -- matches the previous
+  # "MAX_STEPS=300 across ~6 tasks" feel without overwhelming a
+  # single-GPU streaming run.
+  _laptop_steps_per_task="${STEPS_PER_TASK:-50}"
+  _max_steps_per_epoch=$(( _laptop_steps_per_task * N_TASKS ))
   echo
   echo "=== [2/4] Pretraining on $N_TASKS tasks (laptop streaming) ==="
+  echo "  steps/task=$_laptop_steps_per_task -> max_steps_per_epoch=$_max_steps_per_epoch"
   echo "  log: $PRETRAIN_LOG"
   torchrun --nproc_per_node 1 main_node_ddp.py \
     --tasks "$PRETRAIN_TASKS_CSV" \
@@ -364,7 +389,7 @@ else
     --num_heads "$HEADS" \
     --num_centroids "$CENTROIDS" \
     --epochs "$EPOCHS" \
-    --max_steps_per_epoch "$MAX_STEPS" \
+    --max_steps_per_epoch "$_max_steps_per_epoch" \
     --num_workers 0 \
     --lr 1e-4 --warmup_steps 200 \
     --loss_balance "${LOSS_BALANCE:-none}" \

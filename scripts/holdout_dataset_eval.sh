@@ -35,7 +35,13 @@
 # rel-event.user-repeat:1.0,rel-event.user-ignore:1.0".
 #
 # Usage:
-#   bash scripts/holdout_dataset_eval.sh [EPOCHS] [MAX_STEPS]
+#   bash scripts/holdout_dataset_eval.sh [EPOCHS] [STEPS_PER_TASK]
+#
+#     EPOCHS         default 5
+#     STEPS_PER_TASK if set, forwarded to pretrain_p4d.sh which
+#                    computes MAX_STEPS = STEPS_PER_TASK x N_tasks.
+#                    Unset -> p4d backend uses pretrain_p4d.sh's
+#                    default (500); laptop backend uses 50.
 #
 # Output layout: results/holdout_dataset_eval/<src>_to_<tgt>/
 #
@@ -61,12 +67,12 @@
 #
 # Laptop (rel-f1 -> rel-hm, both fit):
 #
-#   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 MAX_STEPS=300 \
+#   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 STEPS_PER_TASK=50 \
 #     bash scripts/holdout_dataset_eval.sh
 #
 # Reverse direction (laptop):
 #
-#   SOURCE=rel-hm TARGET=rel-f1 EPOCHS=5 MAX_STEPS=300 \
+#   SOURCE=rel-hm TARGET=rel-f1 EPOCHS=5 STEPS_PER_TASK=50 \
 #     bash scripts/holdout_dataset_eval.sh
 
 set -euo pipefail
@@ -74,7 +80,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 EPOCHS="${EPOCHS:-${1:-5}}"
-MAX_STEPS="${MAX_STEPS:-${2:-300}}"
+# STEPS_PER_TASK is the user-facing knob. Unset -> p4d branch falls
+# through to pretrain_p4d.sh's default (500); laptop branch uses 50.
+STEPS_PER_TASK="${STEPS_PER_TASK:-${2:-}}"
 SOURCE="${SOURCE:-rel-f1}"
 TARGET="${TARGET:-rel-hm}"
 
@@ -176,7 +184,7 @@ echo "=============================================================="
 echo "Phase-5 cross-dataset adoption: SOURCE=$SOURCE -> TARGET=$TARGET"
 echo "  SOURCE_TASKS: $SOURCE_TASKS_CSV"
 echo "  TARGET_TASKS: $TARGET_TASKS_CSV"
-echo "  EPOCHS=$EPOCHS  MAX_STEPS=$MAX_STEPS  SEED=$SEED"
+echo "  EPOCHS=$EPOCHS  STEPS_PER_TASK=${STEPS_PER_TASK:-<default>}  SEED=$SEED"
 echo "  RUN_DIR: $RUN_DIR"
 echo "=============================================================="
 
@@ -210,11 +218,18 @@ elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
   echo
   echo "=== Delegating SOURCE pretrain to pretrain_p4d.sh (NPROC=$NPROC) ==="
   echo "  log: $PRETRAIN_LOG"
-  TASKS_CSV="$SOURCE_TASKS_CSV" \
+  # STEPS_PER_TASK forwarded only when set; unset = pretrain_p4d.sh
+  # default (500). Forwarding "" would zero out MAX_STEPS downstream.
+  _STEPS_FWD=()
+  if [ -n "${STEPS_PER_TASK:-}" ]; then
+    _STEPS_FWD+=("STEPS_PER_TASK=$STEPS_PER_TASK")
+  fi
+  env \
+    TASKS_CSV="$SOURCE_TASKS_CSV" \
     DATASETS="$SOURCE" \
     NPROC="$NPROC" \
     EPOCHS="$EPOCHS" \
-    MAX_STEPS="$MAX_STEPS" \
+    "${_STEPS_FWD[@]}" \
     OUT_DIR="$PRETRAIN_DIR" \
     RUN_NAME="phase5_${SOURCE}_to_${TARGET}_pretrain" \
     K="$K" \
@@ -242,8 +257,12 @@ else
     fi
   done
 
+  N_SOURCE_TASKS=$(echo "$SOURCE_TASKS_CSV" | tr ',' '\n' | wc -l)
+  _laptop_steps_per_task="${STEPS_PER_TASK:-50}"
+  _max_steps_per_epoch=$(( _laptop_steps_per_task * N_SOURCE_TASKS ))
   echo
   echo "=== Pretraining on SOURCE=$SOURCE ($SOURCE_TASKS_CSV) ==="
+  echo "  steps/task=$_laptop_steps_per_task -> max_steps_per_epoch=$_max_steps_per_epoch"
   echo "  log: $PRETRAIN_LOG"
   torchrun --nproc_per_node 1 main_node_ddp.py \
     --tasks "$SOURCE_TASKS_CSV" \
@@ -257,7 +276,7 @@ else
     --num_heads "$HEADS" \
     --num_centroids "$CENTROIDS" \
     --epochs "$EPOCHS" \
-    --max_steps_per_epoch "$MAX_STEPS" \
+    --max_steps_per_epoch "$_max_steps_per_epoch" \
     --num_workers 0 \
     --lr 1e-4 --warmup_steps 200 \
     --loss_balance "${LOSS_BALANCE:-none}" \
