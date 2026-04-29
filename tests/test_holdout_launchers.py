@@ -113,13 +113,26 @@ def test_holdout_task_dev_default_includes_three_datasets():
     assert "rel-f1:driver-top3" in src        # paper expts/run-large-base-experiments
     assert "rel-event:user-attendance" in src  # paper expts/run-encoder-ablation
     assert "rel-hm:user-churn" in src          # paper expts/run-large-base-experiments
-    # rel-event task list (verified against
-    # relbench.tasks.get_task_names('rel-event')).
+    # rel-event task list (5 of 6 from
+    # relbench.tasks.get_task_names('rel-event'); users-birthyear
+    # OMITTED because its val/test seeds overflow the truncated user
+    # table -- truncated-graph guardrail caveat).
     assert "[rel-event]=" in src
     for t in ("user-attendance", "user-repeat", "user-ignore",
               "event_interest-interested",
-              "event_interest-not_interested", "users-birthyear"):
+              "event_interest-not_interested"):
         assert t in src, f"rel-event task {t!r} missing from launcher defaults"
+    # users-birthyear must NOT be in the rel-event default list.
+    # Match strictly against the bash array assignment so the test
+    # doesn't false-positive on the explanatory comment that names
+    # the task.
+    assert (
+        "[rel-event]=\"user-attendance user-repeat user-ignore "
+        "event_interest-interested event_interest-not_interested\""
+    ) in src, (
+        "rel-event default task list shape unexpected; "
+        "verify users-birthyear is excluded"
+    )
 
 
 def test_holdout_task_dev_rejects_malformed_holdouts_entry(tmp_path):
