@@ -97,6 +97,31 @@ def test_holdout_task_dev_rejects_holdout_not_in_full_tasks(tmp_path):
     assert "not in known tasks" in (proc.stderr + proc.stdout)
 
 
+def test_holdout_task_dev_default_includes_three_datasets():
+    """The launcher's defaults must include rel-f1, rel-event, and
+    rel-hm with one binary holdout each so the AUROC signal is
+    consistent across the three. The defaults are read directly
+    from the script source rather than executed -- the actual run
+    is too expensive for a unit test."""
+    src = (SCRIPTS / "holdout_task_dev.sh").read_text()
+    # Default DATASETS line.
+    assert 'DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"' in src, (
+        "default DATASETS should include all three datasets"
+    )
+    # Default HOLDOUTS line. Each entry should be a binary task so
+    # AUROC is the comparable signal.
+    assert "rel-f1:driver-top3" in src
+    assert "rel-event:user-repeat" in src
+    assert "rel-hm:user-churn" in src
+    # rel-event task list (verified against
+    # relbench.tasks.get_task_names('rel-event')).
+    assert "[rel-event]=" in src
+    for t in ("user-attendance", "user-repeat", "user-ignore",
+              "event_interest-interested",
+              "event_interest-not_interested", "users-birthyear"):
+        assert t in src, f"rel-event task {t!r} missing from launcher defaults"
+
+
 def test_holdout_task_dev_rejects_malformed_holdouts_entry(tmp_path):
     """HOLDOUTS entries must be 'dataset:task' -- malformed entries
     (no colon, empty fields) must reject."""

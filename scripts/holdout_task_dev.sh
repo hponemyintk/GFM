@@ -9,13 +9,25 @@
 # should transfer to unseen task heads on already-seen schemas
 # without further backbone training.
 #
-# Defaults (laptop scale):
-#   DATASETS    "rel-f1 rel-hm"
-#   HOLDOUTS    "rel-f1:driver-top3 rel-hm:user-churn"  (binary, AUROC signal)
+# Defaults (full-scale, AWS p4d-targeted):
+#   DATASETS    "rel-f1 rel-event rel-hm"
+#   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-repeat rel-hm:user-churn"
+#                (all binary -> AUROC signal)
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
-#                = 5 rel-f1 + 2 rel-hm = 7 tasks
+#                = 5 rel-f1 + 5 rel-event + 2 rel-hm = 12 tasks
 #
-# Override DATASETS / HOLDOUTS / PRETRAIN_TASKS_CSV to customize.
+# Memory profile:
+#   * rel-f1 materialization:    ~50 MB (laptop-fine)
+#   * rel-hm materialization:    ~600 MB (laptop-fine)
+#   * rel-event materialization: ~25 GB peak RSS (laptop OOMs at 27 GB)
+#
+# To run on the laptop: override DATASETS to drop rel-event:
+#   DATASETS="rel-f1 rel-hm" \
+#   HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
+#   bash scripts/holdout_task_dev.sh
+#
+# Full 3-dataset run targets the 8x A100 / 1 TB RAM box (same as
+# scripts/pretrain_p4d.sh).
 #
 # Usage:
 #   bash scripts/holdout_task_dev.sh [EPOCHS] [MAX_STEPS]
@@ -42,14 +54,20 @@ cd "$REPO_ROOT"
 
 EPOCHS="${EPOCHS:-${1:-5}}"
 MAX_STEPS="${MAX_STEPS:-${2:-300}}"
-DATASETS="${DATASETS:-rel-f1 rel-hm}"
+DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"
 # Per-dataset holdout map: "<dataset>:<task> <dataset>:<task> ..."
-HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-hm:user-churn}"
+HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-repeat rel-hm:user-churn}"
 
 # Default per-dataset full task lists. The launcher subtracts the
-# HOLDOUTS map from these to produce the pretrain CSV.
+# HOLDOUTS map from these to produce the pretrain CSV. Sources:
+#   rel-f1:    relbench.tasks.get_task_names('rel-f1')
+#   rel-event: relbench.tasks.get_task_names('rel-event')  (matches
+#              scripts/pretrain_alltasks.sh task list verbatim)
+#   rel-hm:    relbench.tasks.get_task_names('rel-hm')
+#              (user-item-purchase is recommendation, omitted)
 declare -A DEFAULT_ALL_TASKS=(
   [rel-f1]="driver-position driver-dnf driver-top3 driver-circuit-compete results-position qualifying-position"
+  [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested users-birthyear"
   [rel-hm]="user-churn item-sales transactions-price"
 )
 
