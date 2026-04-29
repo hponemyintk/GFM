@@ -9,43 +9,38 @@
 # should transfer to unseen task heads on already-seen schemas
 # without further backbone training.
 #
-# Defaults (full-scale, AWS p4d-targeted):
-#   DATASETS    "rel-f1 rel-event rel-hm"
-#   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-churn"
+# Defaults (paper-safe subset; see docs/truncated_graph_caveat.md):
+#   DATASETS    "rel-f1 rel-hm"
+#   HOLDOUTS    "rel-f1:driver-top3 rel-hm:user-churn"
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
-#                = 5 rel-f1 + 5 rel-event + 2 rel-hm = 12 tasks
+#                = 2 rel-f1 + 1 rel-hm = 3 tasks
+#
+# Why no rel-event by default: the only RelGT-paper-benchmarked
+# rel-event task is `user-ignore`. With one safe task there is
+# nothing left to pretrain on after holding it out. To opt in (e.g.
+# include user-ignore in pretrain alongside another dataset's
+# holdout), override DATASETS / HOLDOUTS explicitly. The other
+# rel-event tasks (users-birthyear, user-attendance, user-repeat,
+# event_interest-*) crash the truncated CSR adjacency on val/test
+# seeds; see docs/truncated_graph_caveat.md.
 #
 # Holdout task choices match the RelGT paper's benchmark task list.
-# Metric mix is intentional (paper-aligned, not AUROC-consistent):
-#   * rel-f1 / driver-top3      -- binary, AUROC. Cited in
-#                                  expts/run-large-base-experiments
-#                                  and expts/run-encoder-ablation.
-#   * rel-event / user-attendance -- REGRESSION, MAE. Cited in
-#                                  expts/run-encoder-ablation
-#                                  (paper benchmarks user-attendance,
-#                                  user-repeat, user-ignore on
-#                                  rel-event; user-attendance is the
-#                                  regression of the three).
-#   * rel-hm / user-churn       -- binary, AUROC. Cited in
-#                                  expts/run-large-base-experiments
-#                                  and the paper's main results table.
-#
-# Per-holdout metric will appear in summary.json under the relevant
-# RelBench-evaluated key ('roc_auc' for binary, 'mae' for
-# regression). Cross-holdout aggregation is left to the consumer.
+# Both default holdouts are binary -> AUROC, so summary.json will
+# carry consistent 'roc_auc' keys across datasets:
+#   * rel-f1 / driver-top3  -- binary, AUROC. Cited in
+#                              expts/run-large-base-experiments
+#                              and expts/run-encoder-ablation.
+#   * rel-hm / user-churn   -- binary, AUROC. Cited in
+#                              expts/run-large-base-experiments
+#                              and the paper's main results table.
 #
 # Memory profile:
 #   * rel-f1 materialization:    ~50 MB (laptop-fine)
 #   * rel-hm materialization:    ~600 MB (laptop-fine)
 #   * rel-event materialization: ~25 GB peak RSS (laptop OOMs at 27 GB)
 #
-# To run on the laptop: override DATASETS to drop rel-event:
-#   DATASETS="rel-f1 rel-hm" \
-#   HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
-#   bash scripts/holdout_task_dev.sh
-#
-# Full 3-dataset run targets the 8x A100 / 1 TB RAM box (same as
-# scripts/pretrain_p4d.sh).
+# Full 2-dataset default fits the laptop. The p4d backend (NPROC>=2)
+# is still useful for paper-config (K=300 / 4-layer / channels=512).
 #
 # Usage:
 #   bash scripts/holdout_task_dev.sh [EPOCHS] [MAX_STEPS]
@@ -55,7 +50,7 @@
 #
 # ---------------- Example invocations (copy-paste) ----------------
 #
-# AWS p4d.24xlarge (8 x A100, paper-config, all 3 datasets):
+# AWS p4d.24xlarge (8 x A100, paper-config, default 2-dataset run):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/holdout_task_dev.sh
@@ -66,20 +61,21 @@
 #   NPROC=8 EPOCHS=3 STEPS_PER_TASK=200 \
 #     bash scripts/holdout_task_dev.sh
 #
-# AWS p4d, custom dataset subset (e.g. exclude rel-event for a
-# faster iteration on the smaller two):
+# AWS p4d with rel-event opt-in -- include user-ignore in pretrain
+# alongside the rel-f1 + rel-hm holdouts. rel-event itself contributes
+# zero held-out tasks here (only user-ignore is paper-safe; if you
+# hold it out you have nothing to pretrain on for that dataset):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
-#     DATASETS="rel-f1 rel-hm" \
-#     HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
+#     DATASETS="rel-f1 rel-event rel-hm" \
+#     HOLDOUTS="rel-f1:driver-top3 rel-event:user-ignore rel-hm:user-churn" \
 #     bash scripts/holdout_task_dev.sh
 #
-# Laptop (single GPU, smaller config; rel-event omitted because its
-# materialization peak ~25 GB OOMs a 27 GB box):
+# Laptop (single GPU, smaller config -- default 2-dataset is
+# laptop-friendly; rel-event materialization ~25 GB OOMs a 27 GB box
+# so don't enable rel-event here):
 #
-#   DATASETS="rel-f1 rel-hm" \
-#     HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
-#     bash scripts/holdout_task_dev.sh
+#   bash scripts/holdout_task_dev.sh
 #
 # Output layout under $OUT_DIR (default results/holdout_task_dev/):
 #   pretrain/                    # single shared pretrain
@@ -100,29 +96,44 @@ cd "$REPO_ROOT"
 
 EPOCHS="${EPOCHS:-${1:-5}}"
 MAX_STEPS="${MAX_STEPS:-${2:-300}}"
-DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"
+DATASETS="${DATASETS:-rel-f1 rel-hm}"
 # Per-dataset holdout map: "<dataset>:<task> <dataset>:<task> ..."
 # Tasks cited in RelGT paper expts (see header docstring).
-HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-churn}"
+HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-hm:user-churn}"
 
 # Default per-dataset full task lists. The launcher subtracts the
-# HOLDOUTS map from these to produce the pretrain CSV. Sources:
-#   rel-f1:    relbench.tasks.get_task_names('rel-f1')
-#   rel-event: relbench.tasks.get_task_names('rel-event')  (matches
-#              scripts/pretrain_alltasks.sh task list verbatim).
-#              users-birthyear OMITTED -- its val/test seeds reference
-#              user-table rows past train_cutoff, which IndexError
-#              the truncated CSR adjacency we keep per RelGT paper
-#              guardrail (PR 1.0b). Same pattern as
-#              rel-f1/results-position. To opt back in, override
-#              PRETRAIN_TASKS_CSV explicitly OR flip
-#              upto_test_timestamp=False at the data layer.
-#   rel-hm:    relbench.tasks.get_task_names('rel-hm')
-#              (user-item-purchase is recommendation, omitted)
+# HOLDOUTS map from these to produce the pretrain CSV. We restrict
+# each list to the paper-benchmarked subset for that dataset --
+# tasks whose seed entity is STABLE over time, so the val/test seed
+# ids are valid against the truncated CSR adjacency we keep per the
+# RelGT paper guardrail (upto_test_timestamp=True, PR 1.0b). Tasks
+# with growing seed entities (users-birthyear, results-position,
+# qualifying-position, transactions-price, ...) crash the
+# build at graph_cache.py:288 -- see docs/truncated_graph_caveat.md
+# for the full bug pattern, the paper's sidestep, and opt-in routes.
+#
+# Sources:
+#   rel-f1:    expts/run-large-base-experiments.sh -- driver-{position,
+#              dnf,top3}. driver-circuit-compete dropped despite stable
+#              seed because the paper doesn't benchmark it (no external
+#              sanity check); results-position + qualifying-position
+#              dropped (growing seeds).
+#   rel-event: expts/run-encoder-ablation.sh benchmarks user-attendance,
+#              user-repeat, user-ignore. ONLY user-ignore has a stable
+#              seed (user x event composite, both stable); the other
+#              two grow with new sign-ups / repeat events. event_interest-*
+#              and users-birthyear also grow. Net: only user-ignore
+#              survives -- not enough for "all-but-one" pretrain on
+#              this dataset alone, hence rel-event is not in the
+#              default DATASETS.
+#   rel-hm:    expts/run-large-base-experiments.sh -- user-churn,
+#              item-sales. transactions-price dropped (growing seed:
+#              new transactions every day). user-item-purchase is
+#              recommendation, omitted at the launcher level too.
 declare -A DEFAULT_ALL_TASKS=(
-  [rel-f1]="driver-position driver-dnf driver-top3 driver-circuit-compete results-position qualifying-position"
-  [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested"
-  [rel-hm]="user-churn item-sales transactions-price"
+  [rel-f1]="driver-position driver-dnf driver-top3"
+  [rel-event]="user-ignore"
+  [rel-hm]="user-churn item-sales"
 )
 
 # Parse HOLDOUTS into an associative array: {dataset -> task}

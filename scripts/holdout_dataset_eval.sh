@@ -12,12 +12,24 @@
 # Defaults:
 #   SOURCE       rel-f1        (~50 MB, fits laptop)
 #   TARGET       rel-hm        (~600 MB, fits laptop)
-#   SOURCE_TASKS all 6 rel-f1 tasks (multi-task pretrain)
-#   TARGET_TASKS all 3 rel-hm tasks (extract + finetune + tabpfn each)
+#   SOURCE_TASKS paper-benchmarked rel-f1 tasks (driver-{position,
+#                dnf,top3}) -- multi-task pretrain
+#   TARGET_TASKS paper-benchmarked rel-hm tasks (user-churn,
+#                item-sales) -- extract + finetune + tabpfn each
+#
+# Default task lists are restricted to the paper-benchmarked
+# subset (stable-seed tasks) per docs/truncated_graph_caveat.md.
+# Tasks with growing seed entities (results-position,
+# qualifying-position, transactions-price, ...) crash the
+# truncated CSR adjacency on val/test seeds; opt back in by
+# overriding SOURCE_TASKS_CSV / TARGET_TASKS_CSV (and accepting
+# the build will crash unless upto_test_timestamp is also flipped).
 #
 # rel-event won't fit the laptop; the AWS p4d run uses
 # scripts/pretrain_p4d.sh for source, then this script with
-# SOURCE=rel-event TARGET=<other> on the box.
+# SOURCE=rel-event TARGET=<other> on the box. Note: rel-event has
+# only one paper-safe task (user-ignore); SOURCE=rel-event will
+# require setting SOURCE_TASKS_CSV explicitly to user-ignore alone.
 #
 # Usage:
 #   bash scripts/holdout_dataset_eval.sh [EPOCHS] [MAX_STEPS]
@@ -69,19 +81,21 @@ if [ "$SOURCE" = "$TARGET" ]; then
   exit 2
 fi
 
-# Source pretraining task lists. All tasks of the source dataset.
+# Source pretraining task lists. Restricted to the paper-benchmarked
+# subset per docs/truncated_graph_caveat.md -- the omitted tasks
+# (driver-circuit-compete, results-position, qualifying-position,
+# transactions-price) IndexError on val/test seeds against the
+# truncated CSR adjacency. Override SOURCE_TASKS_CSV /
+# TARGET_TASKS_CSV to opt in (and accept the crash unless
+# upto_test_timestamp is also flipped).
 DEFAULT_RELF1_ALL=(
   "rel-f1.driver-position:1.0"
   "rel-f1.driver-dnf:1.0"
   "rel-f1.driver-top3:1.0"
-  "rel-f1.driver-circuit-compete:1.0"
-  "rel-f1.results-position:1.0"
-  "rel-f1.qualifying-position:1.0"
 )
 DEFAULT_RELHM_ALL=(
   "rel-hm.user-churn:1.0"
   "rel-hm.item-sales:1.0"
-  "rel-hm.transactions-price:1.0"
 )
 
 if [ -z "${SOURCE_TASKS_CSV:-}" ]; then

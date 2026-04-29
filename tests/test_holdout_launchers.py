@@ -97,41 +97,51 @@ def test_holdout_task_dev_rejects_holdout_not_in_full_tasks(tmp_path):
     assert "not in known tasks" in (proc.stderr + proc.stdout)
 
 
-def test_holdout_task_dev_default_includes_three_datasets():
-    """The launcher's defaults must include rel-f1, rel-event, and
-    rel-hm with one binary holdout each so the AUROC signal is
-    consistent across the three. Holdout task choices must match
-    the RelGT paper's benchmark task list."""
+def test_holdout_task_dev_default_paper_safe_subset():
+    """The launcher's defaults must restrict to the paper-benchmarked
+    subset (stable-seed tasks) per docs/truncated_graph_caveat.md.
+    Defaults pin to rel-f1 + rel-hm (both holdouts binary -> AUROC,
+    consistent metric across datasets). rel-event has only one
+    paper-safe task (user-ignore), so it's excluded from defaults --
+    "all-but-one" pretrain has nothing left after holding it out."""
     src = (SCRIPTS / "holdout_task_dev.sh").read_text()
-    # Default DATASETS.
-    assert 'DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"' in src, (
-        "default DATASETS should include all three datasets"
+    # Default DATASETS -- rel-event excluded (only one paper-safe
+    # task, see docs/truncated_graph_caveat.md).
+    assert 'DATASETS="${DATASETS:-rel-f1 rel-hm}"' in src, (
+        "default DATASETS should be the paper-safe 2-dataset subset"
     )
-    # Default HOLDOUTS -- paper-aligned tasks (mixed metrics:
-    # rel-f1/rel-hm are binary -> AUROC, rel-event is regression
-    # -> MAE).
-    assert "rel-f1:driver-top3" in src        # paper expts/run-large-base-experiments
-    assert "rel-event:user-attendance" in src  # paper expts/run-encoder-ablation
-    assert "rel-hm:user-churn" in src          # paper expts/run-large-base-experiments
-    # rel-event task list (5 of 6 from
-    # relbench.tasks.get_task_names('rel-event'); users-birthyear
-    # OMITTED because its val/test seeds overflow the truncated user
-    # table -- truncated-graph guardrail caveat).
-    assert "[rel-event]=" in src
-    for t in ("user-attendance", "user-repeat", "user-ignore",
-              "event_interest-interested",
-              "event_interest-not_interested"):
-        assert t in src, f"rel-event task {t!r} missing from launcher defaults"
-    # users-birthyear must NOT be in the rel-event default list.
-    # Match strictly against the bash array assignment so the test
-    # doesn't false-positive on the explanatory comment that names
-    # the task.
+    # Default HOLDOUTS -- both binary, AUROC.
+    assert "rel-f1:driver-top3" in src   # paper expts/run-large-base-experiments
+    assert "rel-hm:user-churn" in src    # paper expts/run-large-base-experiments
+    # rel-event holdout must NOT be in the default HOLDOUTS string.
+    # Match against the assignment line strictly so the explanatory
+    # comments naming rel-event don't false-positive.
     assert (
-        "[rel-event]=\"user-attendance user-repeat user-ignore "
-        "event_interest-interested event_interest-not_interested\""
+        'HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-hm:user-churn}"'
+        in src
+    ), "default HOLDOUTS should be the paper-safe 2-dataset subset"
+    # rel-f1 default task list -- paper-safe stable-seed tasks only.
+    assert (
+        '[rel-f1]="driver-position driver-dnf driver-top3"'
     ) in src, (
-        "rel-event default task list shape unexpected; "
-        "verify users-birthyear is excluded"
+        "rel-f1 default task list must be the paper-safe subset; "
+        "results-position / qualifying-position / "
+        "driver-circuit-compete excluded"
+    )
+    # rel-hm default task list -- paper-safe stable-seed tasks only.
+    assert (
+        '[rel-hm]="user-churn item-sales"'
+    ) in src, (
+        "rel-hm default task list must be the paper-safe subset; "
+        "transactions-price excluded"
+    )
+    # rel-event entry exists (for explicit opt-in) but limited to
+    # the one paper-safe task.
+    assert (
+        '[rel-event]="user-ignore"'
+    ) in src, (
+        "rel-event default must be limited to user-ignore "
+        "(only paper-safe task on this dataset)"
     )
 
 
