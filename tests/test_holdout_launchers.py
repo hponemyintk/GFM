@@ -40,43 +40,78 @@ def test_holdout_task_dev_bash_syntax():
     assert rc.returncode == 0
 
 
-def test_holdout_task_dev_rejects_holdout_in_tasks_keep(tmp_path):
-    """If TASKS_KEEP_CSV includes the HOLDOUT task, the script must
-    exit non-zero before launching pretraining (catches the easiest
-    user mistake)."""
+def test_holdout_task_dev_rejects_holdout_in_pretrain_csv(tmp_path):
+    """If PRETRAIN_TASKS_CSV (the union of all-but-holdout tasks)
+    accidentally includes a holdout task, the script must reject it
+    BEFORE pretraining starts. Catches the easiest user mistake."""
     bash = _bash()
     p = SCRIPTS / "holdout_task_dev.sh"
     env = os.environ.copy()
-    env["DATASET"] = "rel-f1"
-    env["HOLDOUT"] = "driver-top3"
-    # Deliberately INCLUDE driver-top3 -- script should reject this.
-    env["TASKS_KEEP_CSV"] = "rel-f1.driver-top3:1.0,rel-f1.driver-position:1.0"
-    env["OUT_DIR"] = str(tmp_path / "out")
-    # Fast-fail: the script reaches the holdout-vs-keep check before
-    # any expensive setup.
-    proc = subprocess.run(
-        [bash, str(p)], env=env, check=False,
-        capture_output=True, text=True, timeout=10,
-    )
-    assert proc.returncode != 0
-    assert "HOLDOUT task" in (proc.stderr + proc.stdout)
-
-
-def test_holdout_task_dev_rejects_unknown_dataset(tmp_path):
-    """Unknown DATASET with no explicit TASKS_KEEP_CSV must exit non-zero."""
-    bash = _bash()
-    p = SCRIPTS / "holdout_task_dev.sh"
-    env = os.environ.copy()
-    env["DATASET"] = "rel-totally-fake"
-    env["HOLDOUT"] = "anything"
-    env.pop("TASKS_KEEP_CSV", None)
+    env["DATASETS"] = "rel-f1 rel-hm"
+    env["HOLDOUTS"] = "rel-f1:driver-top3 rel-hm:user-churn"
+    # Deliberately INCLUDE driver-top3 in the pretrain CSV.
+    env["PRETRAIN_TASKS_CSV"] = "rel-f1.driver-top3:1.0,rel-f1.driver-position:1.0,rel-hm.item-sales:1.0"
     env["OUT_DIR"] = str(tmp_path / "out")
     proc = subprocess.run(
         [bash, str(p)], env=env, check=False,
         capture_output=True, text=True, timeout=10,
     )
     assert proc.returncode != 0
-    assert "no default TASKS_KEEP" in (proc.stderr + proc.stdout)
+    assert "holdout" in (proc.stderr + proc.stdout).lower()
+
+
+def test_holdout_task_dev_rejects_unknown_dataset_in_holdouts(tmp_path):
+    """Unknown dataset in HOLDOUTS must exit non-zero (defaults are
+    keyed by dataset name)."""
+    bash = _bash()
+    p = SCRIPTS / "holdout_task_dev.sh"
+    env = os.environ.copy()
+    env["DATASETS"] = "rel-totally-fake"
+    env["HOLDOUTS"] = "rel-totally-fake:anything"
+    env.pop("PRETRAIN_TASKS_CSV", None)
+    env["OUT_DIR"] = str(tmp_path / "out")
+    proc = subprocess.run(
+        [bash, str(p)], env=env, check=False,
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode != 0
+    assert "no default task list" in (proc.stderr + proc.stdout)
+
+
+def test_holdout_task_dev_rejects_holdout_not_in_full_tasks(tmp_path):
+    """If a HOLDOUT task isn't in the dataset's known full task list,
+    the script must reject it -- otherwise the pretrain CSV would be
+    ill-formed (subtracting a non-existent element)."""
+    bash = _bash()
+    p = SCRIPTS / "holdout_task_dev.sh"
+    env = os.environ.copy()
+    env["DATASETS"] = "rel-f1"
+    env["HOLDOUTS"] = "rel-f1:not-a-real-task"
+    env.pop("PRETRAIN_TASKS_CSV", None)
+    env["OUT_DIR"] = str(tmp_path / "out")
+    proc = subprocess.run(
+        [bash, str(p)], env=env, check=False,
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode != 0
+    assert "not in known tasks" in (proc.stderr + proc.stdout)
+
+
+def test_holdout_task_dev_rejects_malformed_holdouts_entry(tmp_path):
+    """HOLDOUTS entries must be 'dataset:task' -- malformed entries
+    (no colon, empty fields) must reject."""
+    bash = _bash()
+    p = SCRIPTS / "holdout_task_dev.sh"
+    env = os.environ.copy()
+    env["DATASETS"] = "rel-f1"
+    env["HOLDOUTS"] = "rel-f1-driver-top3"  # missing colon
+    env["OUT_DIR"] = str(tmp_path / "out")
+    proc = subprocess.run(
+        [bash, str(p)], env=env, check=False,
+        capture_output=True, text=True, timeout=10,
+    )
+    assert proc.returncode != 0
+    assert "malformed HOLDOUTS" in (proc.stderr + proc.stdout)
 
 
 def test_holdout_dataset_eval_bash_syntax():
