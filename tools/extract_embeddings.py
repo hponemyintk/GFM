@@ -218,8 +218,10 @@ def _build_cache(args):
     """Materialize a DatasetGraphCache for the target dataset/task.
 
     Mirrors what train_multi_task._build_caches_and_tokens does but
-    for one (dataset, task) pair. Phase-1 keeps using
-    ``upto_test_timestamp=True`` per the RelGT paper guardrail.
+    for one (dataset, task) pair. Honors ``args.full_graph`` so the
+    adoption build matches the pretraining mode -- mismatched modes
+    yield different seed-id indexing and produce embeddings that
+    don't align with the pretrained backbone.
     """
     from relbench.datasets import get_dataset
     from relbench.tasks import get_task
@@ -236,20 +238,23 @@ def _build_cache(args):
     dset = get_dataset(args.dataset, download=True)
     task = get_task(args.dataset, args.task, download=True)
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=True)
-    db = dset.get_db(upto_test_timestamp=True)
+    upto = not args.full_graph
+    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=upto)
+    db = dset.get_db(upto_test_timestamp=upto)
     cs = _filter_stypes(cs, db)
+    mat_suffix = "materialized_full" if args.full_graph else "materialized"
+    tf_suffix = "tf_store_full" if args.full_graph else "tf_store"
     data, _col_stats = make_pkey_fkey_graph(
         db,
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device="cpu"), batch_size=256,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/{mat_suffix}",
     )
     cache = DatasetGraphCache(
         data=data, undirected=True, name_prefix=args.dataset,
-        tf_store_root=os.path.join(args.cache_dir, "tf_store", args.dataset)
+        tf_store_root=os.path.join(args.cache_dir, tf_suffix, args.dataset)
         if args.use_tf_store else None,
     )
     return cache, task
@@ -295,6 +300,15 @@ def main(argv=None):
              "target dataset wasn't in the saved backbone_meta.",
     )
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--full_graph", action="store_true", default=False,
+        help="Use upto_test_timestamp=False so the materialization "
+             "includes entities created after train_cutoff. Must match "
+             "what the backbone was pretrained with: if pretraining used "
+             "--full_graph, adoption must too, otherwise the seed-id "
+             "indexing differs between train and adoption. "
+             "See docs/truncated_graph_caveat.md.",
+    )
     args = p.parse_args(argv)
 
     # Expand user paths.

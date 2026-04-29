@@ -119,13 +119,22 @@ def test_holdout_task_dev_default_paper_safe_subset():
         'HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 '
         'rel-event:user-attendance}"'
     ) in src, "default HOLDOUTS must be the binary+regression pair"
-    # rel-f1 default task list -- paper-safe stable-seed tasks only.
+    # rel-f1 default task list -- 3 stable-seed paper tasks PLUS the
+    # 2 autocomplete regression tasks (results-position,
+    # qualifying-position) that need FULL_GRAPH=1 to build cleanly.
+    # driver-circuit-compete is link-prediction, kept out of defaults.
     assert (
-        '[rel-f1]="driver-position driver-dnf driver-top3"'
+        '[rel-f1]="driver-position driver-dnf driver-top3 '
+        'results-position qualifying-position"'
     ) in src, (
-        "rel-f1 default task list must be the paper-safe subset; "
-        "results-position / qualifying-position / "
-        "driver-circuit-compete excluded"
+        "rel-f1 default task list must include both stable-seed and "
+        "autocomplete tasks; FULL_GRAPH=1 default makes the "
+        "autocomplete tasks build cleanly"
+    )
+    # FULL_GRAPH default must be 1 (enabled).
+    assert 'FULL_GRAPH="${FULL_GRAPH:-1}"' in src, (
+        "FULL_GRAPH must default to 1 so autocomplete tasks "
+        "(results-position, qualifying-position) build cleanly"
     )
     # rel-event default task list -- all three paper-benchmarked tasks
     # (Table 1a/1b). user-attendance is regression; user-repeat and

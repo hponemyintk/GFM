@@ -143,8 +143,27 @@ cd "$REPO_ROOT"
 # Defaults
 # ------------------------------------------------------------------
 CACHE="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
-TF_STORE="$CACHE/tf_store"
-SHARDS="$CACHE/shards"
+
+# FULL_GRAPH=1 builds with upto_test_timestamp=False (the materialization
+# includes entities created after train_cutoff). Required for autocomplete
+# tasks (results-position, qualifying-position, transactions-price,
+# users-birthyear) whose val/test seeds reference such rows -- without it,
+# their indptr lookup IndexErrors at graph_cache.py:288. Temporal leakage
+# is still prevented by the per-neighbor seed_time filter at
+# gfm_data/sampler.py:69. See docs/truncated_graph_caveat.md.
+#
+# We use mode-aware TF/shard cache paths so the truncated build is not
+# overwritten by a full-graph rebuild (and vice-versa).
+FULL_GRAPH="${FULL_GRAPH:-0}"
+if [ "$FULL_GRAPH" = "1" ]; then
+    TF_STORE="$CACHE/tf_store_full"
+    SHARDS="$CACHE/shards_full"
+    FULL_GRAPH_FLAG="--full_graph"
+else
+    TF_STORE="$CACHE/tf_store"
+    SHARDS="$CACHE/shards"
+    FULL_GRAPH_FLAG=""
+fi
 K="${K:-300}"
 # Defaults match expts/run-large-base-experiments.sh per-task budget,
 # adjusted for batch=512 (half of expts' 1024) on 8-GPU DDP.
@@ -217,6 +236,7 @@ echo "  epochs=$EPOCHS  steps_per_task=$STEPS_PER_TASK  workers=$WORKERS  nproc=
 echo "  parallel_tf=$PARALLEL_TF_BUILDS  parallel_shard=$PARALLEL_SHARD_BUILDS"
 echo "  lr=$LR  warmup=$WARMUP  loss_balance=$LOSS_BALANCE"
 echo "  cache=$CACHE  out=$OUT_DIR"
+echo "  full_graph=$FULL_GRAPH  tf_store=$TF_STORE  shards=$SHARDS"
 echo
 
 # ------------------------------------------------------------------
@@ -330,7 +350,8 @@ phase1_build_one() {
     t0=$(date +%s)
     echo "  [GPU $gpu_id] $ds: building ... (log: $log)"
     if CUDA_VISIBLE_DEVICES="$gpu_id" python3 tools/build_tf_store.py \
-        --dataset "$ds" --out_dir "$TF_STORE/$ds" > "$log" 2>&1; then
+        --dataset "$ds" --out_dir "$TF_STORE/$ds" $FULL_GRAPH_FLAG \
+        > "$log" 2>&1; then
         touch "$TF_STORE/$ds/.done"
         echo "  [GPU $gpu_id] $ds: done in $(( $(date +%s) - t0 ))s"
     else
@@ -371,7 +392,8 @@ phase2_build_one() {
         --K "$K" --shard_size "$SHARD_SIZE" \
         --out_dir "$out" \
         --name_prefix "$ds" \
-        --splits train val test > "$log" 2>&1; then
+        --splits train val test $FULL_GRAPH_FLAG \
+        > "$log" 2>&1; then
         mkdir -p "$k_dir"
         touch "$k_dir/.done"
         echo "  $ds.$task: done in $(( $(date +%s) - t0 ))s (K=$K)"
@@ -638,7 +660,7 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --loss_balance "$LOSS_BALANCE" \
     --load_concurrency "$LOAD_CONCURRENCY" \
     --out_dir "$OUT_DIR" \
-    --run_name "$RUN_NAME" \
+    --run_name "$RUN_NAME" $FULL_GRAPH_FLAG \
     > "$LOG" 2>&1 &
 TORCHRUN_PID=$!
 set +m
