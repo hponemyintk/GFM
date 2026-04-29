@@ -26,23 +26,22 @@
 #
 # ---------------- Example invocations (copy-paste) ----------------
 #
-# This launcher runs single-GPU pretrain by default (set
-# --nproc_per_node 1 below). For p4d-scale runs, pretrain via
-# scripts/pretrain_p4d.sh first, then point THIS launcher at the
-# saved checkpoint via SKIP_PRETRAIN=1 (not yet implemented; see TODO
-# below) -- or just run pretrain_p4d.sh + tools/extract_embeddings.py
-# manually for cross-dataset adoption.
+# Backend dispatch mirrors holdout_task_dev.sh:
+#   NPROC>=2  -> delegate SOURCE pretrain to scripts/pretrain_p4d.sh
+#                (DDP across NPROC GPUs + parallel TF/shard build +
+#                 memory watchdog + pre-flight cleanup)
+#   NPROC=1   -> inline single-GPU streaming pretrain (default)
 #
-# AWS p4d.24xlarge (single-GPU pretrain on SOURCE, then adopt on
-# TARGET tasks; ~30h on rel-event SOURCE):
+# AWS p4d.24xlarge (rel-event SOURCE, paper-config; ~30h wall):
 #
-#   SOURCE=rel-event TARGET=rel-hm \
-#     EPOCHS=10 MAX_STEPS=3000 \
+#   NPROC=8 SOURCE=rel-event TARGET=rel-hm \
+#     EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/holdout_dataset_eval.sh
 #
-# AWS p4d, smaller cross-dataset run for sanity (rel-f1 -> rel-hm):
+# AWS p4d quick shake-out (rel-f1 -> rel-hm, ~1h):
 #
-#   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 MAX_STEPS=500 \
+#   NPROC=8 SOURCE=rel-f1 TARGET=rel-hm \
+#     EPOCHS=3 STEPS_PER_TASK=200 \
 #     bash scripts/holdout_dataset_eval.sh
 #
 # Laptop (rel-f1 -> rel-hm, both fit):
@@ -50,14 +49,10 @@
 #   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 MAX_STEPS=300 \
 #     bash scripts/holdout_dataset_eval.sh
 #
-# Reverse direction:
+# Reverse direction (laptop):
 #
 #   SOURCE=rel-hm TARGET=rel-f1 EPOCHS=5 MAX_STEPS=300 \
 #     bash scripts/holdout_dataset_eval.sh
-#
-# TODO: add NPROC + pretrain_p4d.sh delegation here too (mirror of
-# the p4d backend in holdout_task_dev.sh) once Phase-5 is exercised
-# at scale. Today this script always uses --nproc_per_node 1.
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -116,15 +111,42 @@ fi
 CACHE="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 TF_STORE="$CACHE/tf_store"
 SEED="${SEED:-0}"
-K="${K:-64}"
-BATCH="${BATCH:-128}"
-CHANNELS="${CHANNELS:-128}"
-HEADS="${HEADS:-4}"
-CENTROIDS="${CENTROIDS:-512}"
-MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval}"
 RUN_DIR="$OUT_DIR_BASE/${SOURCE}_to_${TARGET}"
 PRETRAIN_DIR="$RUN_DIR/pretrain"
+
+# ---- backend dispatch (mirror of holdout_task_dev.sh) ----
+# NPROC>=2 -> delegate pretrain to scripts/pretrain_p4d.sh (DDP +
+# parallel build phases + memory watchdog + pre-flight cleanup).
+# NPROC=1  -> inline single-GPU streaming pretrain (default).
+NPROC="${NPROC:-1}"
+if [ -z "${PRETRAIN_BACKEND:-}" ]; then
+  if [ "$NPROC" -ge 2 ]; then
+    PRETRAIN_BACKEND=p4d
+  else
+    PRETRAIN_BACKEND=laptop
+  fi
+fi
+
+# Per-backend training-config defaults. Set BEFORE the dispatch so
+# the adoption phase (extract_embeddings + finetune_head + tabpfn)
+# downstream reads matching K + BATCH.
+if [ "$PRETRAIN_BACKEND" = "p4d" ]; then
+  K="${K:-300}"
+  BATCH="${BATCH:-512}"
+  CHANNELS="${CHANNELS:-512}"
+  NUM_LAYERS="${NUM_LAYERS:-4}"
+  HEADS="${HEADS:-4}"
+  CENTROIDS="${CENTROIDS:-4096}"
+else
+  K="${K:-64}"
+  BATCH="${BATCH:-128}"
+  CHANNELS="${CHANNELS:-128}"
+  NUM_LAYERS="${NUM_LAYERS:-1}"
+  HEADS="${HEADS:-4}"
+  CENTROIDS="${CENTROIDS:-512}"
+fi
+MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"
 
 mkdir -p "$PRETRAIN_DIR"
 
@@ -141,27 +163,68 @@ echo "  EPOCHS=$EPOCHS  MAX_STEPS=$MAX_STEPS  SEED=$SEED"
 echo "  RUN_DIR: $RUN_DIR"
 echo "=============================================================="
 
-# ----------------- 1. TF stores for SOURCE + TARGET -----------------
-for ds in "$SOURCE" "$TARGET"; do
-  if [ ! -f "$TF_STORE/$ds/.done" ]; then
-    echo
-    echo "=== Building TF store for $ds ==="
-    python3 tools/build_tf_store.py --dataset "$ds" --out_dir "$TF_STORE/$ds"
-    touch "$TF_STORE/$ds/.done"
-  else
-    echo "[setup] TF store cached at $TF_STORE/$ds"
-  fi
-done
-
-# ----------------- 2. Pretrain on SOURCE -----------------
+# ----------------- Pretrain artifact paths (shared by both backends) -----------------
 PRETRAIN_LOG="$PRETRAIN_DIR/run.log"
 META="$PRETRAIN_DIR/multi_task/backbone_meta.json"
 WEIGHTS="$PRETRAIN_DIR/multi_task/best_backbone.pt"
 SCHEMA="$PRETRAIN_DIR/multi_task/backbone_schema.pt"
 
+# ----------------- 1+2. TF stores + SOURCE pretrain -----------------
+# The TARGET TF store is also built so step-3 extract_embeddings has
+# memmap shards to read from (`--use_tf_store` below).
 if [ -f "$WEIGHTS" ] && [ -f "$META" ] && [ -f "$SCHEMA" ]; then
   echo "[pretrain] artifacts cached at $PRETRAIN_DIR/multi_task/"
+elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
+  # Delegate to pretrain_p4d.sh. It handles parallel TF/shard
+  # builds, DDP launch, memory watchdog, etc. We pass TASKS_CSV to
+  # bypass relbench's full-task enumeration. NOTE: pretrain_p4d.sh
+  # only builds TF stores for datasets in $DATASETS, so we ALSO
+  # pre-build TARGET's TF store here for the post-pretrain
+  # extract_embeddings step (which reads it via --use_tf_store).
+  echo
+  echo "=== Pre-building TARGET TF store for adoption phase ==="
+  if [ ! -f "$TF_STORE/$TARGET/.done" ]; then
+    python3 tools/build_tf_store.py --dataset "$TARGET" --out_dir "$TF_STORE/$TARGET"
+    touch "$TF_STORE/$TARGET/.done"
+  else
+    echo "  $TARGET: cached at $TF_STORE/$TARGET"
+  fi
+
+  echo
+  echo "=== Delegating SOURCE pretrain to pretrain_p4d.sh (NPROC=$NPROC) ==="
+  echo "  log: $PRETRAIN_LOG"
+  TASKS_CSV="$SOURCE_TASKS_CSV" \
+    DATASETS="$SOURCE" \
+    NPROC="$NPROC" \
+    EPOCHS="$EPOCHS" \
+    MAX_STEPS="$MAX_STEPS" \
+    OUT_DIR="$PRETRAIN_DIR" \
+    RUN_NAME="phase5_${SOURCE}_to_${TARGET}_pretrain" \
+    K="$K" \
+    BATCH="$BATCH" \
+    CHANNELS="$CHANNELS" \
+    NUM_LAYERS="$NUM_LAYERS" \
+    HEADS="$HEADS" \
+    CENTROIDS="$CENTROIDS" \
+    LR="${LR:-1e-4}" \
+    WARMUP="${WARMUP:-1000}" \
+    LOSS_BALANCE="${LOSS_BALANCE:-none}" \
+    bash "$REPO_ROOT/scripts/pretrain_p4d.sh" \
+    > "$PRETRAIN_LOG" 2>&1
 else
+  # Laptop backend: single-GPU streaming pretrain, with both
+  # SOURCE and TARGET TF stores built sequentially.
+  for ds in "$SOURCE" "$TARGET"; do
+    if [ ! -f "$TF_STORE/$ds/.done" ]; then
+      echo
+      echo "=== Building TF store for $ds ==="
+      python3 tools/build_tf_store.py --dataset "$ds" --out_dir "$TF_STORE/$ds"
+      touch "$TF_STORE/$ds/.done"
+    else
+      echo "[setup] TF store cached at $TF_STORE/$ds"
+    fi
+  done
+
   echo
   echo "=== Pretraining on SOURCE=$SOURCE ($SOURCE_TASKS_CSV) ==="
   echo "  log: $PRETRAIN_LOG"
@@ -173,7 +236,7 @@ else
     --num_neighbors "$K" \
     --batch_size "$BATCH" \
     --channels "$CHANNELS" \
-    --num_layers 1 \
+    --num_layers "$NUM_LAYERS" \
     --num_heads "$HEADS" \
     --num_centroids "$CENTROIDS" \
     --epochs "$EPOCHS" \
