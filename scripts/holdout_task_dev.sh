@@ -11,20 +11,28 @@
 #
 # Defaults (full-scale, AWS p4d-targeted):
 #   DATASETS    "rel-f1 rel-event rel-hm"
-#   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-ignore rel-hm:user-churn"
-#                (all binary -> AUROC signal)
+#   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-churn"
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
 #                = 5 rel-f1 + 5 rel-event + 2 rel-hm = 12 tasks
 #
 # Holdout task choices match the RelGT paper's benchmark task list.
-# All three are binary classification (AUROC signal):
-#   * rel-f1 / driver-top3 -- cited in expts/run-large-base-experiments
-#                             and expts/run-encoder-ablation
-#   * rel-event / user-ignore -- cited in
-#                             expts/run-hyperparam-sweep-small-experiments
-#                             (the paper's primary "small" sweep)
-#   * rel-hm / user-churn -- cited in expts/run-large-base-experiments
-#                             and the paper's main results table
+# Metric mix is intentional (paper-aligned, not AUROC-consistent):
+#   * rel-f1 / driver-top3      -- binary, AUROC. Cited in
+#                                  expts/run-large-base-experiments
+#                                  and expts/run-encoder-ablation.
+#   * rel-event / user-attendance -- REGRESSION, MAE. Cited in
+#                                  expts/run-encoder-ablation
+#                                  (paper benchmarks user-attendance,
+#                                  user-repeat, user-ignore on
+#                                  rel-event; user-attendance is the
+#                                  regression of the three).
+#   * rel-hm / user-churn       -- binary, AUROC. Cited in
+#                                  expts/run-large-base-experiments
+#                                  and the paper's main results table.
+#
+# Per-holdout metric will appear in summary.json under the relevant
+# RelBench-evaluated key ('roc_auc' for binary, 'mae' for
+# regression). Cross-holdout aggregation is left to the consumer.
 #
 # Memory profile:
 #   * rel-f1 materialization:    ~50 MB (laptop-fine)
@@ -67,7 +75,7 @@ MAX_STEPS="${MAX_STEPS:-${2:-300}}"
 DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"
 # Per-dataset holdout map: "<dataset>:<task> <dataset>:<task> ..."
 # Tasks cited in RelGT paper expts (see header docstring).
-HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-ignore rel-hm:user-churn}"
+HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-churn}"
 
 # Default per-dataset full task lists. The launcher subtracts the
 # HOLDOUTS map from these to produce the pretrain CSV. Sources:

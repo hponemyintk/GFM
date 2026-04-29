@@ -107,10 +107,12 @@ def test_holdout_task_dev_default_includes_three_datasets():
     assert 'DATASETS="${DATASETS:-rel-f1 rel-event rel-hm}"' in src, (
         "default DATASETS should include all three datasets"
     )
-    # Default HOLDOUTS -- paper-aligned binary tasks.
-    assert "rel-f1:driver-top3" in src      # paper expts/run-large-base-experiments
-    assert "rel-event:user-ignore" in src    # paper expts/run-hyperparam-sweep-small-experiments
-    assert "rel-hm:user-churn" in src        # paper expts/run-large-base-experiments
+    # Default HOLDOUTS -- paper-aligned tasks (mixed metrics:
+    # rel-f1/rel-hm are binary -> AUROC, rel-event is regression
+    # -> MAE).
+    assert "rel-f1:driver-top3" in src        # paper expts/run-large-base-experiments
+    assert "rel-event:user-attendance" in src  # paper expts/run-encoder-ablation
+    assert "rel-hm:user-churn" in src          # paper expts/run-large-base-experiments
     # rel-event task list (verified against
     # relbench.tasks.get_task_names('rel-event')).
     assert "[rel-event]=" in src
