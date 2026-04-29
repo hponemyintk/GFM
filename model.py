@@ -322,3 +322,96 @@ class RelGT(torch.nn.Module):
             x = self.ffs[i](x)
         x = self.fc_out(x)
         return x
+
+    # ------------------------------------------------ adoption-time loader
+    @classmethod
+    def load_backbone(
+        cls,
+        meta_json_path: str,
+        weights_path: str,
+        schema_pt_path: str,
+        *,
+        map_location=None,
+        eval_mode: bool = True,
+        freeze: bool = True,
+    ) -> "RelGT":
+        """Reconstruct a saved backbone for adoption.
+
+        Reads ``backbone_meta.json`` for architectural constants +
+        ``node_type_map``, then ``backbone_schema.pt`` for the
+        ``col_names_dict`` + ``col_stats_dict`` that drive
+        ``NeighborTfsEncoder.register_dataset()``, then loads the
+        weights from ``best_backbone.pt``.
+
+        These three artifacts are what ``train_multi_task._save_best_checkpoint``
+        (PR 2.1) writes per best-val event.
+
+        Adoption defaults: ``eval_mode=True`` and ``freeze=True`` --
+        adoption-time code typically wants the backbone in eval mode
+        with frozen parameters so embedding extraction doesn't update
+        running buffers (BN, EMA cluster size) and downstream head
+        training can't accidentally update the backbone. Pass
+        ``freeze=False`` to keep ``requires_grad=True`` for the
+        warm-then-unfreeze fine-tuning regime.
+        """
+        import json
+        import os
+
+        with open(meta_json_path) as f:
+            meta = json.load(f)
+        if not os.path.exists(schema_pt_path):
+            raise FileNotFoundError(
+                f"backbone_schema.pt not found at {schema_pt_path}; "
+                f"PR 2.1's _save_best_checkpoint should have written it"
+            )
+        schema = torch.load(
+            schema_pt_path, map_location="cpu", weights_only=False,
+        )
+        col_names_dict = schema.get("col_names_dict", {})
+        col_stats_dict = schema.get("col_stats_dict", {})
+
+        node_type_map = {
+            str(k): int(v) for k, v in meta["node_type_map"].items()
+        }
+
+        # Reconstruct with the same architectural constants. The
+        # __init__ auto-calls register_dataset on the encoder via the
+        # backward-compat path (PR 1.2) so per-table buffers + GloVe
+        # column-name embeddings populate to the same shape as the
+        # saved state_dict.
+        backbone = cls(
+            max_neighbor_hop=int(meta["max_neighbor_hop"]),
+            node_type_map=node_type_map,
+            col_names_dict=col_names_dict,
+            col_stats_dict=col_stats_dict,
+            local_num_layers=int(meta["num_layers"]),
+            channels=int(meta["channels"]),
+            # Adoption uses out_channels=channels so the forward
+            # returns embeddings (PR 1.0 + PR 2.x convention). The
+            # head's Linear(channels, ...) at training time was a
+            # transient wrapper.
+            out_channels=int(meta["channels"]),
+            global_dim=int(meta["global_dim"]),
+            heads=int(meta["num_heads"]),
+            ff_dropout=float(meta["ff_dropout"]),
+            attn_dropout=float(meta["attn_dropout"]),
+            conv_type=str(meta["gt_conv_type"]),
+            ablate=str(meta["ablate"]),
+            gnn_pe_dim=int(meta["gnn_pe_dim"]),
+            num_centroids=int(meta["num_centroids"]),
+            sample_node_len=int(meta["num_neighbors"]),
+            args=None,
+        )
+
+        state = torch.load(
+            weights_path,
+            map_location=map_location or "cpu",
+            weights_only=False,
+        )
+        backbone.load_state_dict(state, strict=True)
+
+        if eval_mode:
+            backbone.eval()
+        if freeze:
+            backbone.requires_grad_(False)
+        return backbone

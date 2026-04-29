@@ -168,3 +168,39 @@ class MultiTaskRelGT(nn.Module):
             # output for TabPFN / a new fine-tune head / a feature store.
             return h
         return self.head(h, task_id.long())
+
+    # ------------------------------------------------ adoption-time loader
+    @classmethod
+    def load_backbone(
+        cls,
+        meta_json_path: str,
+        weights_path: str,
+        schema_pt_path: str,
+        *,
+        map_location=None,
+        eval_mode: bool = True,
+        freeze: bool = True,
+    ):
+        """Adoption helper: load just the backbone (no per-task heads).
+
+        Per-task heads are throwaway at adoption time -- the
+        downstream code either runs forward(task_id=None) on the bare
+        backbone for embedding extraction, or wraps it with a fresh
+        head for fine-tuning. Either path doesn't need the saved
+        per-task heads.
+
+        Returns the backbone (RelGT instance) directly, NOT a
+        MultiTaskRelGT wrapper. Callers that want the wrapper for
+        symmetry can do ``MultiTaskRelGT(backbone=..., channels=...,
+        num_tasks=0, task_type_ids=[])`` themselves.
+        """
+        # Pure delegation -- the backbone IS what adoption code wants.
+        # Lives on MultiTaskRelGT for discoverability since that's the
+        # class users construct at training time.
+        from model import RelGT
+        return RelGT.load_backbone(
+            meta_json_path, weights_path, schema_pt_path,
+            map_location=map_location,
+            eval_mode=eval_mode,
+            freeze=freeze,
+        )

@@ -335,6 +335,37 @@ confirms no metric drift.
 275 unit tests passing total (269 from PR 1.4 + 6 new in
 test_checkpoint_to_disk).
 
+---
+
+# PR 2.2 Validation (RelGT.load_backbone / MultiTaskRelGT.load_backbone)
+
+**Date:** 2026-04-28. **Status:** PASS via unit tests + integration.
+
+PR 2.2 adds a classmethod that reconstructs a saved backbone from
+the three artifacts written by PR 2.1:
+``backbone_meta.json``, ``best_backbone.pt``, ``backbone_schema.pt``.
+Returns a forward-ready RelGT in eval mode with frozen params --
+adoption defaults. ``eval_mode=False`` / ``freeze=False`` opt outs
+for warm-then-unfreeze fine-tuning regimes.
+
+``MultiTaskRelGT.load_backbone`` is a thin delegator -- per-task
+heads are throwaway at adoption time, so adoption code wants the
+bare RelGT.
+
+6 unit tests in ``tests/test_load_backbone.py``:
+  * test_load_backbone_constructs_correct_arch
+  * test_load_backbone_rebuilds_register_dataset_state
+    (verifies _node_type_to_safe / _col_name_to_idx / Z-score buffers
+     all rebuilt from schema before load_state_dict)
+  * test_load_backbone_state_dict_strict_match (bit-equal)
+  * test_load_backbone_eval_mode_and_frozen_by_default (+ opt-outs)
+  * test_load_backbone_missing_schema_raises (no silent under-register)
+  * test_multitask_load_backbone_delegates_to_relgt
+
+281 unit tests passing total (275 from PR 2.1 + 6 new). No parity
+sweep (per user direction "without full sweep" -- the IO surface is
+covered by the strict load_state_dict test).
+
 ## Memory smoke (PR2 §6.3.6 / MS1, MS3)
 
 `./scripts/memory_smoke.sh 50` — 50 train steps + val + test on rel-f1 / driver-top3 with `--mode streaming --tf_store_dir <...> --max_rows_per_task 1000`, channels=64, batch=64, K=32. RSS sampled via `ps`, VRAM via `nvidia-smi`, both at 1 Hz.
