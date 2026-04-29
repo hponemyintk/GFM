@@ -93,8 +93,10 @@ PRETRAIN_DIR="$RUN_DIR/pretrain"
 
 mkdir -p "$PRETRAIN_DIR"
 
-export WANDB_MODE=offline
-export WANDB_SILENT=true
+# WANDB_MODE left to the caller's environment / wandb's own default.
+# WANDB_SILENT default true to avoid interleaving wandb spam with
+# script stdout; override with WANDB_SILENT=false if desired.
+export WANDB_SILENT="${WANDB_SILENT:-true}"
 
 echo "=============================================================="
 echo "Phase-5 cross-dataset adoption: SOURCE=$SOURCE -> TARGET=$TARGET"

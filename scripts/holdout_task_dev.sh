@@ -145,55 +145,127 @@ done
 CACHE="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 TF_STORE="$CACHE/tf_store"
 SEED="${SEED:-0}"
-K="${K:-64}"
-BATCH="${BATCH:-128}"
-CHANNELS="${CHANNELS:-128}"
-HEADS="${HEADS:-4}"
-CENTROIDS="${CENTROIDS:-512}"
-MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_task_dev}"
 PRETRAIN_DIR="$OUT_DIR_BASE/pretrain"
 
+# Detect run-target and pick the right pretrain backend.
+#   p4d  (default if NPROC>=2): delegate to scripts/pretrain_p4d.sh --
+#        gives DDP across NPROC GPUs + precomputed shards + memory
+#        watchdog + parallel TF/shard build phases.
+#   laptop (default if NPROC=1): inline single-GPU streaming pretrain.
+#
+# Force one or the other with PRETRAIN_BACKEND=p4d / PRETRAIN_BACKEND=laptop.
+NPROC="${NPROC:-1}"
+if [ -z "${PRETRAIN_BACKEND:-}" ]; then
+  if [ "$NPROC" -ge 2 ]; then
+    PRETRAIN_BACKEND=p4d
+  else
+    PRETRAIN_BACKEND=laptop
+  fi
+fi
+
+# Per-backend training-config defaults. These are set BEFORE the
+# backend dispatch because the adoption phase (extract_embeddings,
+# finetune_head, tabpfn_eval) downstream also reads K + BATCH and
+# must match what the pretrain used.
+if [ "$PRETRAIN_BACKEND" = "p4d" ]; then
+  # Match scripts/pretrain_p4d.sh paper-config defaults.
+  K="${K:-300}"
+  BATCH="${BATCH:-512}"
+  CHANNELS="${CHANNELS:-512}"
+  NUM_LAYERS="${NUM_LAYERS:-4}"
+  HEADS="${HEADS:-4}"
+  CENTROIDS="${CENTROIDS:-4096}"
+else
+  # Laptop-sized.
+  K="${K:-64}"
+  BATCH="${BATCH:-128}"
+  CHANNELS="${CHANNELS:-128}"
+  NUM_LAYERS="${NUM_LAYERS:-1}"
+  HEADS="${HEADS:-4}"
+  CENTROIDS="${CENTROIDS:-512}"
+fi
+
 mkdir -p "$PRETRAIN_DIR"
 
-export WANDB_MODE=offline
-export WANDB_SILENT=true
+# WANDB_MODE is left to the caller's environment / wandb's own
+# default. WANDB_SILENT defaults to true so wandb's own progress
+# spam doesn't interleave with this script's stdout, but the user
+# can override with WANDB_SILENT=false.
+export WANDB_SILENT="${WANDB_SILENT:-true}"
 
 echo "=============================================================="
 echo "Phase-4 multi-dataset holdout-task"
-echo "  DATASETS:       $DATASETS"
-echo "  HOLDOUTS:       $HOLDOUTS"
-echo "  PRETRAIN tasks: $PRETRAIN_TASKS_CSV"
+echo "  DATASETS:        $DATASETS"
+echo "  HOLDOUTS:        $HOLDOUTS"
+echo "  PRETRAIN tasks:  $PRETRAIN_TASKS_CSV"
 echo "  EPOCHS=$EPOCHS  MAX_STEPS=$MAX_STEPS  SEED=$SEED"
-echo "  OUT_DIR:        $OUT_DIR_BASE"
+echo "  PRETRAIN_BACKEND=$PRETRAIN_BACKEND  NPROC=$NPROC"
+echo "  OUT_DIR:         $OUT_DIR_BASE"
 echo "=============================================================="
 
-# ----------------- 1. TF stores (one-time per dataset) -----------------
-echo
-echo "=== [1/4] TF stores ==="
-for ds in $DATASETS; do
-  if [ -f "$TF_STORE/$ds/.done" ]; then
-    echo "  $ds: cached at $TF_STORE/$ds"
-  else
-    echo "  $ds: building..."
-    python3 tools/build_tf_store.py --dataset "$ds" --out_dir "$TF_STORE/$ds"
-    touch "$TF_STORE/$ds/.done"
-  fi
-done
-
-# ----------------- 2. Multi-dataset pretrain on all-but-holdout -----------------
+# ----------------- Pretrain artifact paths (shared by both backends) -----------------
 PRETRAIN_LOG="$PRETRAIN_DIR/run.log"
 META="$PRETRAIN_DIR/multi_task/backbone_meta.json"
 WEIGHTS="$PRETRAIN_DIR/multi_task/best_backbone.pt"
 SCHEMA="$PRETRAIN_DIR/multi_task/backbone_schema.pt"
 
+# ----------------- 1+2. TF stores + pretrain -----------------
 if [ -f "$META" ] && [ -f "$WEIGHTS" ] && [ -f "$SCHEMA" ]; then
   echo
-  echo "=== [2/4] Pretrain artifacts cached at $PRETRAIN_DIR/multi_task/ ==="
+  echo "=== [1+2/4] Pretrain artifacts cached at $PRETRAIN_DIR/multi_task/ ==="
+elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
+  # Delegate to pretrain_p4d.sh. It handles:
+  #   * parallel TF memmap build (one GPU per dataset)
+  #   * parallel shard build (CPU-only, --mode precomputed_shards)
+  #   * DDP launch across NPROC GPUs
+  #   * memory watchdog (anon-only, cgroup-aware)
+  #   * pre-flight stale-process cleanup, HF offline detection
+  # We pass TASKS_CSV (added in the same commit) to bypass relbench's
+  # full-task enumeration and use our all-but-holdout subset directly.
+  # DATASETS gets passed through as the comma-joined dataset filter
+  # so phase 1+2 only build the datasets we actually need.
+  echo
+  echo "=== [1+2/4] Delegating to pretrain_p4d.sh (NPROC=$NPROC) ==="
+  echo "  log: $PRETRAIN_LOG"
+  DS_CSV=$(echo "$DATASETS" | tr ' ' ',')
+  TASKS_CSV="$PRETRAIN_TASKS_CSV" \
+    DATASETS="$DS_CSV" \
+    NPROC="$NPROC" \
+    EPOCHS="$EPOCHS" \
+    MAX_STEPS="$MAX_STEPS" \
+    OUT_DIR="$PRETRAIN_DIR" \
+    RUN_NAME="${RUN_NAME:-phase4_multi_holdout_pretrain}" \
+    K="$K" \
+    BATCH="$BATCH" \
+    CHANNELS="$CHANNELS" \
+    NUM_LAYERS="$NUM_LAYERS" \
+    HEADS="$HEADS" \
+    CENTROIDS="$CENTROIDS" \
+    LR="${LR:-1e-4}" \
+    WARMUP="${WARMUP:-1000}" \
+    LOSS_BALANCE="${LOSS_BALANCE:-none}" \
+    bash "$REPO_ROOT/scripts/pretrain_p4d.sh" \
+    > "$PRETRAIN_LOG" 2>&1
 else
+  # Laptop backend: single-GPU streaming pretrain.
+  MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"
+
+  echo
+  echo "=== [1/4] Building TF stores ==="
+  for ds in $DATASETS; do
+    if [ -f "$TF_STORE/$ds/.done" ]; then
+      echo "  $ds: cached at $TF_STORE/$ds"
+    else
+      echo "  $ds: building..."
+      python3 tools/build_tf_store.py --dataset "$ds" --out_dir "$TF_STORE/$ds"
+      touch "$TF_STORE/$ds/.done"
+    fi
+  done
+
   N_TASKS=$(echo "$PRETRAIN_TASKS_CSV" | tr ',' '\n' | wc -l)
   echo
-  echo "=== [2/4] Pretraining on $N_TASKS tasks across $(echo $DATASETS | wc -w) datasets ==="
+  echo "=== [2/4] Pretraining on $N_TASKS tasks (laptop streaming) ==="
   echo "  log: $PRETRAIN_LOG"
   torchrun --nproc_per_node 1 main_node_ddp.py \
     --tasks "$PRETRAIN_TASKS_CSV" \
@@ -203,7 +275,7 @@ else
     --num_neighbors "$K" \
     --batch_size "$BATCH" \
     --channels "$CHANNELS" \
-    --num_layers 1 \
+    --num_layers "$NUM_LAYERS" \
     --num_heads "$HEADS" \
     --num_centroids "$CENTROIDS" \
     --epochs "$EPOCHS" \
@@ -213,7 +285,7 @@ else
     --loss_balance "${LOSS_BALANCE:-none}" \
     --seed "$SEED" \
     --out_dir "$PRETRAIN_DIR" \
-    --run_name "phase4_multi_holdout_pretrain" \
+    --run_name "${RUN_NAME:-phase4_multi_holdout_pretrain}" \
     > "$PRETRAIN_LOG" 2>&1
 fi
 

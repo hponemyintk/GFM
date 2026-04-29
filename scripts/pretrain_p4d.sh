@@ -220,12 +220,21 @@ echo "  cache=$CACHE  out=$OUT_DIR"
 echo
 
 # ------------------------------------------------------------------
-# Phase 0: enumerate tasks via relbench
+# Phase 0: enumerate tasks via relbench (or take TASKS_CSV override)
 # ------------------------------------------------------------------
-echo "[0/3] Enumerating RelBench tasks (binary + regression only)"
+# TASKS_CSV override: pre-built "ds.task:weight,..." list. When set,
+# skip the relbench enumeration entirely. Used by
+# scripts/holdout_task_dev.sh to drive a pretrain on the union of
+# all-but-one tasks across multiple datasets without re-implementing
+# the build phases / DDP launch.
+if [ -n "${TASKS_CSV:-}" ]; then
+    echo "[0/3] Using user-provided TASKS_CSV (skipping relbench enumeration)"
+    TASKS_RAW=$(echo "$TASKS_CSV" | tr ',' '\n')
+else
+    echo "[0/3] Enumerating RelBench tasks (binary + regression only)"
 
-# Pass DATASETS_FILTER into Python; emit a list of "ds.task:1.0" strings.
-TASKS_RAW=$(DATASETS_FILTER="$DATASETS_FILTER" python3 - <<'PY'
+    # Pass DATASETS_FILTER into Python; emit a list of "ds.task:1.0" strings.
+    TASKS_RAW=$(DATASETS_FILTER="$DATASETS_FILTER" python3 - <<'PY'
 import contextlib
 import os
 import sys
@@ -263,6 +272,7 @@ with contextlib.redirect_stdout(sys.stderr):
 sys.stdout.write("\n".join(out) + ("\n" if out else ""))
 PY
 )
+fi  # end TASKS_CSV override branch
 
 # Read into bash array.
 mapfile -t TASKS <<< "$TASKS_RAW"
