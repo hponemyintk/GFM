@@ -23,6 +23,41 @@
 #   bash scripts/holdout_dataset_eval.sh [EPOCHS] [MAX_STEPS]
 #
 # Output layout: results/holdout_dataset_eval/<src>_to_<tgt>/
+#
+# ---------------- Example invocations (copy-paste) ----------------
+#
+# This launcher runs single-GPU pretrain by default (set
+# --nproc_per_node 1 below). For p4d-scale runs, pretrain via
+# scripts/pretrain_p4d.sh first, then point THIS launcher at the
+# saved checkpoint via SKIP_PRETRAIN=1 (not yet implemented; see TODO
+# below) -- or just run pretrain_p4d.sh + tools/extract_embeddings.py
+# manually for cross-dataset adoption.
+#
+# AWS p4d.24xlarge (single-GPU pretrain on SOURCE, then adopt on
+# TARGET tasks; ~30h on rel-event SOURCE):
+#
+#   SOURCE=rel-event TARGET=rel-hm \
+#     EPOCHS=10 MAX_STEPS=3000 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# AWS p4d, smaller cross-dataset run for sanity (rel-f1 -> rel-hm):
+#
+#   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 MAX_STEPS=500 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# Laptop (rel-f1 -> rel-hm, both fit):
+#
+#   SOURCE=rel-f1 TARGET=rel-hm EPOCHS=5 MAX_STEPS=300 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# Reverse direction:
+#
+#   SOURCE=rel-hm TARGET=rel-f1 EPOCHS=5 MAX_STEPS=300 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# TODO: add NPROC + pretrain_p4d.sh delegation here too (mirror of
+# the p4d backend in holdout_task_dev.sh) once Phase-5 is exercised
+# at scale. Today this script always uses --nproc_per_node 1.
 
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

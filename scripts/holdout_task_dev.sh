@@ -53,6 +53,34 @@
 #     EPOCHS        default 5
 #     MAX_STEPS     default 300
 #
+# ---------------- Example invocations (copy-paste) ----------------
+#
+# AWS p4d.24xlarge (8 x A100, paper-config, all 3 datasets):
+#
+#   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
+#     bash scripts/holdout_task_dev.sh
+#
+# AWS p4d quick shake-out (~1 hour wall, sanity that the full
+# pipeline runs end-to-end):
+#
+#   NPROC=8 EPOCHS=3 STEPS_PER_TASK=200 \
+#     bash scripts/holdout_task_dev.sh
+#
+# AWS p4d, custom dataset subset (e.g. exclude rel-event for a
+# faster iteration on the smaller two):
+#
+#   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
+#     DATASETS="rel-f1 rel-hm" \
+#     HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
+#     bash scripts/holdout_task_dev.sh
+#
+# Laptop (single GPU, smaller config; rel-event omitted because its
+# materialization peak ~25 GB OOMs a 27 GB box):
+#
+#   DATASETS="rel-f1 rel-hm" \
+#     HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
+#     bash scripts/holdout_task_dev.sh
+#
 # Output layout under $OUT_DIR (default results/holdout_task_dev/):
 #   pretrain/                    # single shared pretrain
 #     multi_task/<seed>.json     # per-task test metrics during pretrain
