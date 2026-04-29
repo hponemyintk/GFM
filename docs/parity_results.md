@@ -260,6 +260,50 @@ forward(strings).
 Tensor-path metrics unchanged from PR 1.2 within seed noise — name
 path is dead code in Phase 1. Phase-4 adoption will exercise it.
 
+---
+
+# PR 1.4 (`tools/compute_dataset_stats.py`) — parity-exempt
+
+**Date:** 2026-04-28. **Status:** PASS (tools-only PR; parity sweep
+not required per `docs/zero_shot_gfm_test_plan.md`'s exemption rule
+for files outside the encoder / training paths).
+
+PR 1.4 adds a script that walks a TF-store directory and emits a
+`col_stats_dict` ready for
+`NeighborTfsEncoder.register_dataset(...)`. Used at adoption time
+(Phase 4) on a held-out dataset whose stats weren't part of the
+training-time `col_stats_dict`. No relbench import; reads
+meta.json + memmap files directly.
+
+Output per stype:
+- numerical → `StatType.MEAN`, `StatType.STD` (NaN-aware, std clamped
+  to 1e-8 floor on constant columns)
+- categorical → `StatType.COUNT` (distinct levels)
+- multicategorical → `StatType.COUNT` (distinct values across the
+  flattened jagged column)
+- embedding → `StatType.EMB_DIM` (per-column dim from offset diff)
+- timestamp → not emitted (encoder doesn't use per-column ts stats)
+
+8 unit tests in `tests/test_compute_dataset_stats.py` covering each
+stype's correctness, NaN-handling, constant-column std-floor,
+name_prefix application, and end-to-end compatibility (feed the
+output directly into `register_dataset` and verify Z-score buffers
+populate correctly).
+
+End-to-end smoke on the cached rel-f1 TF store:
+```
+python3 -m tools.compute_dataset_stats \
+  --tf_store_dir ~/.cache/relbench_examples/tf_store/rel-f1 \
+  --out /tmp/rel_f1_stats.pt --name_prefix "rel-f1::"
+# Wrote col_stats_dict for 9 tables -> /tmp/rel_f1_stats.pt
+#   rel-f1::circuits: 7 columns
+#   rel-f1::constructor_results: 1 columns
+#   ... (all 9 rel-f1 tables)
+```
+
+No training code touched → metrics unchanged → no parity sweep
+needed. 269 unit tests passing (261 from PR 1.3 + 8 new).
+
 ## Memory smoke (PR2 §6.3.6 / MS1, MS3)
 
 `./scripts/memory_smoke.sh 50` — 50 train steps + val + test on rel-f1 / driver-top3 with `--mode streaming --tf_store_dir <...> --max_rows_per_task 1000`, channels=64, batch=64, K=32. RSS sampled via `ps`, VRAM via `nvidia-smi`, both at 1 Hz.
