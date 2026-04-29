@@ -18,9 +18,9 @@ The fix is the `--full_graph` flag (added in this PR): pass it to the build tool
 | rel-event | user-attendance | users | 0/2013 | 0/1958 | **safe (paper Table 1a, MAE 0.2502)** |
 | rel-event | user-repeat | users | 0/268 | 0/246 | **safe (paper Table 1b, AUC 0.7609)** |
 | rel-event | user-ignore | users | 0/2013 | 0/1958 | **safe (paper Table 1b, AUC 0.8157)** |
-| rel-event | users-birthyear | users | 0/1731 | (test materialization 49 GiB pd.date_range OOM — separate bug) | needs `--full_graph` *and* RelBench fix |
-| rel-event | event_interest-interested | event_interest | 0/536 | (same 49 GiB OOM) | same |
-| rel-event | event_interest-not_interested | event_interest | 0/536 | (same 49 GiB OOM) | same |
+| rel-event | users-birthyear | users | 0/1731 | runs on p4d (49 GiB allocation in `pd.date_range`; OOMs on a 27 GiB laptop) | works on p4d under `--full_graph` |
+| rel-event | event_interest-interested | event_interest | 0/536 | same | same |
+| rel-event | event_interest-not_interested | event_interest | 0/536 | same | same |
 | rel-hm | user-churn | users | 0 | 0 | **safe** |
 | rel-hm | item-sales | items | 0 | 0 | **safe** |
 | rel-hm | transactions-price | transactions | growing | growing | needs `--full_graph` |
@@ -136,6 +136,26 @@ The earlier drafts of this doc considered three layered fixes:
 - **Layer 1 — defensive bounds check.** Implemented in this PR.
 - **Layer 2 — per-task `--full_graph` opt-in.** Implemented in this PR.
 - **Layer 3 — re-key seeds.** Map seed ids from full-DB scope to truncated-table scope via a lookup so out-of-bounds seeds get a sentinel index. More invasive than 1+2 and unnecessary now that 2 is in.
+
+## Empirical p4d reference (commit e6aa7a3)
+
+A 20-epoch multi-task pretrain over **all 11 tasks** (rel-f1 ×5 + rel-event ×6, all-but-zero held out) on p4d.24xlarge built with `--full_graph` finished in **8h 11m wall-time** (best epoch 6, val macro 0.5627). Per-task test metrics:
+
+| task | metric | value |
+|---|---|---|
+| rel-f1.driver-position | r2 / mae | 0.117 / 4.03 |
+| rel-f1.driver-dnf | roc_auc | 0.792 |
+| rel-f1.driver-top3 | roc_auc | 0.901 |
+| rel-f1.results-position | r2 / mae | **0.780** / 1.92 |
+| rel-f1.qualifying-position | r2 / mae | **0.967** / 0.91 |
+| rel-event.user-attendance | r2 / mae | 0.025 / 0.41 |
+| rel-event.user-repeat | roc_auc | 0.758 |
+| rel-event.user-ignore | roc_auc | 0.568 |
+| rel-event.event_interest-interested | roc_auc / f1 | 0.587 / 0.0 |
+| rel-event.event_interest-not_interested | roc_auc / f1 | 0.624 / 0.0 |
+| rel-event.users-birthyear | r2 / mae | -1.05 / 10.0 |
+
+The autocomplete tasks **build and train end-to-end**; their absolute test-metric quality varies (`results-position`/`qualifying-position` strong, `users-birthyear`/`event_interest-*` weak), but the pipeline does not crash and they contribute valid pretrain signal.
 
 ## References
 

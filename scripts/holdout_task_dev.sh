@@ -13,10 +13,11 @@
 #   DATASETS    "rel-f1 rel-event"
 #   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-attendance"
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
-#                = 4 rel-f1 + 2 rel-event = 6 tasks
+#                = 4 rel-f1 + 5 rel-event = 9 tasks
 #   FULL_GRAPH  1   -- builds with upto_test_timestamp=False so
 #                       autocomplete-task seeds (results-position,
-#                       qualifying-position) don't IndexError on val/test.
+#                       qualifying-position, users-birthyear,
+#                       event_interest-*) don't IndexError on val/test.
 #
 # Holdouts are mixed-metric (one binary + one regression) so the
 # frozen-backbone GFM claim is tested across both head kinds:
@@ -28,11 +29,13 @@
 #
 # Pretrain composition with the default holdouts:
 #   * rel-f1: driver-position (regression), driver-dnf (binary),
-#             results-position (regression, autocomplete; needs
-#             FULL_GRAPH=1), qualifying-position (regression,
-#             autocomplete; needs FULL_GRAPH=1)
-#   * rel-event: user-repeat (binary), user-ignore (binary)
-# = 3 regression + 3 binary tasks for pretrain. Mixed-metric pretrain
+#             results-position (regression, autocomplete),
+#             qualifying-position (regression, autocomplete)
+#   * rel-event: user-repeat (binary), user-ignore (binary),
+#                event_interest-interested (binary, autocomplete),
+#                event_interest-not_interested (binary, autocomplete),
+#                users-birthyear (regression, autocomplete)
+# = 4 regression + 5 binary tasks for pretrain. Mixed-metric pretrain
 # matters: it forces the backbone to embed both classification and
 # regression signal, so the frozen-backbone evaluation on the
 # held-out regression head (rel-event:user-attendance) tests
@@ -40,10 +43,9 @@
 # that only ever saw classification labels.
 #
 # rel-hm is NOT in defaults but stays available via DATASETS override.
-# rel-event.users-birthyear and rel-event.event_interest-* are
-# blocked by a separate RelBench bug (pd.date_range allocates
-# 49 GiB on test-split materialization). FULL_GRAPH alone won't
-# unblock them -- documented in docs/truncated_graph_caveat.md.
+# Empirical wall-time on p4d.24xlarge for the full 9-task pretrain at
+# EPOCHS=20 STEPS_PER_TASK=500: ~8h11m (commit e6aa7a3, see
+# docs/truncated_graph_caveat.md for the test-metric snapshot).
 #
 # Memory profile:
 #   * rel-f1 materialization:    ~50 MB (laptop-fine)
@@ -152,7 +154,7 @@ HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance}"
 #              item-sales.
 declare -A DEFAULT_ALL_TASKS=(
   [rel-f1]="driver-position driver-dnf driver-top3 results-position qualifying-position"
-  [rel-event]="user-attendance user-repeat user-ignore"
+  [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested users-birthyear"
   [rel-hm]="user-churn item-sales"
 )
 

@@ -136,15 +136,19 @@ def test_holdout_task_dev_default_paper_safe_subset():
         "FULL_GRAPH must default to 1 so autocomplete tasks "
         "(results-position, qualifying-position) build cleanly"
     )
-    # rel-event default task list -- all three paper-benchmarked tasks
-    # (Table 1a/1b). user-attendance is regression; user-repeat and
-    # user-ignore are binary. users-birthyear / event_interest-* are
-    # excluded (autocomplete + RelBench pd.date_range OOM).
+    # rel-event default task list -- 3 paper-benchmarked tasks
+    # (user-attendance regression, user-repeat / user-ignore binary)
+    # PLUS 3 autocomplete tasks that need FULL_GRAPH=1
+    # (event_interest-{interested,not_interested} binary,
+    # users-birthyear regression). Confirmed runnable end-to-end on
+    # p4d in commit e6aa7a3 (~8h wall-time for the 11-task pretrain).
     assert (
-        '[rel-event]="user-attendance user-repeat user-ignore"'
+        '[rel-event]="user-attendance user-repeat user-ignore '
+        'event_interest-interested event_interest-not_interested '
+        'users-birthyear"'
     ) in src, (
-        "rel-event default task list must include all three "
-        "paper-benchmarked tasks"
+        "rel-event default task list must include all 6 task variants "
+        "(3 paper-safe + 3 autocomplete enabled by FULL_GRAPH=1)"
     )
     # rel-hm task list still available for opt-in via DATASETS override.
     assert (
