@@ -223,6 +223,43 @@ seed 1's 0.705 outlier — well within the per-seed range observed in
 prior sweeps (dev-kyaw range across PR 1.0 / 1.1 / 1.2 includes
 seeds at 0.74-0.81). Not a regression in mean behavior.
 
+---
+
+# PR 1.3 Parity (`NeighborNodeTypeEncoder` lazy GloVe name path)
+
+**Date:** 2026-04-28. **Status:** PASS vs dev-kyaw within error bars.
+
+PR 1.3 adds an alternative forward path on `NeighborNodeTypeEncoder`:
+when the input is a list of strings (instead of an int tensor), known
+names hit the precomputed `glove_embeddings` buffer and unseen names
+are GloVe-embedded on the fly into a lazy `_unseen_cache`. Mirror of
+the unseen-column-name pattern in `NeighborTfsEncoder`.
+
+7 unit tests in `tests/test_lazy_type_glove.py`. Cross-file
+torch_geometric un-mock guard added. Tensor input path is unchanged
+(same buffer index + projection); name path is purely additive and
+unused at training in Phase 1 — only Phase-4 adoption code will call
+forward(strings).
+
+## PR 1.3 results
+
+| Task (metric) | Pipeline | Seeds | Mean | Std | Per-seed |
+|---|---|---|---|---|---|
+| rel-f1 / driver-position (MAE↓) | dev-kyaw | 5 | 9.449 | 0.162 | (cached) |
+| rel-f1 / driver-position (MAE↓) | new      | 5 | 4.074 | 0.145 | [4.16, 3.99, 4.21, 3.94, 4.07] |
+| rel-f1 / driver-top3 (AUROC↑)   | dev-kyaw | 5 | 0.7796 | 0.0238 | (cached) |
+| rel-f1 / driver-top3 (AUROC↑)   | new      | 5 | 0.7728 | 0.0329 | [0.793, 0.731, 0.798, 0.733, 0.808] |
+
+## PR 1.3 acceptance (vs dev-kyaw)
+
+| Task | μ_dev | μ_new | Δ | Threshold | Verdict |
+|---|---|---|---|---|---|
+| driver-position (MAE↓) | 9.449 | 4.074 | -5.38 (improvement) | 0.162 | **PASS** |
+| driver-top3 (AUROC↑)   | 0.780 | 0.773 | -0.007 (within 1×σ) | 0.033 | **PASS** |
+
+Tensor-path metrics unchanged from PR 1.2 within seed noise — name
+path is dead code in Phase 1. Phase-4 adoption will exercise it.
+
 ## Memory smoke (PR2 §6.3.6 / MS1, MS3)
 
 `./scripts/memory_smoke.sh 50` — 50 train steps + val + test on rel-f1 / driver-top3 with `--mode streaming --tf_store_dir <...> --max_rows_per_task 1000`, channels=64, batch=64, K=32. RSS sampled via `ps`, VRAM via `nvidia-smi`, both at 1 Hz.

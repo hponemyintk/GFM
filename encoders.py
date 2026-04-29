@@ -1,8 +1,9 @@
 import re
 import warnings
-from typing import Dict
+from typing import Dict, List
 
 import torch
+from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
 from utils import GloveTextEmbedding
@@ -16,10 +17,23 @@ from torch_geometric.data import Data
 
 class NeighborNodeTypeEncoder(nn.Module):
     """
-    Encoder that maps table name indices to projected GloVe embeddings.
+    Encoder that maps table names to projected GloVe embeddings.
 
-    GloVe embeddings are precomputed at init time for all known table names
-    and stored as a buffer. Forward pass is a simple index + linear projection.
+    Two forward paths:
+
+    * **Index path** (existing, fast): ``forward(int_tensor[B, K])`` indexes
+      the precomputed ``glove_embeddings`` buffer. Used at training and any
+      time the caller has already mapped names to integer ids.
+    * **Name path** (Phase-4 adoption): ``forward(List[List[str]])``
+      resolves each name string against a per-rank dict.  Known names
+      (those passed in ``node_type_map`` at construction, plus the
+      ``"mask"`` sentinel) hit the precomputed buffer; unseen names are
+      GloVe-embedded on the fly into ``_unseen_cache`` so subsequent
+      lookups are O(1). Mirrors the unseen-column-name lazy cache in
+      :class:`NeighborTfsEncoder`.
+
+    The name path is the path adoption-time code uses when extending the
+    encoder onto a dataset whose prefixed types weren't part of training.
     """
 
     def __init__(self, node_type_map, embedding_dim):
@@ -50,19 +64,94 @@ class NeighborNodeTypeEncoder(nn.Module):
         # Trainable projection
         self.proj = nn.Linear(300, embedding_dim)
 
+        # ---- name-based lookup state (Phase-4 adoption) ----
+        # Known type-name -> buffer index. Includes the "mask" sentinel
+        # at index num_types so name-keyed callers can pass "mask" for
+        # padding rows without falling into the lazy path.
+        self._name_to_idx: Dict[str, int] = dict(node_type_map)
+        self._name_to_idx["mask"] = num_types
+        # On-the-fly GloVe cache for names not in _name_to_idx. Plain
+        # Python dict (per-rank, but GloVe is deterministic so DDP ranks
+        # converge to identical entries). Not in state_dict.
+        self._unseen_cache: Dict[str, Tensor] = {}
+        # Lazy embedder; constructed on first unseen-name lookup so the
+        # common case (all names known) doesn't pay the GloVe-load cost.
+        self._glove_embedder = None
+
     def reset_parameters(self):
         self.proj.reset_parameters()
 
-    def forward(self, type_indices):
+    def _resolve_unseen(self, name: str) -> Tensor:
+        """Return the cached GloVe vector for ``name`` if present, else
+        compute it via GloVe and cache it. Vector is on the same device
+        as ``self.glove_embeddings`` so downstream stack/index ops don't
+        cross devices."""
+        cached = self._unseen_cache.get(name)
+        if cached is not None:
+            return cached
+        if self._glove_embedder is None:
+            self._glove_embedder = GloveTextEmbedding(device="cpu")
+        with torch.no_grad():
+            vec = self._glove_embedder([name])[0]  # [300]
+        vec = vec.to(self.glove_embeddings.device)
+        self._unseen_cache[name] = vec
+        return vec
+
+    def _forward_names(self, type_names) -> Tensor:
+        """Resolve a [B, K] grid of type-name strings to projected GloVe
+        embeddings.
+
+        ``type_names`` may be a ``List[List[str]]`` or a 2-D NumPy /
+        object-tensor of strings. Known names hit the precomputed buffer
+        (fast path); unseen names go through ``_resolve_unseen`` which
+        computes once + caches.
+        """
+        # Normalize to a flat list with explicit B/K so we can reshape
+        # the projected output back to [B, K, embedding_dim].
+        if isinstance(type_names, list):
+            B = len(type_names)
+            K = len(type_names[0]) if B > 0 else 0
+            flat: List[str] = [n for row in type_names for n in row]
+        else:
+            # Assume 2D array-like (numpy, etc.)
+            B, K = type_names.shape
+            flat = [str(x) for x in type_names.reshape(-1)]
+
+        if B == 0 or K == 0:
+            return torch.zeros(
+                (B, K, self.proj.out_features),
+                device=self.glove_embeddings.device,
+            )
+
+        # Resolve each name. Build the [B*K, 300] stack on the same
+        # device as the buffer.
+        vecs: List[Tensor] = []
+        for name in flat:
+            idx = self._name_to_idx.get(name)
+            if idx is not None:
+                vecs.append(self.glove_embeddings[idx])
+            else:
+                vecs.append(self._resolve_unseen(name))
+        stacked = torch.stack(vecs, dim=0).view(B, K, 300)
+        return self.proj(stacked)
+
+    def forward(self, type_indices_or_names):
         """
         Args:
-            type_indices (Tensor): Integer indices of shape [Batch, K]
+            type_indices_or_names: either
+              * ``Tensor`` of integer indices, shape ``[B, K]`` -- fast
+                index path (existing behavior; matches dev-kyaw).
+              * ``List[List[str]]`` or 2D string array -- name path.
+                Known names hit the precomputed buffer; unseen names
+                are GloVe-embedded lazily and cached.
 
         Returns:
-            Tensor: Projected GloVe embeddings of shape [Batch, K, embedding_dim]
+            ``Tensor`` of shape ``[B, K, embedding_dim]``.
         """
-        x = self.glove_embeddings[type_indices]  # [B, K, 300]
-        return self.proj(x)
+        if isinstance(type_indices_or_names, torch.Tensor):
+            x = self.glove_embeddings[type_indices_or_names]
+            return self.proj(x)
+        return self._forward_names(type_indices_or_names)
 
 
 class NeighborHopEncoder(nn.Module):
