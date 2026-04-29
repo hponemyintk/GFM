@@ -70,12 +70,16 @@ if [ "$SOURCE" = "$TARGET" ]; then
 fi
 
 # Source pretraining task lists. All tasks of the source dataset.
+# results-position OMITTED: its test seeds reference rows beyond
+# train_cutoff, which IndexError the truncated CSR adjacency we keep
+# per RelGT paper guardrail (PR 1.0b). Override SOURCE_TASKS_CSV /
+# TARGET_TASKS_CSV to include it explicitly if upto_test_timestamp is
+# flipped to False at the data layer.
 DEFAULT_RELF1_ALL=(
   "rel-f1.driver-position:1.0"
   "rel-f1.driver-dnf:1.0"
   "rel-f1.driver-top3:1.0"
   "rel-f1.driver-circuit-compete:1.0"
-  "rel-f1.results-position:1.0"
   "rel-f1.qualifying-position:1.0"
 )
 DEFAULT_RELHM_ALL=(

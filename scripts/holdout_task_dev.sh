@@ -108,12 +108,18 @@ HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-c
 # Default per-dataset full task lists. The launcher subtracts the
 # HOLDOUTS map from these to produce the pretrain CSV. Sources:
 #   rel-f1:    relbench.tasks.get_task_names('rel-f1')
+#              (results-position OMITTED -- it has test seeds whose
+#              ids reference rows beyond train_cutoff, which IndexError
+#              the truncated CSR adjacency we keep per RelGT paper
+#              guardrail. See PR 1.0b commit message. To use it, set
+#              upto_test_timestamp=False globally OR pin tasks via
+#              PRETRAIN_TASKS_CSV.)
 #   rel-event: relbench.tasks.get_task_names('rel-event')  (matches
 #              scripts/pretrain_alltasks.sh task list verbatim)
 #   rel-hm:    relbench.tasks.get_task_names('rel-hm')
 #              (user-item-purchase is recommendation, omitted)
 declare -A DEFAULT_ALL_TASKS=(
-  [rel-f1]="driver-position driver-dnf driver-top3 driver-circuit-compete results-position qualifying-position"
+  [rel-f1]="driver-position driver-dnf driver-top3 driver-circuit-compete qualifying-position"
   [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested users-birthyear"
   [rel-hm]="user-churn item-sales transactions-price"
 )
