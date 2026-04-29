@@ -304,6 +304,37 @@ python3 -m tools.compute_dataset_stats \
 No training code touched → metrics unchanged → no parity sweep
 needed. 269 unit tests passing (261 from PR 1.3 + 8 new).
 
+---
+
+# PR 2.1 Validation (best-val ckpt to disk; IO-only at training time)
+
+**Date:** 2026-04-28. **Status:** PASS via unit tests + partial sanity.
+
+PR 2.1 replaces the in-memory ``best_state =
+copy.deepcopy(model.module.state_dict())`` at train_multi_task.py:828
+with on-disk saves: ``best_full.pt``, ``best_backbone.pt``,
+``backbone_meta.json``, ``backbone_schema.pt``. Training math is
+unchanged -- only the persistence path moved from RAM to disk.
+
+Per-PR validation tier (per user direction "without full sweep"):
+6 unit tests in ``tests/test_checkpoint_to_disk.py``:
+  * test_save_best_checkpoint_writes_all_four_files
+  * test_meta_json_schema_complete
+  * test_schema_pt_roundtrip_with_stype_keys (StatType enum + NaN)
+  * test_overwrite_on_new_best (single canonical filename)
+  * test_no_in_memory_deepcopy_in_train_multi_task (regression guard)
+  * test_save_then_load_roundtrip_state_dict (bit-equal)
+
+Sanity (partial parity, 3 of 10 seeds before sweep was halted at the
+user's direction): driver-position test MAE [4.02, 3.87, 4.31] --
+squarely within the new-branch driver-position range established by
+PR 1.0 / 1.1 / 1.2 / 1.3 / 1.4 (4.0-4.4). PR 2.1 doesn't change
+training behavior, only checkpoint persistence; the partial sample
+confirms no metric drift.
+
+275 unit tests passing total (269 from PR 1.4 + 6 new in
+test_checkpoint_to_disk).
+
 ## Memory smoke (PR2 §6.3.6 / MS1, MS3)
 
 `./scripts/memory_smoke.sh 50` — 50 train steps + val + test on rel-f1 / driver-top3 with `--mode streaming --tf_store_dir <...> --max_rows_per_task 1000`, channels=64, batch=64, K=32. RSS sampled via `ps`, VRAM via `nvidia-smi`, both at 1 Hz.

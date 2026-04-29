@@ -495,6 +495,13 @@ def _build_model(
 ):
     """Build RelGT(out_channels=channels) so its output is an embedding,
     then wrap with per-task heads keyed by ``task_type_ids``.
+
+    Returns (wrapper, meta_dict). meta_dict carries everything needed
+    to reconstruct the backbone for adoption: architectural constants,
+    the unified node_type_map, and the col_names_dict + col_stats_dict
+    from this run's data load. PR 2.1 uses meta_dict to write
+    backbone_meta.json + backbone_schema.pt alongside the best-val
+    checkpoint.
     """
     # Union col_names_dict over all datasets/tables.
     # NOTE: we use cache._captured_col_names_dict (stashed at cache
@@ -536,13 +543,89 @@ def _build_model(
         sample_node_len=args.num_neighbors,
         args=args,
     ).to(device)
+    meta_dict = {
+        # Architectural constants. ``RelGT.load_backbone`` (PR 2.2)
+        # reads these to reconstruct the backbone shape; the schema
+        # dicts then drive register_dataset() to populate per-table
+        # buffers in the same order as this training run.
+        "channels": int(args.channels),
+        "num_centroids": int(args.num_centroids),
+        "num_layers": int(args.num_layers),
+        "num_heads": int(args.num_heads),
+        "num_neighbors": int(args.num_neighbors),
+        "max_neighbor_hop": 3,
+        "global_dim": int(args.channels // 2),
+        "ff_dropout": float(args.ff_dropout),
+        "attn_dropout": float(args.attn_dropout),
+        "gt_conv_type": str(args.gt_conv_type),
+        "ablate": str(args.ablate),
+        "gnn_pe_dim": int(args.gnn_pe_dim),
+        "node_type_map": {str(k): int(v) for k, v in type_to_index.items()},
+        # Schema dicts go into the .pt sidecar (not JSON-friendly).
+        "_col_names_dict": col_names_dict,
+        "_col_stats_dict": col_stats_unified,
+    }
     wrapper = MultiTaskRelGT(
         backbone=backbone,
         channels=args.channels,
         num_tasks=len(task_type_ids),
         task_type_ids=list(task_type_ids),
     ).to(device)
-    return wrapper
+    meta_dict["num_tasks"] = int(len(task_type_ids))
+    meta_dict["task_type_ids"] = [int(t) for t in task_type_ids]
+    return wrapper, meta_dict
+
+
+def _save_best_checkpoint(model, output_path: str, meta_dict: dict,
+                          best_epoch: int, best_metric: float) -> None:
+    """Save a best-val checkpoint as four files; free in-memory copy.
+
+    Files written under ``output_path``:
+
+      * ``best_full.pt`` -- full ``MultiTaskRelGT`` state_dict (heads
+        + backbone). Used for resume / final test eval.
+      * ``best_backbone.pt`` -- ``model.module.backbone.state_dict()``
+        only. Adoption-portable artifact (Phase 4+).
+      * ``backbone_meta.json`` -- architectural constants +
+        node_type_map + best_epoch / best_metric.
+      * ``backbone_schema.pt`` -- col_names_dict + col_stats_dict
+        sidecar. ``StatType`` enum keys aren't JSON-friendly so this
+        rides separately.
+
+    Caller invokes ``gc.collect()`` is implicit -- no in-memory
+    deepcopy is held; the state_dict references handed to torch.save
+    are temporary and dropped at function exit.
+    """
+    os.makedirs(output_path, exist_ok=True)
+
+    # 1. Full state. Saved before backbone-only so a partial-write
+    #    crash leaves the more-conservative artifact behind.
+    torch.save(
+        model.module.state_dict(),
+        os.path.join(output_path, "best_full.pt"),
+    )
+
+    # 2. Backbone-only state -- the adoption-portable artifact.
+    torch.save(
+        model.module.backbone.state_dict(),
+        os.path.join(output_path, "best_backbone.pt"),
+    )
+
+    # 3. Meta JSON. Strip private (underscore-prefixed) keys; those
+    #    ride in the schema sidecar.
+    public_meta = {k: v for k, v in meta_dict.items() if not k.startswith("_")}
+    public_meta["best_epoch"] = int(best_epoch)
+    public_meta["best_val_macro"] = float(best_metric)
+    with open(os.path.join(output_path, "backbone_meta.json"), "w") as f:
+        json.dump(public_meta, f, indent=2)
+
+    # 4. Schema sidecar. col_stats_dict has ``StatType`` enum keys and
+    #    occasional NaN/inf floats -- not JSON-friendly.
+    schema = {
+        "col_names_dict": meta_dict.get("_col_names_dict", {}),
+        "col_stats_dict": meta_dict.get("_col_stats_dict", {}),
+    }
+    torch.save(schema, os.path.join(output_path, "backbone_schema.pt"))
 
 
 # --------------------------------------------------------- training
@@ -627,8 +710,10 @@ def run(args, local_rank: int, device, gpu_handle):
         int(task_tokens["train"][ti].task_type_id)
         for ti in range(len(tasks_spec))
     ]
-    model = _build_model(args, caches, col_stats_per_ds, type_to_index,
-                         device, task_type_ids)
+    model, meta_dict = _build_model(
+        args, caches, col_stats_per_ds, type_to_index,
+        device, task_type_ids,
+    )
     # OOM mitigation: free cache.data NOW that _build_model has read
     # what it needs. Workers fork from the parent rank below; if we
     # don't drop here, every fork inherits per-type time tensors and
@@ -803,8 +888,11 @@ def run(args, local_rank: int, device, gpu_handle):
         # multi-task convention (T5 / RT pretraining); per-task fine-
         # tuning would beat it but needs a separate run per task.
         best_macro = -math.inf
-        best_state = None
         best_epoch = 0
+        # Sentinel: True iff a best-val ckpt has been written to disk.
+        # Used post-loop to decide whether to reload (vs run final test
+        # against the last-epoch model state).
+        best_ckpt_written = False
         per_epoch_macro: Dict[int, float] = {}
 
         for epoch in range(1, args.epochs + 1):
@@ -825,17 +913,39 @@ def run(args, local_rank: int, device, gpu_handle):
                 if macro > best_macro:
                     best_macro = macro
                     best_epoch = epoch
-                    best_state = copy.deepcopy(model.module.state_dict())
-                    print(f"  [best] macro={macro:.4f} @ epoch {epoch}; checkpoint cached in memory")
+                    # Save to disk instead of in-memory deepcopy.
+                    # Frees ~model-state-dict-size of RAM per best
+                    # update -- significant on the 8x A100 / large
+                    # model configurations.
+                    _save_best_checkpoint(
+                        model, output_path, meta_dict,
+                        best_epoch=best_epoch, best_metric=best_macro,
+                    )
+                    best_ckpt_written = True
+                    print(
+                        f"  [best] macro={macro:.4f} @ epoch {epoch}; "
+                        f"checkpoint written to {output_path}"
+                    )
                 else:
                     print(f"  macro={macro:.4f} (best={best_macro:.4f} @ epoch {best_epoch})")
             dist.barrier()
 
-        # Load best-macro checkpoint on rank 0, broadcast to all ranks.
-        if local_rank == 0 and best_state is not None:
-            print(f"\nLoading best-macro checkpoint (epoch {best_epoch}, macro={best_macro:.4f}) "
-                  f"before test eval.")
+        # Load best-macro checkpoint from disk on rank 0, broadcast.
+        # Replaces the prior in-memory ``best_state`` deepcopy path.
+        best_full_path = os.path.join(output_path, "best_full.pt")
+        if local_rank == 0 and best_ckpt_written and os.path.exists(best_full_path):
+            print(
+                f"\nLoading best-macro checkpoint (epoch {best_epoch}, "
+                f"macro={best_macro:.4f}) from {best_full_path} "
+                f"before test eval."
+            )
+            best_state = torch.load(best_full_path, map_location="cpu")
             model.module.load_state_dict(best_state)
+            # Free immediately; the state_dict reference would otherwise
+            # linger until the next gc cycle.
+            del best_state
+            import gc as _gc
+            _gc.collect()
         for param in model.parameters():
             dist.broadcast(param.data, src=0)
         for buf in model.buffers():
