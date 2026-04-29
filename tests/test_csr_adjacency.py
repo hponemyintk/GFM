@@ -98,6 +98,20 @@ def test_C3_zero_outdegree_returns_empty():
     assert cache.neighbors_set("A", 3) == set()
 
 
+# ----------------------------------------------------------------- C3b
+def test_C3b_out_of_bounds_seed_returns_empty():
+    """Layer-1 safety net: a seed past the truncated CSR returns
+    an empty set instead of IndexError. This is what catches forgotten
+    --full_graph for autocomplete tasks (docs/truncated_graph_caveat.md)."""
+    g = make_toy_graph()
+    cache = DatasetGraphCache(data=g, undirected=True)
+    # Block A has 4 source rows (0..3); 4 and beyond are OOB.
+    n_src_A = cache.csr["A"].num_src
+    assert cache.neighbors_set("A", n_src_A) == set()
+    assert cache.neighbors_set("A", n_src_A + 100) == set()
+    assert cache.neighbors_set("A", -1) == set()
+
+
 # ----------------------------------------------------------------- C4
 def test_C4_dtype_overflow_guard_for_many_types():
     """If we ever exceed int16 type-id range we want an explicit failure.

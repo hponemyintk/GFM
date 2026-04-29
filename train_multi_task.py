@@ -100,7 +100,7 @@ def _rss_gb() -> float:
     return float("nan")
 
 
-def _load_dataset(name: str, cache_dir: str, device: str):
+def _load_dataset(name: str, cache_dir: str, device: str, full_graph: bool = False):
     """Load one dataset's HeteroData + col_stats.
 
     Routes stypes loading through gfm_data.stypes.load_or_generate_stypes
@@ -117,29 +117,29 @@ def _load_dataset(name: str, cache_dir: str, device: str):
     import gc
     dset = get_dataset(name, download=True)
     stypes_path = Path(cache_dir) / name / "stypes.json"
-    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: entity
-    # tables are truncated at train cutoff as a defense-in-depth
-    # guardrail against temporal leakage. The per-neighbor seed_time
-    # filter at gfm_data/sampler.py:69 is the actual leakage barrier;
-    # the truncation is redundant but kept to honor the paper's
-    # guardrail convention.
-    #
-    # Caveat: some tasks (e.g. results-position on rel-f1) have test
-    # seeds whose ids reference rows beyond train_cutoff. With the
-    # truncated entity table those reads can IndexError in
-    # graph_cache.neighbors_set. If a future task hits this, prefer
-    # to special-case that task rather than weakening the guardrail
-    # globally.
-    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=True)
-    db = dset.get_db(upto_test_timestamp=True)
+    # upto_test_timestamp controls entity table truncation:
+    #   True  (default)        -- matches dev-kyaw / RelGT paper.
+    #   False (--full_graph)   -- required for autocomplete tasks
+    #                             (users-birthyear, results-position,
+    #                             qualifying-position, transactions-price)
+    #                             whose val/test seeds reference rows
+    #                             added after train_cutoff. With the
+    #                             truncated table those seeds IndexError
+    #                             in graph_cache.neighbors_set.
+    # The per-neighbor seed_time filter at gfm_data/sampler.py:69 is
+    # the actual temporal leakage barrier in both modes.
+    upto = not full_graph
+    cs = _load_stypes(stypes_path, dset, upto_test_timestamp=upto)
+    db = dset.get_db(upto_test_timestamp=upto)
     cs = _filter_stypes(cs, db)
+    mat_suffix = "materialized_full" if full_graph else "materialized"
     data, col_stats = make_pkey_fkey_graph(
         db,
         col_to_stype_dict=cs,
         text_embedder_cfg=TextEmbedderConfig(
             text_embedder=GloveTextEmbedding(device=device), batch_size=256,
         ),
-        cache_dir=f"{cache_dir}/{name}/materialized",
+        cache_dir=f"{cache_dir}/{name}/{mat_suffix}",
     )
     # OOM mitigation: relbench's Dataset.get_db is decorated with
     # @lru_cache(maxsize=None), so the raw pickle (~25 GiB on
@@ -194,12 +194,16 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
                     _log_rss("pre-load", ds_name)
                     data, col_stats = _load_dataset(
                         ds_name, args.cache_dir, device,
+                        full_graph=getattr(args, "full_graph", False),
                     )
                     _log_rss("post-load", ds_name)
                 dist.barrier()
         else:
             _log_rss("pre-load", ds_name)
-            data, col_stats = _load_dataset(ds_name, args.cache_dir, device)
+            data, col_stats = _load_dataset(
+                ds_name, args.cache_dir, device,
+                full_graph=getattr(args, "full_graph", False),
+            )
             _log_rss("post-load", ds_name)
         cache_root = (
             os.path.join(args.tf_store_dir, ds_name)

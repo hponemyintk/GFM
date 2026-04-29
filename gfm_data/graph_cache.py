@@ -282,8 +282,18 @@ class DatasetGraphCache:
         set iteration order is hash-determined and therefore identical for
         identical-element sets across the two implementations, which is what
         makes ``random.sample`` reproducible across the refactor.
+
+        Out-of-bounds ``src_idx`` (seed entity past the truncated CSR --
+        e.g. an autocomplete-task test seed referencing a row created
+        after train_cutoff) returns an empty set rather than IndexError.
+        Callers see the seed as "no neighbors" and the model predicts
+        from the seed's static features only. This is the Layer-1 safety
+        net described in docs/truncated_graph_caveat.md; the proper fix
+        is ``--full_graph`` (upto_test_timestamp=False) at build time.
         """
         block = self.csr[src_type]
+        if src_idx < 0 or src_idx + 1 >= block.indptr.shape[0]:
+            return set()
         start = int(block.indptr[src_idx])
         end = int(block.indptr[src_idx + 1])
         if end == start:

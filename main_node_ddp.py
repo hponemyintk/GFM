@@ -146,6 +146,18 @@ parser.add_argument(
          "bounded by one rank's load instead of WORLD_SIZE x. Bump to 2-4 "
          "for faster startup if pod RAM headroom allows.",
 )
+parser.add_argument(
+    "--full_graph",
+    action="store_true",
+    default=False,
+    help="Use upto_test_timestamp=False so the entity tables include "
+         "rows created after train_cutoff. Required for autocomplete "
+         "tasks (users-birthyear, results-position, qualifying-position, "
+         "transactions-price) whose val/test seeds reference entities "
+         "added after the cutoff. Temporal leakage is still prevented "
+         "by the per-neighbor seed_time filter at gfm_data/sampler.py:69. "
+         "See docs/truncated_graph_caveat.md.",
+)
 
 args = parser.parse_args()
 MULTI_TASK = args.tasks is not None
@@ -222,15 +234,18 @@ _chunk = max(1, int(args.load_concurrency))
 def _do_load_db_and_graph():
     # stypes load+regen lives INSIDE the slot so the cold-cache
     # regen path's get_db() doesn't fan out across ranks.
-    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: the
-    # entity tables are truncated at train cutoff as a defense-in-depth
-    # guardrail against temporal leakage. The per-neighbor seed_time
-    # filter at gfm_data/sampler.py:69 is the actual leakage barrier;
-    # the truncation is redundant but kept to honor the paper's
-    # guardrail convention.
-    cs_loaded = _load_stypes(stypes_cache_path, dataset, upto_test_timestamp=True)
-    db_local = dataset.get_db(upto_test_timestamp=True)
+    # upto_test_timestamp controls entity table truncation:
+    #   True  (default)        -- matches dev-kyaw / RelGT paper guardrail.
+    #   False (--full_graph)   -- required for autocomplete tasks whose
+    #                             val/test seeds reference entities added
+    #                             after train_cutoff. The per-neighbor
+    #                             seed_time filter at sampler.py:69 is
+    #                             the actual leakage barrier in both modes.
+    upto = not args.full_graph
+    cs_loaded = _load_stypes(stypes_cache_path, dataset, upto_test_timestamp=upto)
+    db_local = dataset.get_db(upto_test_timestamp=upto)
     cs_local = _filter_stypes(cs_loaded, db_local)
+    mat_suffix = "materialized_full" if args.full_graph else "materialized"
     d_local, cs_dict_local = make_pkey_fkey_graph(
         db_local,
         col_to_stype_dict=cs_local,
@@ -238,7 +253,7 @@ def _do_load_db_and_graph():
             text_embedder=GloveTextEmbedding(device=f"cuda:{local_rank}"),
             batch_size=256,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/{mat_suffix}",
     )
     # Pre-warm the task parquet caches inside the slot. If a parquet
     # is missing, ``task.get_table`` falls into ``_get_table`` which

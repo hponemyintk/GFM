@@ -10,29 +10,34 @@
 # without further backbone training.
 #
 # Defaults (paper-safe subset; see docs/truncated_graph_caveat.md):
-#   DATASETS    "rel-f1 rel-hm"
-#   HOLDOUTS    "rel-f1:driver-top3 rel-hm:user-churn"
+#   DATASETS    "rel-f1 rel-event"
+#   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-attendance"
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
-#                = 2 rel-f1 + 1 rel-hm = 3 tasks
+#                = 2 rel-f1 + 2 rel-event = 4 tasks
 #
-# Why no rel-event by default: the only RelGT-paper-benchmarked
-# rel-event task is `user-ignore`. With one safe task there is
-# nothing left to pretrain on after holding it out. To opt in (e.g.
-# include user-ignore in pretrain alongside another dataset's
-# holdout), override DATASETS / HOLDOUTS explicitly. The other
-# rel-event tasks (users-birthyear, user-attendance, user-repeat,
-# event_interest-*) crash the truncated CSR adjacency on val/test
-# seeds; see docs/truncated_graph_caveat.md.
+# Holdouts are deliberately mixed-metric (one binary classification +
+# one regression) to test the frozen-backbone GFM claim across head
+# types:
+#   * rel-f1 / driver-top3       -- binary, AUROC. Paper-benchmarked
+#                                   in expts/run-large-base-experiments
+#                                   and expts/run-encoder-ablation.
+#   * rel-event / user-attendance -- regression, MAE. Paper-benchmarked
+#                                   (Table 1a, MAE 0.2502) and in
+#                                   expts/run-hyperparam-sweep-small.
 #
-# Holdout task choices match the RelGT paper's benchmark task list.
-# Both default holdouts are binary -> AUROC, so summary.json will
-# carry consistent 'roc_auc' keys across datasets:
-#   * rel-f1 / driver-top3  -- binary, AUROC. Cited in
-#                              expts/run-large-base-experiments
-#                              and expts/run-encoder-ablation.
-#   * rel-hm / user-churn   -- binary, AUROC. Cited in
-#                              expts/run-large-base-experiments
-#                              and the paper's main results table.
+# Pretrain composition:
+#   * rel-f1: driver-position (regression), driver-dnf (binary)
+#   * rel-event: user-repeat (binary), user-ignore (binary)
+# = 1 regression + 3 binary tasks. The regression-vs-binary mix in
+# pretrain (driver-position) plus the regression holdout
+# (user-attendance) lets us evaluate transfer to a held-out
+# regression head specifically.
+#
+# rel-hm is NOT in defaults but stays available via DATASETS override.
+# users-birthyear / event_interest-* / results-position /
+# qualifying-position / transactions-price (autocomplete tasks with
+# growing seeds) are excluded from defaults and require --full_graph
+# to opt in -- see docs/truncated_graph_caveat.md.
 #
 # Memory profile:
 #   * rel-f1 materialization:    ~50 MB (laptop-fine)
@@ -50,7 +55,7 @@
 #
 # ---------------- Example invocations (copy-paste) ----------------
 #
-# AWS p4d.24xlarge (8 x A100, paper-config, default 2-dataset run):
+# AWS p4d.24xlarge (8 x A100, paper-config, default rel-f1+rel-event):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/holdout_task_dev.sh
@@ -61,21 +66,19 @@
 #   NPROC=8 EPOCHS=3 STEPS_PER_TASK=200 \
 #     bash scripts/holdout_task_dev.sh
 #
-# AWS p4d with rel-event opt-in -- include user-ignore in pretrain
-# alongside the rel-f1 + rel-hm holdouts. rel-event itself contributes
-# zero held-out tasks here (only user-ignore is paper-safe; if you
-# hold it out you have nothing to pretrain on for that dataset):
+# AWS p4d, three-dataset (rel-f1 + rel-event + rel-hm):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
 #     DATASETS="rel-f1 rel-event rel-hm" \
-#     HOLDOUTS="rel-f1:driver-top3 rel-event:user-ignore rel-hm:user-churn" \
+#     HOLDOUTS="rel-f1:driver-top3 rel-event:user-attendance rel-hm:user-churn" \
 #     bash scripts/holdout_task_dev.sh
 #
-# Laptop (single GPU, smaller config -- default 2-dataset is
-# laptop-friendly; rel-event materialization ~25 GB OOMs a 27 GB box
-# so don't enable rel-event here):
+# Laptop (single GPU, smaller config -- override to drop rel-event,
+# whose materialization peak ~25 GB OOMs a 27 GB box):
 #
-#   bash scripts/holdout_task_dev.sh
+#   DATASETS="rel-f1 rel-hm" \
+#     HOLDOUTS="rel-f1:driver-top3 rel-hm:user-churn" \
+#     bash scripts/holdout_task_dev.sh
 #
 # Output layout under $OUT_DIR (default results/holdout_task_dev/):
 #   pretrain/                    # single shared pretrain
@@ -96,43 +99,42 @@ cd "$REPO_ROOT"
 
 EPOCHS="${EPOCHS:-${1:-5}}"
 MAX_STEPS="${MAX_STEPS:-${2:-300}}"
-DATASETS="${DATASETS:-rel-f1 rel-hm}"
+DATASETS="${DATASETS:-rel-f1 rel-event}"
 # Per-dataset holdout map: "<dataset>:<task> <dataset>:<task> ..."
 # Tasks cited in RelGT paper expts (see header docstring).
-HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-hm:user-churn}"
+# Default holdouts: one binary (rel-f1:driver-top3) + one regression
+# (rel-event:user-attendance), to evaluate frozen-backbone transfer
+# to held-out heads of both kinds.
+HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance}"
 
 # Default per-dataset full task lists. The launcher subtracts the
-# HOLDOUTS map from these to produce the pretrain CSV. We restrict
-# each list to the paper-benchmarked subset for that dataset --
-# tasks whose seed entity is STABLE over time, so the val/test seed
-# ids are valid against the truncated CSR adjacency we keep per the
-# RelGT paper guardrail (upto_test_timestamp=True, PR 1.0b). Tasks
-# with growing seed entities (users-birthyear, results-position,
-# qualifying-position, transactions-price, ...) crash the
-# build at graph_cache.py:288 -- see docs/truncated_graph_caveat.md
-# for the full bug pattern, the paper's sidestep, and opt-in routes.
+# HOLDOUTS map from these to produce the pretrain CSV. Each list is
+# restricted to the paper-benchmarked tasks whose val/test seeds
+# index within the truncated CSR adjacency built under the RelGT
+# paper guardrail (upto_test_timestamp=True). Empirically all tasks
+# below have val OOB = 0 and test OOB = 0 against the truncated
+# entity table -- safe out of the box.
+#
+# Tasks excluded from defaults (autocomplete / growing-seed):
+#   * rel-f1.results-position, rel-f1.qualifying-position --
+#     test seeds 100% reference rows past train_cutoff.
+#   * rel-hm.transactions-price -- growing transaction seeds.
+#   * rel-event.users-birthyear, rel-event.event_interest-* --
+#     val OK but test-split materialization itself OOMs in
+#     RelBench's pd.date_range (separate bug from the CSR-OOB).
+# To opt these in, override PRETRAIN_TASKS_CSV explicitly AND build
+# shards/TF stores with --full_graph (see docs/truncated_graph_caveat.md).
 #
 # Sources:
-#   rel-f1:    expts/run-large-base-experiments.sh -- driver-{position,
-#              dnf,top3}. driver-circuit-compete dropped despite stable
-#              seed because the paper doesn't benchmark it (no external
-#              sanity check); results-position + qualifying-position
-#              dropped (growing seeds).
-#   rel-event: expts/run-encoder-ablation.sh benchmarks user-attendance,
-#              user-repeat, user-ignore. ONLY user-ignore has a stable
-#              seed (user x event composite, both stable); the other
-#              two grow with new sign-ups / repeat events. event_interest-*
-#              and users-birthyear also grow. Net: only user-ignore
-#              survives -- not enough for "all-but-one" pretrain on
-#              this dataset alone, hence rel-event is not in the
-#              default DATASETS.
+#   rel-f1:    expts/run-large-base-experiments.sh + paper Table 1.
+#   rel-event: expts/run-hyperparam-sweep-small-experiments.sh +
+#              paper Tables 1a (user-attendance MAE 0.2502) and 1b
+#              (user-repeat AUC 0.7609, user-ignore AUC 0.8157).
 #   rel-hm:    expts/run-large-base-experiments.sh -- user-churn,
-#              item-sales. transactions-price dropped (growing seed:
-#              new transactions every day). user-item-purchase is
-#              recommendation, omitted at the launcher level too.
+#              item-sales.
 declare -A DEFAULT_ALL_TASKS=(
   [rel-f1]="driver-position driver-dnf driver-top3"
-  [rel-event]="user-ignore"
+  [rel-event]="user-attendance user-repeat user-ignore"
   [rel-hm]="user-churn item-sales"
 )
 

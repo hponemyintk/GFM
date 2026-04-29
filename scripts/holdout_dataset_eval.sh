@@ -19,17 +19,20 @@
 #
 # Default task lists are restricted to the paper-benchmarked
 # subset (stable-seed tasks) per docs/truncated_graph_caveat.md.
-# Tasks with growing seed entities (results-position,
-# qualifying-position, transactions-price, ...) crash the
-# truncated CSR adjacency on val/test seeds; opt back in by
-# overriding SOURCE_TASKS_CSV / TARGET_TASKS_CSV (and accepting
-# the build will crash unless upto_test_timestamp is also flipped).
+# Autocomplete tasks with growing seed entities (results-position,
+# qualifying-position, transactions-price, users-birthyear) crash
+# the truncated CSR adjacency on test split. Opt in by overriding
+# SOURCE_TASKS_CSV / TARGET_TASKS_CSV AND passing --full_graph to
+# the underlying tools (precompute_shards.py, build_tf_store.py,
+# main_node_ddp.py); see docs/truncated_graph_caveat.md.
 #
 # rel-event won't fit the laptop; the AWS p4d run uses
 # scripts/pretrain_p4d.sh for source, then this script with
-# SOURCE=rel-event TARGET=<other> on the box. Note: rel-event has
-# only one paper-safe task (user-ignore); SOURCE=rel-event will
-# require setting SOURCE_TASKS_CSV explicitly to user-ignore alone.
+# SOURCE=rel-event TARGET=<other> on the box. rel-event paper-safe
+# tasks: user-attendance (regression), user-repeat (binary),
+# user-ignore (binary). Pass SOURCE_TASKS_CSV explicitly when
+# SOURCE=rel-event, e.g. SOURCE_TASKS_CSV="rel-event.user-attendance:1.0,\
+# rel-event.user-repeat:1.0,rel-event.user-ignore:1.0".
 #
 # Usage:
 #   bash scripts/holdout_dataset_eval.sh [EPOCHS] [MAX_STEPS]

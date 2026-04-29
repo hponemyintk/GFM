@@ -61,6 +61,19 @@ def parse_args():
              "(e.g. 'rel-f1', 'rel-event'). Single-task / dev-kyaw "
              "compatible runs leave it None.",
     )
+    p.add_argument(
+        "--full_graph", action="store_true", default=False,
+        help="Use upto_test_timestamp=False so the entity tables include "
+             "rows created after train_cutoff. Required for autocomplete "
+             "tasks (users-birthyear, results-position, qualifying-position, "
+             "transactions-price) whose val/test seeds reference entities "
+             "added after the cutoff -- the truncated CSR adjacency would "
+             "IndexError on those seeds. Temporal leakage is still "
+             "prevented by the per-neighbor seed_time filter at "
+             "gfm_data/sampler.py:69. Materialization is cached separately "
+             "under <cache_dir>/<dataset>/materialized_full so the "
+             "truncated build (default) is not overwritten.",
+    )
     return p.parse_args()
 
 
@@ -69,24 +82,30 @@ def load_data(args):
     task = get_task(args.dataset, args.task, download=True)
 
     stypes_path = Path(args.cache_dir) / args.dataset / "stypes.json"
-    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=True)
+    upto = not args.full_graph
+    cs = load_or_generate_stypes(stypes_path, dataset, upto_test_timestamp=upto)
 
     # Use GPU for text embedding when available; major speedup on big
     # datasets (rel-event ~41M rows).
     import torch as _torch
     embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
 
-    # upto_test_timestamp=True matches dev-kyaw / RelGT paper: truncate
-    # entity tables at train cutoff as a defense-in-depth guardrail.
-    # The per-neighbor seed_time filter at gfm_data/sampler.py:69 is
-    # the actual leakage barrier; the truncation is redundant but kept
-    # to honor the paper's convention.
-    db = dataset.get_db(upto_test_timestamp=True)
+    # upto_test_timestamp controls entity table truncation.
+    # True (default): truncate at train_cutoff. Matches dev-kyaw / RelGT
+    #   paper as a defense-in-depth guardrail. Works for forecasting
+    #   tasks where seeds reference pre-existing entities.
+    # False (--full_graph): keep all entities. Required for autocomplete
+    #   tasks where val/test seeds reference entities created after
+    #   train_cutoff (users-birthyear, results-position, ...).
+    # In both cases the per-neighbor seed_time filter at
+    # gfm_data/sampler.py:69 is the actual temporal leakage barrier.
+    db = dataset.get_db(upto_test_timestamp=upto)
     # RelBench tasks (e.g., results-position) strip leakage-risk
     # columns from the source table; the stypes JSON still references
     # the full schema. Filter so make_pkey_fkey_graph's torch_frame
     # Dataset.__init__ doesn't ValueError on missing columns.
     cs = filter_to_db_columns(cs, db)
+    mat_suffix = "materialized_full" if args.full_graph else "materialized"
     data, _ = make_pkey_fkey_graph(
         db,
         col_to_stype_dict=cs,
@@ -94,7 +113,7 @@ def load_data(args):
             text_embedder=GloveTextEmbedding(device=embed_device),
             batch_size=512,
         ),
-        cache_dir=f"{args.cache_dir}/{args.dataset}/materialized",
+        cache_dir=f"{args.cache_dir}/{args.dataset}/{mat_suffix}",
     )
 
     # Shard building only needs the structural part (CSR adjacency +

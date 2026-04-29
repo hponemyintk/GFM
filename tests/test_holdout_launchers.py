@@ -100,26 +100,25 @@ def test_holdout_task_dev_rejects_holdout_not_in_full_tasks(tmp_path):
 def test_holdout_task_dev_default_paper_safe_subset():
     """The launcher's defaults must restrict to the paper-benchmarked
     subset (stable-seed tasks) per docs/truncated_graph_caveat.md.
-    Defaults pin to rel-f1 + rel-hm (both holdouts binary -> AUROC,
-    consistent metric across datasets). rel-event has only one
-    paper-safe task (user-ignore), so it's excluded from defaults --
-    "all-but-one" pretrain has nothing left after holding it out."""
+
+    Defaults pin to rel-f1 + rel-event with one binary holdout
+    (rel-f1:driver-top3) + one regression holdout
+    (rel-event:user-attendance), so the frozen-backbone GFM claim
+    is tested on both head types simultaneously."""
     src = (SCRIPTS / "holdout_task_dev.sh").read_text()
-    # Default DATASETS -- rel-event excluded (only one paper-safe
-    # task, see docs/truncated_graph_caveat.md).
-    assert 'DATASETS="${DATASETS:-rel-f1 rel-hm}"' in src, (
-        "default DATASETS should be the paper-safe 2-dataset subset"
+    # Default DATASETS -- rel-f1 + rel-event for mixed-metric holdouts.
+    assert 'DATASETS="${DATASETS:-rel-f1 rel-event}"' in src, (
+        "default DATASETS should be rel-f1 + rel-event"
     )
-    # Default HOLDOUTS -- both binary, AUROC.
+    # Default HOLDOUTS -- one binary + one regression.
     assert "rel-f1:driver-top3" in src   # paper expts/run-large-base-experiments
-    assert "rel-hm:user-churn" in src    # paper expts/run-large-base-experiments
-    # rel-event holdout must NOT be in the default HOLDOUTS string.
+    assert "rel-event:user-attendance" in src  # paper Table 1a (MAE 0.2502)
     # Match against the assignment line strictly so the explanatory
-    # comments naming rel-event don't false-positive.
+    # comments don't false-positive.
     assert (
-        'HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-hm:user-churn}"'
-        in src
-    ), "default HOLDOUTS should be the paper-safe 2-dataset subset"
+        'HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 '
+        'rel-event:user-attendance}"'
+    ) in src, "default HOLDOUTS must be the binary+regression pair"
     # rel-f1 default task list -- paper-safe stable-seed tasks only.
     assert (
         '[rel-f1]="driver-position driver-dnf driver-top3"'
@@ -128,20 +127,22 @@ def test_holdout_task_dev_default_paper_safe_subset():
         "results-position / qualifying-position / "
         "driver-circuit-compete excluded"
     )
-    # rel-hm default task list -- paper-safe stable-seed tasks only.
+    # rel-event default task list -- all three paper-benchmarked tasks
+    # (Table 1a/1b). user-attendance is regression; user-repeat and
+    # user-ignore are binary. users-birthyear / event_interest-* are
+    # excluded (autocomplete + RelBench pd.date_range OOM).
+    assert (
+        '[rel-event]="user-attendance user-repeat user-ignore"'
+    ) in src, (
+        "rel-event default task list must include all three "
+        "paper-benchmarked tasks"
+    )
+    # rel-hm task list still available for opt-in via DATASETS override.
     assert (
         '[rel-hm]="user-churn item-sales"'
     ) in src, (
         "rel-hm default task list must be the paper-safe subset; "
         "transactions-price excluded"
-    )
-    # rel-event entry exists (for explicit opt-in) but limited to
-    # the one paper-safe task.
-    assert (
-        '[rel-event]="user-ignore"'
-    ) in src, (
-        "rel-event default must be limited to user-ignore "
-        "(only paper-safe task on this dataset)"
     )
 
 
