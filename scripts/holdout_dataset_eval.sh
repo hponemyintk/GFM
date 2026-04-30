@@ -41,6 +41,15 @@
 #                    computes MAX_STEPS = STEPS_PER_TASK x N_tasks.
 #                    Unset -> p4d backend uses pretrain_p4d.sh's
 #                    default (500); laptop backend uses 50.
+#     SEEDS          space-separated adoption-phase seeds; default
+#                    "0 1 2". The pretrain backbone is shared across
+#                    seeds (only extract -> finetune -> tabpfn
+#                    repeats). Per seed, the per-row neighbor cache
+#                    at ~/.cache/relbench_examples/precomputed/
+#                    <TARGET>/<task>/<K>/ is wiped so the sampler
+#                    regenerates it under the new RNG. SEEDS=""
+#                    falls back to the legacy single-seed behavior
+#                    keyed off $SEED.
 #
 # Output layout: results/holdout_dataset_eval/<src>_to_<tgt>/
 #
@@ -52,9 +61,15 @@
 #                 memory watchdog + pre-flight cleanup)
 #   NPROC=1   -> inline single-GPU streaming pretrain (default)
 #
-# AWS p4d.24xlarge (default rel-f1 + rel-event -> rel-arxiv, paper-config):
+# AWS p4d.24xlarge (default rel-f1 + rel-event -> rel-arxiv, paper-config,
+# 3-seed adoption sweep):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# AWS p4d, single-seed adoption only (skip the seed-variance sweep):
+#
+#   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 SEEDS="0" \
 #     bash scripts/holdout_dataset_eval.sh
 #
 # AWS p4d quick shake-out (default datasets, lighter budget ~1-2h):
@@ -195,6 +210,16 @@ else
     FULL_GRAPH_FLAG=""
 fi
 SEED="${SEED:-0}"
+# Adoption-time sweep: run extract -> finetune -> tabpfn once per
+# seed in $SEEDS. The pretrain backbone is shared across seeds (it's
+# expensive and the user-facing question is "how stable is the
+# adoption pipeline" not "how stable is pretraining"). Per-seed each
+# repeat wipes ~/.cache/relbench_examples/precomputed/<TARGET>/<task>
+# so the per-row neighbor sampling done by gfm_data/sampler.py
+# (random.sample on the neighbor list) is regenerated. Set SEEDS=""
+# (or " ") to fall back to single-seed legacy behavior keyed off
+# $SEED.
+SEEDS="${SEEDS:-0 1 2}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval}"
 RUN_DIR="$OUT_DIR_BASE/${SOURCE_SLUG}_to_${TARGET}"
 PRETRAIN_DIR="$RUN_DIR/pretrain"
@@ -222,6 +247,10 @@ if [ "$PRETRAIN_BACKEND" = "p4d" ]; then
   NUM_LAYERS="${NUM_LAYERS:-4}"
   HEADS="${HEADS:-4}"
   CENTROIDS="${CENTROIDS:-4096}"
+  # The adoption-phase extract is single-process today (no DDP), so
+  # the dataloader's per-row neighbor sampling is the bottleneck.
+  # Bump num_workers on p4d to parallelize that across CPU cores.
+  EXTRACT_NUM_WORKERS="${EXTRACT_NUM_WORKERS:-8}"
 else
   K="${K:-64}"
   BATCH="${BATCH:-128}"
@@ -229,6 +258,7 @@ else
   NUM_LAYERS="${NUM_LAYERS:-1}"
   HEADS="${HEADS:-4}"
   CENTROIDS="${CENTROIDS:-512}"
+  EXTRACT_NUM_WORKERS="${EXTRACT_NUM_WORKERS:-0}"
 fi
 MAX_ROWS_TRAIN="${MAX_ROWS_TRAIN:-2000}"
 
@@ -355,11 +385,19 @@ for f in "$META" "$WEIGHTS" "$SCHEMA"; do
   fi
 done
 
-# ----------------- 3. For each TARGET task, extract + finetune + tabpfn -----------------
+# ----------------- 3. For each TARGET task x SEED, extract + finetune + tabpfn -----------------
 # 'auto': raw if channels<=500, else PCA-cap at 500. Adapts to whatever
 # channels the upstream backbone produces. Override with PROJECTOR=none /
 # pca64 for ablations.
 PROJECTOR="${PROJECTOR:-auto}"
+
+# Resolve the seed list. Empty SEEDS = legacy single-seed behavior at
+# $SEED, keyed off the same per-task path layout.
+if [ -z "${SEEDS// /}" ]; then
+  SEED_LIST=( "$SEED" )
+else
+  read -ra SEED_LIST <<< "$SEEDS"
+fi
 
 # Parse TARGET_TASKS_CSV "ds.task:weight,..." -> just the task names.
 IFS=',' read -ra TGT_PAIRS <<< "$TARGET_TASKS_CSV"
@@ -370,89 +408,162 @@ for pair in "${TGT_PAIRS[@]}"; do
   task_name="${pair_no_weight#${TARGET}.}"
 
   TASK_DIR="$RUN_DIR/${task_name}"
-  EMB_DIR="$TASK_DIR/embeddings"
-  FT_DIR="$TASK_DIR/finetune_head"
-  TABPFN_DIR="$TASK_DIR/tabpfn"
-  mkdir -p "$EMB_DIR" "$FT_DIR" "$TABPFN_DIR"
+  mkdir -p "$TASK_DIR"
 
   echo
-  echo "=== TARGET task: ${TARGET}.${task_name} ==="
+  echo "=== TARGET task: ${TARGET}.${task_name} (seeds=[${SEED_LIST[*]}]) ==="
 
-  EMB_LOG="$EMB_DIR/extract.log"
-  if [ ! -f "$EMB_DIR/test.pt" ]; then
-    echo "  [extract] register_new_dataset on $TARGET, then forward"
-    python3 -m tools.extract_embeddings \
-      --backbone_meta "$META" \
-      --backbone_weights "$WEIGHTS" \
-      --backbone_schema "$SCHEMA" \
+  for ADOPT_SEED in "${SEED_LIST[@]}"; do
+    SEED_DIR="$TASK_DIR/seed${ADOPT_SEED}"
+    EMB_DIR="$SEED_DIR/embeddings"
+    FT_DIR="$SEED_DIR/finetune_head"
+    TABPFN_DIR="$SEED_DIR/tabpfn"
+    mkdir -p "$EMB_DIR" "$FT_DIR" "$TABPFN_DIR"
+    echo
+    echo "  ---- seed=$ADOPT_SEED ----"
+
+    EMB_LOG="$EMB_DIR/extract.log"
+    if [ ! -f "$EMB_DIR/test.pt" ]; then
+      # Wipe the cached HDF5 of per-row neighbor lists so the
+      # sampler regenerates them under the new RNG. Different
+      # ($TARGET, $task_name) pairs have isolated dirs; we only
+      # touch this task's. cache_dir has the FULL_GRAPH suffix
+      # built into the path indirectly (extract_embeddings writes
+      # to precomputed/<dataset>/<task>/<K>/), so K is part of the
+      # path and the wipe matches whichever K we're running.
+      PRECOMP_DIR="$CACHE/precomputed/$TARGET/$task_name/$K"
+      if [ -d "$PRECOMP_DIR" ]; then
+        echo "    [extract] wiping $PRECOMP_DIR (per-seed re-sample)"
+        rm -rf "$PRECOMP_DIR"
+      fi
+      echo "    [extract] register_new_dataset on $TARGET, then forward (seed=$ADOPT_SEED)"
+      python3 -m tools.extract_embeddings \
+        --backbone_meta "$META" \
+        --backbone_weights "$WEIGHTS" \
+        --backbone_schema "$SCHEMA" \
+        --dataset "$TARGET" --task "$task_name" \
+        --register_new_dataset \
+        --split all \
+        --num_neighbors "$K" --batch_size "$BATCH" \
+        --num_workers "$EXTRACT_NUM_WORKERS" \
+        --cache_dir "$CACHE" \
+        --use_tf_store \
+        --seed "$ADOPT_SEED" \
+        --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG \
+        > "$EMB_LOG" 2>&1
+    else
+      echo "    [extract] embeddings cached for seed=$ADOPT_SEED"
+    fi
+
+    echo "    [finetune] linear head (seed=$ADOPT_SEED)"
+    python3 -m tools.finetune_head \
+      --embeddings_dir "$EMB_DIR" \
       --dataset "$TARGET" --task "$task_name" \
-      --register_new_dataset \
-      --split all \
-      --num_neighbors "$K" --batch_size "$BATCH" \
-      --num_workers 0 \
-      --cache_dir "$CACHE" \
-      --use_tf_store \
-      --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG \
-      > "$EMB_LOG" 2>&1
-  else
-    echo "  [extract] embeddings cached"
-  fi
+      --head linear --epochs 50 --lr 1e-3 \
+      --seed "$ADOPT_SEED" \
+      --out "$FT_DIR/finetuned.pt" \
+      > "$FT_DIR/finetune.log" 2>&1 || \
+        echo "    WARN: finetune_head failed; see $FT_DIR/finetune.log"
 
-  echo "  [finetune] linear head"
-  python3 -m tools.finetune_head \
-    --embeddings_dir "$EMB_DIR" \
-    --dataset "$TARGET" --task "$task_name" \
-    --head linear --epochs 50 --lr 1e-3 \
-    --out "$FT_DIR/finetuned.pt" \
-    --device cpu \
-    > "$FT_DIR/finetune.log" 2>&1 || \
-      echo "  WARN: finetune_head failed; see $FT_DIR/finetune.log"
-
-  echo "  [tabpfn] post-hoc"
-  python3 -m tools.tabpfn_eval \
-    --embeddings_dir "$EMB_DIR" \
-    --dataset "$TARGET" --task "$task_name" \
-    --projector "$PROJECTOR" \
-    --out "$TABPFN_DIR/tabpfn.json" \
-    > "$TABPFN_DIR/tabpfn.log" 2>&1 || \
-      echo "  WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
+    echo "    [tabpfn] post-hoc (seed=$ADOPT_SEED)"
+    python3 -m tools.tabpfn_eval \
+      --embeddings_dir "$EMB_DIR" \
+      --dataset "$TARGET" --task "$task_name" \
+      --projector "$PROJECTOR" \
+      --seed "$ADOPT_SEED" \
+      --out "$TABPFN_DIR/tabpfn.json" \
+      > "$TABPFN_DIR/tabpfn.log" 2>&1 || \
+        echo "    WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
+  done
 
   TASK_SUMMARIES+=("$TASK_DIR")
 done
 
-# ----------------- 4. Aggregate -----------------
+# ----------------- 4. Aggregate (per-task mean +/- SD across seeds) -----------------
 SUMMARY="$RUN_DIR/summary.json"
+SEED_LIST_STR="${SEED_LIST[*]}"
 python3 - <<PY
-import json, os
+import json, os, statistics
 out = {
     "source": "${SOURCE_LIST[*]}",
     "target": "$TARGET",
     "source_tasks": "$SOURCE_TASKS_CSV".split(","),
     "target_tasks": "$TARGET_TASKS_CSV".split(","),
     "epochs": int($EPOCHS),
-    "seed": int($SEED),
+    "seeds": [int(s) for s in "$SEED_LIST_STR".split() if s.strip()],
     "per_task": {},
 }
+
+def _mean_sd(values):
+    """Return (mean, std) for a numeric list. SD undefined for n<2."""
+    vals = [float(v) for v in values if v is not None]
+    if not vals:
+        return None
+    if len(vals) == 1:
+        return {"mean": vals[0], "sd": None, "n": 1, "values": vals}
+    return {
+        "mean": statistics.fmean(vals),
+        "sd": statistics.stdev(vals),
+        "n": len(vals),
+        "values": vals,
+    }
+
 for d in """$(IFS=$'\n'; echo "${TASK_SUMMARIES[*]}")""".split():
     if not d.strip():
         continue
     name = os.path.basename(d.strip())
-    entry = {}
-    ft = os.path.join(d, "finetune_head", "finetuned.pt")
-    if os.path.exists(ft):
-        import torch
-        f = torch.load(ft, map_location="cpu", weights_only=False)
-        entry["finetune_head"] = {
-            "head_kind": f.get("head_kind"),
-            "best_epoch": f.get("best_epoch"),
-            "best_val_loss": f.get("best_val_loss"),
-            "test_metrics": f.get("test_metrics"),
-        }
-    tp = os.path.join(d, "tabpfn", "tabpfn.json")
-    if os.path.exists(tp):
-        with open(tp) as fp:
-            entry["tabpfn"] = json.load(fp)
+    seed_dirs = sorted(
+        sd for sd in os.listdir(d)
+        if sd.startswith("seed") and os.path.isdir(os.path.join(d, sd))
+    )
+    finetune_runs = []
+    tabpfn_runs = []
+    for sd in seed_dirs:
+        seed_label = sd[len("seed"):]
+        ft_path = os.path.join(d, sd, "finetune_head", "finetuned.pt")
+        if os.path.exists(ft_path):
+            import torch
+            f = torch.load(ft_path, map_location="cpu", weights_only=False)
+            finetune_runs.append({
+                "seed": seed_label,
+                "head_kind": f.get("head_kind"),
+                "best_epoch": f.get("best_epoch"),
+                "best_val_loss": f.get("best_val_loss"),
+                "test_metrics": f.get("test_metrics"),
+            })
+        tp_path = os.path.join(d, sd, "tabpfn", "tabpfn.json")
+        if os.path.exists(tp_path):
+            with open(tp_path) as fp:
+                tabpfn_json = json.load(fp)
+            tabpfn_json["seed"] = seed_label
+            tabpfn_runs.append(tabpfn_json)
+
+    entry = {"finetune_head_seeds": finetune_runs,
+             "tabpfn_seeds": tabpfn_runs}
+
+    # Roll up the per-seed test metrics into mean +/- SD per metric.
+    # Same shape for both adoption methods.
+    def _roll(runs, metrics_field):
+        agg = {}
+        if not runs:
+            return agg
+        # Collect metric keys from the first run that has them.
+        keys = set()
+        for r in runs:
+            m = r.get(metrics_field) or {}
+            keys.update(m.keys())
+        for k in sorted(keys):
+            stats = _mean_sd([
+                (r.get(metrics_field) or {}).get(k) for r in runs
+            ])
+            if stats is not None:
+                agg[k] = stats
+        return agg
+
+    entry["finetune_head_summary"] = _roll(finetune_runs, "test_metrics")
+    entry["tabpfn_summary"] = _roll(tabpfn_runs, "test_metrics")
     out["per_task"][name] = entry
+
 with open("$SUMMARY", "w") as f:
     json.dump(out, f, indent=2)
 print(json.dumps(out, indent=2))
