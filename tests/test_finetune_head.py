@@ -183,3 +183,59 @@ def test_main_end_to_end_with_synthetic_embeddings(tmp_path):
               "best_epoch", "best_val_loss", "test_metrics"):
         assert k in saved, f"missing key {k} in saved head .pt"
     assert saved["test_metrics"]["roc_auc"] == 0.95
+
+
+def test_main_evaluates_test_even_when_pt_lacks_labels(tmp_path):
+    """RelBench masks the target column on get_table('test') by default
+    (binary leaderboard tasks like rel-f1.driver-top3), so
+    extract_embeddings emits a test.pt without 'labels'. finetune_head
+    must STILL call task.evaluate(predictions) -- RelBench reads the
+    unmasked labels via get_table(test, mask_input_cols=False)
+    internally. Without this, frozen-backbone evaluation is silently
+    skipped and summary.json reports test_metrics=null."""
+    from tools.finetune_head import main as ft_main
+
+    channels = 8
+    n = 64
+    torch.manual_seed(7)
+    w = torch.randn(channels)
+
+    # train + val have labels, test does NOT (mirrors the
+    # extract_embeddings output for masked-target tasks).
+    for split, n_split in (("train", n), ("val", n // 4)):
+        emb = torch.randn(n_split, channels)
+        labels = ((emb @ w) > 0).float()
+        torch.save({
+            "embeddings": emb, "labels": labels,
+            "global_idx": torch.arange(n_split, dtype=torch.long),
+            "split": split, "task": "fake-task", "dataset": "fake-ds",
+            "channels": channels,
+        }, tmp_path / f"{split}.pt")
+    n_test = n // 4
+    torch.save({
+        "embeddings": torch.randn(n_test, channels),
+        "global_idx": torch.arange(n_test, dtype=torch.long),
+        # NO 'labels' key -- the masked-test-target case.
+        "split": "test", "task": "fake-task", "dataset": "fake-ds",
+        "channels": channels,
+    }, tmp_path / "test.pt")
+
+    out_path = tmp_path / "head.pt"
+    fake_task = type("T", (), {})()
+    fake_task.get_table = lambda split: type("Tbl", (), {"__len__": lambda self_: n_test})()
+    fake_task.evaluate = lambda preds: {"roc_auc": 0.88, "f1": 0.7}
+
+    with patch("relbench.tasks.get_task", return_value=fake_task):
+        rc = ft_main([
+            "--embeddings_dir", str(tmp_path),
+            "--dataset", "fake-ds", "--task", "fake-task",
+            "--head", "linear", "--epochs", "20", "--lr", "1e-2",
+            "--out", str(out_path), "--device", "cpu",
+        ])
+    assert rc == 0
+    saved = torch.load(out_path, map_location="cpu", weights_only=False)
+    assert saved["test_metrics"] is not None, (
+        "test_metrics must be populated even when test.pt lacks labels; "
+        "task.evaluate(predictions) reads the masked labels internally"
+    )
+    assert saved["test_metrics"]["roc_auc"] == 0.88

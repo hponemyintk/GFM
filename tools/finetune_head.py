@@ -241,17 +241,20 @@ def main(argv=None):
         f"[finetune] best epoch {best_epoch} val_loss={best_val_loss:.4f}"
     )
 
-    if "labels" in test:
-        metrics = _final_evaluate(
-            head,
-            test_emb=test["embeddings"], test_global_idx=test["global_idx"],
-            task_kind=task_kind, dataset=args.dataset, task=args.task,
-            device=args.device,
-        )
-        print(f"[finetune] test metrics: {metrics}")
-    else:
-        print(f"[finetune] no test labels; skipping final evaluation")
-        metrics = None
+    # _final_evaluate scatters predictions by global_idx and calls
+    # ``task.evaluate(predictions)`` -- RelBench reads the unmasked test
+    # labels via ``get_table("test", mask_input_cols=False)`` internally.
+    # We do NOT need ``test["labels"]`` to be present in the .pt; the
+    # default get_table() output for entity tasks masks the target column
+    # to gate users into the official evaluator. Mirrors what
+    # train_multi_task.py:882 does for in-loop test eval.
+    metrics = _final_evaluate(
+        head,
+        test_emb=test["embeddings"], test_global_idx=test["global_idx"],
+        task_kind=task_kind, dataset=args.dataset, task=args.task,
+        device=args.device,
+    )
+    print(f"[finetune] test metrics: {metrics}")
 
     if args.out:
         out_path = os.path.expanduser(args.out)
