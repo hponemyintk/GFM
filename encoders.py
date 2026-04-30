@@ -586,6 +586,14 @@ class NeighborTfsEncoder(nn.Module):
         self.node_type_map: Dict[str, int] = {}
         self.inv_node_type_map: Dict[int, str] = {}
         self._node_type_to_safe: Dict[str, str] = {}
+        # Per-table numerical column ORDER as registered. Used by
+        # _align_num_buffers when adoption-time column count differs
+        # from the pretrained mean/std width (e.g. RelBench's task-
+        # aware leakage stripping removes a different set of columns
+        # under a different active task). Plain dict (not a buffer) --
+        # rebuilt from col_names_dict on each register_dataset call,
+        # so it doesn't need to survive state_dict round-trips.
+        self._num_col_names: Dict[str, List[str]] = {}
         self._col_name_to_idx: Dict[str, int] = {}
         # Runtime cache for GloVe vectors of column names that arrive at
         # forward time but weren't in any register_dataset call. Populated
@@ -735,6 +743,10 @@ class NeighborTfsEncoder(nn.Module):
                 f'_num_std_{safe_name}',
                 torch.tensor(stds, dtype=torch.float32),
             )
+            # Remember the column order so _align_num_buffers can
+            # rebuild a width-correct (mean, std) pair when adoption
+            # gives the same table a different column count.
+            self._num_col_names[safe_name] = list(num_cols)
             new_zscore_tables += 1
         self._num_zscore_tables.data = (
             self._num_zscore_tables + new_zscore_tables
@@ -819,9 +831,78 @@ class NeighborTfsEncoder(nn.Module):
         feat = big_tf.feat_dict[torch_frame.numerical]
         if hasattr(feat, "values") and not callable(feat.values):
             feat = feat.values
+        # Adoption-time column set may differ from pretraining when
+        # RelBench's task-aware leakage stripping yields a different
+        # surviving column set for a shared table (e.g. rel-f1.results
+        # has 'position' stripped under results-position pretraining
+        # but kept under driver-top3 adoption). Even when widths happen
+        # to match, the surviving order can flip, so align by NAME
+        # whenever the TF carries col_names_dict; pretrained columns
+        # get their saved mean/std, new columns fall back to identity
+        # (mean=0, std=1) which is no-op normalization. Width-only
+        # fallback (truncate/pad) handles legacy callers that don't
+        # populate col_names_dict.
+        n_cols = feat.shape[-1]
+        actual_cols = None
+        cnd = getattr(big_tf, "col_names_dict", None)
+        if isinstance(cnd, dict):
+            cand = cnd.get(torch_frame.numerical)
+            if isinstance(cand, (list, tuple)) and len(cand) == n_cols:
+                actual_cols = list(cand)
+        pretrain_cols = self._num_col_names.get(safe_name)
+        needs_align = (
+            mean.shape[0] != n_cols
+            or (actual_cols is not None
+                and pretrain_cols is not None
+                and actual_cols != list(pretrain_cols))
+        )
+        if needs_align:
+            mean, std = self._align_num_buffers(
+                mean, std, safe_name, big_tf, n_cols,
+            )
         # NaN propagates naturally: (NaN - mean) / std = NaN
         # Clamp to ±10 std devs to control outliers (clamp preserves NaN)
         big_tf.feat_dict[torch_frame.numerical] = ((feat - mean) / (std + 1e-8)).clamp(-10, 10)
+
+    def _align_num_buffers(self, mean, std, safe_name, big_tf, n_cols):
+        """Rebuild (mean, std) sized to ``n_cols`` aligned by column name.
+
+        Pretrained columns keep their saved stats; columns the backbone
+        never saw at registration get identity (0, 1). Falls back to
+        truncate/pad if column names aren't recoverable from the TF.
+        """
+        pretrain_cols = self._num_col_names.get(safe_name)
+        actual_cols = None
+        cnd = getattr(big_tf, "col_names_dict", None)
+        if isinstance(cnd, dict):
+            cand = cnd.get(torch_frame.numerical)
+            if isinstance(cand, (list, tuple)) and len(cand) == n_cols:
+                actual_cols = list(cand)
+
+        if pretrain_cols is not None and actual_cols is not None:
+            pretrain_idx = {c: i for i, c in enumerate(pretrain_cols)}
+            aligned_mean = torch.zeros(
+                n_cols, dtype=mean.dtype, device=mean.device,
+            )
+            aligned_std = torch.ones(
+                n_cols, dtype=std.dtype, device=std.device,
+            )
+            for j, col in enumerate(actual_cols):
+                if col in pretrain_idx:
+                    aligned_mean[j] = mean[pretrain_idx[col]]
+                    aligned_std[j] = std[pretrain_idx[col]]
+            return aligned_mean, aligned_std
+
+        # Fallback: TF has no col_names_dict (or it's empty). Truncate
+        # the buffer if the TF is narrower; pad with identity if wider.
+        buf_len = mean.shape[0]
+        if n_cols < buf_len:
+            return mean[:n_cols], std[:n_cols]
+        pad_mean = torch.zeros(n_cols, dtype=mean.dtype, device=mean.device)
+        pad_std = torch.ones(n_cols, dtype=std.dtype, device=std.device)
+        pad_mean[:buf_len] = mean
+        pad_std[:buf_len] = std
+        return pad_mean, pad_std
 
     def _get_col_semantic_embeddings(self, big_tf, device):
         """Build [num_cols, channels] semantic embedding for the columns in big_tf.

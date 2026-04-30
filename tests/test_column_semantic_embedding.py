@@ -909,15 +909,21 @@ class TestMultiStypeForward:
 
 
 # ═══════════════════════════════════════════════════════════
-# 10. SHAPE MISMATCH WARNING
+# 10. ADOPTION-TIME COLUMN COUNT MISMATCH (handled, not warned)
 # ═══════════════════════════════════════════════════════════
 
 class TestShapeMismatchWarning:
-    """Verify a warning is emitted when column count doesn't match."""
+    """Adoption-time column count can differ from pretraining when
+    RelBench's task-aware leakage stripping yields a different
+    surviving column set for a shared table. The encoder aligns by
+    column name in _normalize_numerical, so the forward pass succeeds
+    without emitting the legacy 'Column semantic count' warning."""
 
-    def test_mismatch_emits_warning(self):
-        """When col_names_dict has fewer names than the encoder produces
-        columns, a warning should be emitted."""
+    def test_adoption_mismatch_runs_without_warning(self):
+        """Pretrained on [price, age] (2 cols), adopted to a TF with
+        only [price] (1 col): _normalize_numerical aligns by name and
+        the forward pass produces a finite output without emitting
+        the legacy shape-mismatch warning."""
         channels = 32
         enc = _make_encoder(
             node_type_map={"t": 0},
@@ -932,9 +938,6 @@ class TestShapeMismatchWarning:
         B, K = 1, 1
         neighbor_types = torch.zeros(B, K, dtype=torch.long)
 
-        # TF has 2 numerical columns but col_names_dict lists only 1 name
-        # → Z-score broadcasts 2-element buffer onto 1-col tensor → 2 value cols
-        # but only 1 semantic col → shape mismatch warning
         feat = torch.randn(1, 1)
         big_tf = _make_tensorframe(
             feat_dict={torch_frame.numerical: feat},
@@ -951,14 +954,19 @@ class TestShapeMismatchWarning:
         import warnings as w
         with w.catch_warnings(record=True) as caught:
             w.simplefilter("always")
-            enc(batch_dict, neighbor_types)
+            out = enc(batch_dict, neighbor_types)
 
         mismatch_warnings = [
             x for x in caught
             if "Column semantic count" in str(x.message)
         ]
-        assert len(mismatch_warnings) >= 1, (
-            f"Expected shape mismatch warning, got: {[str(x.message) for x in caught]}"
+        assert not mismatch_warnings, (
+            "Adoption-time column-count mismatch should be aligned by "
+            "_normalize_numerical, not warned about: "
+            f"{[str(x.message) for x in mismatch_warnings]}"
+        )
+        assert torch.isfinite(out).all(), (
+            "Aligned forward pass must produce finite outputs"
         )
 
     def test_no_warning_when_shapes_match(self):

@@ -294,6 +294,88 @@ class TestNormalizeNumerical:
         )
 
 
+class TestNumericalColumnAlignment:
+    """Adoption-time column count can differ from pretraining when
+    RelBench's task-aware leakage stripping yields a different
+    surviving column set for a shared table. _normalize_numerical
+    must align by column NAME, not crash on shape mismatch."""
+
+    def _enc_with_two_cols(self):
+        """Encoder pretrained on table 't' with numerical columns
+        [x, y] and means/stds (10, 100) / (1, 10)."""
+        return _make_encoder(
+            node_type_map={"t": 0},
+            col_names_dict={"t": {torch_frame.numerical: ["x", "y"]}},
+            col_stats_dict={"t": {
+                "x": {StatType.MEAN: 10.0, StatType.STD: 1.0},
+                "y": {StatType.MEAN: 100.0, StatType.STD: 10.0},
+            }},
+        )
+
+    def test_extra_column_at_adoption_uses_identity(self):
+        """Adoption table has a NEW column 'z' that pretraining didn't
+        see. The normalization must succeed (no shape crash) and apply
+        identity (mean=0, std=1) to the new column."""
+        enc = self._enc_with_two_cols()
+        # Adoption: same x, y, plus a new z column.
+        feat = torch.tensor([[10.0, 100.0, 7.0]])
+        tf = MagicMock()
+        tf.feat_dict = {torch_frame.numerical: feat.clone()}
+        tf.col_names_dict = {torch_frame.numerical: ["x", "y", "z"]}
+        enc._normalize_numerical(tf, "t")
+        result = tf.feat_dict[torch_frame.numerical]
+        # x, y get pretrained stats -> 0; z gets identity -> 7.0.
+        assert result.shape == (1, 3)
+        assert result[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+        assert result[0, 1].item() == pytest.approx(0.0, abs=1e-6)
+        assert result[0, 2].item() == pytest.approx(7.0, abs=1e-4)
+
+    def test_missing_column_at_adoption_drops_unused_stats(self):
+        """Adoption table has FEWER columns than pretraining. The
+        pretrained mean/std for the missing column simply isn't used."""
+        enc = self._enc_with_two_cols()
+        # Adoption: only column x survives.
+        feat = torch.tensor([[12.0]])
+        tf = MagicMock()
+        tf.feat_dict = {torch_frame.numerical: feat.clone()}
+        tf.col_names_dict = {torch_frame.numerical: ["x"]}
+        enc._normalize_numerical(tf, "t")
+        result = tf.feat_dict[torch_frame.numerical]
+        assert result.shape == (1, 1)
+        # (12 - 10) / 1 = 2.0
+        assert result[0, 0].item() == pytest.approx(2.0, abs=1e-6)
+
+    def test_reordered_columns_align_by_name_not_position(self):
+        """Adoption gives the columns in a different order. Alignment
+        must follow column NAME, not positional indexing -- otherwise
+        we'd apply x's stats to y and vice versa."""
+        enc = self._enc_with_two_cols()
+        # Adoption: order swapped to [y, x].
+        feat = torch.tensor([[100.0, 10.0]])
+        tf = MagicMock()
+        tf.feat_dict = {torch_frame.numerical: feat.clone()}
+        tf.col_names_dict = {torch_frame.numerical: ["y", "x"]}
+        enc._normalize_numerical(tf, "t")
+        result = tf.feat_dict[torch_frame.numerical]
+        # y gets y-stats: (100 - 100) / 10 = 0; x gets x-stats: (10 - 10) / 1 = 0.
+        assert torch.allclose(result, torch.zeros(1, 2), atol=1e-6)
+
+    def test_fallback_truncates_when_no_col_names(self):
+        """If TF doesn't carry col_names_dict, fall back to positional
+        truncate/pad rather than crashing -- the buffer width vs feat
+        width mismatch must not propagate to the broadcast op."""
+        enc = self._enc_with_two_cols()
+        feat = torch.tensor([[10.0]])  # 1 column, buffer has 2
+        tf = MagicMock()
+        tf.feat_dict = {torch_frame.numerical: feat.clone()}
+        tf.col_names_dict = None  # signal: not available
+        enc._normalize_numerical(tf, "t")
+        result = tf.feat_dict[torch_frame.numerical]
+        assert result.shape == (1, 1)
+        # Truncate keeps first stat (x): (10-10)/1 = 0.
+        assert result[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+
+
 class TestZScoreSerializationGuard:
     """Tests for the _num_zscore_tables guard that prevents silent normalization skip."""
 
