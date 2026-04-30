@@ -320,6 +320,19 @@ def main(argv=None):
     out_dir = os.path.expanduser(args.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
+    # Seed the per-seed-row neighbor sampling. The sampler at
+    # gfm_data/sampler.py uses Python's ``random.sample`` to pick K of
+    # N neighbors, so the embeddings depend on ``random.seed(args.seed)``
+    # being set BEFORE the precompute pass. Caller must also wipe the
+    # cached HDF5 shards (~/.cache/relbench_examples/precomputed/...)
+    # between seeded runs, otherwise the precompute gets reused.
+    import random as _random
+    _random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     # 1. Load backbone (frozen, eval mode by default).
     from model import RelGT
     print(f"[extract] loading backbone from {args.backbone_meta}")

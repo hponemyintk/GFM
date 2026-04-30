@@ -158,6 +158,7 @@ def _fit_predict(
     test_chunk_size: int = 10000,
     device: str = "auto",
     n_estimators: int = 4,
+    seed: int = 0,
 ):
     """Fit TabPFN on train, predict on test. Returns predictions
     (probabilities for binary, scalar for regression).
@@ -178,7 +179,7 @@ def _fit_predict(
         from tabpfn import TabPFNClassifier
         clf = TabPFNClassifier(
             device=device, n_estimators=n_estimators,
-            memory_saving_mode=True,
+            memory_saving_mode=True, random_state=seed,
         )
         clf.fit(train_emb, train_labels.astype(int))
         preds = []
@@ -193,7 +194,7 @@ def _fit_predict(
         from tabpfn import TabPFNRegressor
         reg = TabPFNRegressor(
             device=device, n_estimators=n_estimators,
-            memory_saving_mode=True,
+            memory_saving_mode=True, random_state=seed,
         )
         reg.fit(train_emb, train_labels)
         preds = []
@@ -258,6 +259,11 @@ def main(argv=None):
         help="Test rows per TabPFN inference pass. Drop this if GPU "
              "OOMs even at chunk_size=10k.",
     )
+    p.add_argument(
+        "--seed", type=int, default=0,
+        help="Seeds the support-set subsample and TabPFN's random_state. "
+             "Use a different seed per repeat to get error bars.",
+    )
     p.add_argument("--out", type=str, default=None,
                    help="If set, save the metrics dict as JSON here.")
     args = p.parse_args(argv)
@@ -290,6 +296,7 @@ def main(argv=None):
         train_emb, train_lab,
         n_max=args.max_train_samples,
         task_kind=task_kind,
+        seed=args.seed,
     )
     if train_emb.shape[0] != n_train_full:
         print(

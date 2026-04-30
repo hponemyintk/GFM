@@ -200,7 +200,15 @@ def main(argv=None):
                    help="NOT YET IMPLEMENTED. Reserved for warm-then-unfreeze.")
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed", type=int, default=0,
+                   help="Seeds head init, dataloader shuffle, and CUDA "
+                        "RNG. Set per-run when collecting error bars.")
     args = p.parse_args(argv)
+
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
 
     if args.unfreeze_after_epoch > 0:
         raise NotImplementedError(
@@ -264,6 +272,7 @@ def main(argv=None):
             "head_kind": args.head,
             "channels": channels,
             "task_kind": task_kind,
+            "seed": args.seed,
             "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
             "test_metrics": metrics,
