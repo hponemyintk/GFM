@@ -10,13 +10,26 @@
 # Train fresh head + run TabPFN on each TARGET task.
 #
 # Defaults (FULL_GRAPH=1; p4d-ready -- see docs/truncated_graph_caveat.md):
-#   SOURCE       "rel-f1 rel-event"   space-separated multi-source pretrain
-#   TARGET       rel-arxiv            unseen schema -- adoption via
-#                                     register_new_dataset
-#   SOURCE_TASKS union of paper-benchmarked rel-f1 + rel-event tasks
-#                (3 rel-f1 + 6 rel-event = 9 tasks)
-#   TARGET_TASKS rel-arxiv.paper-citation (binary) +
-#                rel-arxiv.author-publication (regression)
+#   TARGET       rel-event            6-task holdout: paper-benchmarked
+#                                     (RelGT Tables 1a/1b) + 3 autocomplete
+#                                     joined under FULL_GRAPH=1.
+#   SOURCE       <SUPPORTED_DATASETS minus TARGET>
+#                                     Leave-one-dataset-out across the 9
+#                                     RelBench v2 datasets that have entity
+#                                     binary/regression tasks supported by
+#                                     the adoption pipeline.
+#   SOURCE_TASKS Union of every entity binary + regression task across the
+#                resolved SOURCE datasets.
+#   TARGET_TASKS Every entity binary + regression task in TARGET.
+#
+# Excluded (unsupported by the adoption pipeline today):
+#   * rel-mimic / rel-salt -- multiclass + autocomplete cls + recommendation
+#     only. Add multiclass head support to finetune_head/tabpfn_eval to
+#     unblock these.
+#   * Per-dataset task exclusions: link-prediction / recommendation
+#     (driver-circuit-compete, paper-paper-cocitation, user-beer-* etc.)
+#     and multiclass (author-category) -- structural mismatches with the
+#     ranking/multiclass-aware heads we don't have yet.
 #
 # SOURCE accepts a space-separated list so the backbone can see
 # multiple schemas before adoption to TARGET. The script unions the
@@ -61,10 +74,22 @@
 #                 memory watchdog + pre-flight cleanup)
 #   NPROC=1   -> inline single-GPU streaming pretrain (default)
 #
-# AWS p4d.24xlarge (default rel-f1 + rel-event -> rel-arxiv, paper-config,
-# 3-seed adoption sweep):
+# AWS p4d.24xlarge (default LOO: TARGET=rel-event, SOURCE = rest;
+# paper-config, 3-seed adoption sweep):
 #
 #   NPROC=8 EPOCHS=10 STEPS_PER_TASK=500 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# AWS p4d, hold out a different dataset (e.g. rel-arxiv):
+#
+#   NPROC=8 TARGET=rel-arxiv \
+#     EPOCHS=10 STEPS_PER_TASK=500 \
+#     bash scripts/holdout_dataset_eval.sh
+#
+# AWS p4d, restrict the SOURCE pool (e.g. only rel-f1 + rel-hm):
+#
+#   NPROC=8 SOURCE="rel-f1 rel-hm" TARGET=rel-arxiv \
+#     EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/holdout_dataset_eval.sh
 #
 # AWS p4d, single-seed adoption only (skip the seed-variance sweep):
@@ -75,12 +100,6 @@
 # AWS p4d quick shake-out (default datasets, lighter budget ~1-2h):
 #
 #   NPROC=8 EPOCHS=3 STEPS_PER_TASK=200 \
-#     bash scripts/holdout_dataset_eval.sh
-#
-# AWS p4d, single-source override (rel-f1 -> rel-hm):
-#
-#   NPROC=8 SOURCE=rel-f1 TARGET=rel-hm \
-#     EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/holdout_dataset_eval.sh
 #
 # AWS p4d, paper-strict (drop FULL_GRAPH so the build matches the
@@ -103,8 +122,30 @@ EPOCHS="${EPOCHS:-${1:-5}}"
 # STEPS_PER_TASK is the user-facing knob. Unset -> p4d branch falls
 # through to pretrain_p4d.sh's default (500); laptop branch uses 50.
 STEPS_PER_TASK="${STEPS_PER_TASK:-${2:-}}"
-SOURCE="${SOURCE:-rel-f1 rel-event}"
-TARGET="${TARGET:-rel-arxiv}"
+# Default holdout TARGET = rel-event. Picked over rel-arxiv because
+# it has 6 entity binary/regression tasks (rel-arxiv only has 2),
+# giving a richer per-task error-bar story for the GFM
+# generalization claim, and because it's paper-benchmarked in RelGT
+# Tables 1a/1b. Override TARGET=rel-arxiv (or any other supported
+# dataset) to flip the holdout.
+TARGET="${TARGET:-rel-event}"
+# SUPPORTED_DATASETS lists every RelBench v2 dataset whose entity
+# binary/regression tasks the adoption pipeline (extract_embeddings
+# -> finetune_head -> tabpfn_eval) handles today. rel-mimic and
+# rel-salt are excluded -- they only expose multiclass / autocomplete
+# classification / recommendation tasks, and the launcher's adoption
+# heads don't support those yet. When SOURCE is unset, SOURCE
+# defaults to "all SUPPORTED_DATASETS except TARGET" (LOO).
+SUPPORTED_DATASETS="${SUPPORTED_DATASETS:-rel-amazon rel-avito rel-event rel-f1 rel-hm rel-stack rel-trial rel-arxiv rel-ratebeer}"
+if [ -z "${SOURCE:-}" ]; then
+  _src_auto=()
+  for _ds in $SUPPORTED_DATASETS; do
+    if [ "$_ds" != "$TARGET" ]; then
+      _src_auto+=("$_ds")
+    fi
+  done
+  SOURCE="${_src_auto[*]}"
+fi
 
 # SOURCE accepts a space-separated list of pretraining datasets so the
 # backbone can see multiple schemas before we adopt to TARGET. Parse
@@ -163,16 +204,70 @@ DEFAULT_RELARXIV_ALL=(
   "rel-arxiv.paper-citation:1.0"
   "rel-arxiv.author-publication:1.0"
 )
+# rel-amazon: 4 entity tasks (2 binary churn + 2 regression LTV).
+# review-rating is autocomplete classification; not supported here.
+DEFAULT_RELAMAZON_ALL=(
+  "rel-amazon.user-churn:1.0"
+  "rel-amazon.item-churn:1.0"
+  "rel-amazon.user-ltv:1.0"
+  "rel-amazon.item-ltv:1.0"
+)
+# rel-avito: 5 entity tasks. ad-ctr (reg) + user-* (binary
+# forecasting) + 2 autocomplete binaries (searchstream-click,
+# searchinfo-isuserloggedon) joined under FULL_GRAPH=1.
+DEFAULT_RELAVITO_ALL=(
+  "rel-avito.ad-ctr:1.0"
+  "rel-avito.user-visits:1.0"
+  "rel-avito.user-clicks:1.0"
+  "rel-avito.searchstream-click:1.0"
+  "rel-avito.searchinfo-isuserloggedon:1.0"
+)
+# rel-stack: 3 entity tasks (RelBench v1 forecasting only; no v2
+# autocomplete on this dataset).
+DEFAULT_RELSTACK_ALL=(
+  "rel-stack.user-engagement:1.0"
+  "rel-stack.user-badge:1.0"
+  "rel-stack.post-votes:1.0"
+)
+# rel-trial: 7 entity tasks. The 3 forecasting RelBench v1 tasks
+# (study-outcome, study-adverse, site-success) plus 4 autocomplete
+# tasks (studies-enrollment reg, studies-has_dmc binary,
+# eligibilities-{adult,child} binary).
+DEFAULT_RELTRIAL_ALL=(
+  "rel-trial.study-outcome:1.0"
+  "rel-trial.study-adverse:1.0"
+  "rel-trial.site-success:1.0"
+  "rel-trial.studies-enrollment:1.0"
+  "rel-trial.studies-has_dmc:1.0"
+  "rel-trial.eligibilities-adult:1.0"
+  "rel-trial.eligibilities-child:1.0"
+)
+# rel-ratebeer: 5 entity tasks (3 churn binaries forecasting,
+# user-count reg, beer_ratings-total_score reg autocomplete).
+# user-beer-favorite / user-beer-liked / user-place-liked are
+# recommendation tasks and stay out of the launcher's defaults.
+DEFAULT_RELRATEBEER_ALL=(
+  "rel-ratebeer.beer-churn:1.0"
+  "rel-ratebeer.user-churn:1.0"
+  "rel-ratebeer.brewer-dormant:1.0"
+  "rel-ratebeer.user-count:1.0"
+  "rel-ratebeer.beer_ratings-total_score:1.0"
+)
 
 # Per-dataset default-task lookup so multi-source pretrain (and any
 # TARGET) can resolve auto-defaults without a chain of if/elif.
 _default_tasks_for() {
   case "$1" in
-    rel-f1)    printf '%s\n' "${DEFAULT_RELF1_ALL[@]}" ;;
-    rel-event) printf '%s\n' "${DEFAULT_RELEVENT_ALL[@]}" ;;
-    rel-hm)    printf '%s\n' "${DEFAULT_RELHM_ALL[@]}" ;;
-    rel-arxiv) printf '%s\n' "${DEFAULT_RELARXIV_ALL[@]}" ;;
-    *)         return 1 ;;
+    rel-f1)       printf '%s\n' "${DEFAULT_RELF1_ALL[@]}" ;;
+    rel-event)    printf '%s\n' "${DEFAULT_RELEVENT_ALL[@]}" ;;
+    rel-hm)       printf '%s\n' "${DEFAULT_RELHM_ALL[@]}" ;;
+    rel-arxiv)    printf '%s\n' "${DEFAULT_RELARXIV_ALL[@]}" ;;
+    rel-amazon)   printf '%s\n' "${DEFAULT_RELAMAZON_ALL[@]}" ;;
+    rel-avito)    printf '%s\n' "${DEFAULT_RELAVITO_ALL[@]}" ;;
+    rel-stack)    printf '%s\n' "${DEFAULT_RELSTACK_ALL[@]}" ;;
+    rel-trial)    printf '%s\n' "${DEFAULT_RELTRIAL_ALL[@]}" ;;
+    rel-ratebeer) printf '%s\n' "${DEFAULT_RELRATEBEER_ALL[@]}" ;;
+    *)            return 1 ;;
   esac
 }
 

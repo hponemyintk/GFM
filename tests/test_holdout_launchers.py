@@ -206,45 +206,78 @@ def test_holdout_dataset_eval_rejects_same_source_target(tmp_path):
     assert "holdout_task_dev.sh" in err  # redirect the user
 
 
-def test_holdout_dataset_eval_default_multi_source_to_relarxiv():
-    """Defaults: pretrain on rel-f1 + rel-event multi-source, adopt to
-    rel-arxiv. FULL_GRAPH=1 by default. Pins the p4d-ready config."""
+def test_holdout_dataset_eval_default_loo_to_relevent():
+    """Defaults: leave-one-dataset-out across all 9 supported RelBench v2
+    datasets, with TARGET=rel-event (6 tasks for richer adoption-side
+    eval). FULL_GRAPH=1 by default. Pins the p4d-ready config."""
     src = (SCRIPTS / "holdout_dataset_eval.sh").read_text()
-    assert 'SOURCE="${SOURCE:-rel-f1 rel-event}"' in src, (
-        "default SOURCE should be the multi-source rel-f1 + rel-event"
+    assert 'TARGET="${TARGET:-rel-event}"' in src, (
+        "default TARGET should be rel-event for the 6-task LOO holdout"
     )
-    assert 'TARGET="${TARGET:-rel-arxiv}"' in src, (
-        "default TARGET should be rel-arxiv"
+    # SUPPORTED_DATASETS lists every dataset whose entity binary/
+    # regression tasks the adoption pipeline supports today.
+    assert (
+        'SUPPORTED_DATASETS="${SUPPORTED_DATASETS:-rel-amazon rel-avito '
+        'rel-event rel-f1 rel-hm rel-stack rel-trial rel-arxiv '
+        'rel-ratebeer}"'
+    ) in src, (
+        "SUPPORTED_DATASETS must list all 9 RelBench v2 datasets with "
+        "supported entity binary/regression tasks (rel-mimic and "
+        "rel-salt have only multiclass / autocomplete-cls / rec tasks)"
+    )
+    # SOURCE auto-fills to "all SUPPORTED_DATASETS minus TARGET" when
+    # the user doesn't set it explicitly.
+    assert 'if [ -z "${SOURCE:-}" ]; then' in src, (
+        "SOURCE must auto-fill to all-but-TARGET when unset (LOO default)"
+    )
+    assert 'if [ "$_ds" != "$TARGET" ]; then' in src, (
+        "LOO loop must skip TARGET when building auto SOURCE list"
     )
     assert 'FULL_GRAPH="${FULL_GRAPH:-1}"' in src, (
-        "FULL_GRAPH default must be 1 so rel-event autocomplete tasks "
-        "(users-birthyear / event_interest-*) build cleanly"
+        "FULL_GRAPH default must be 1 so autocomplete tasks across the "
+        "LOO source set (transactions-price, results-position, etc.) "
+        "build cleanly"
     )
-    # rel-event lookup includes all 6 entity tasks (3 paper-safe + 3
-    # autocomplete unlocked by FULL_GRAPH=1).
+    # rel-event (default TARGET) lookup includes all 6 entity tasks.
     for tn in ("user-attendance", "user-repeat", "user-ignore",
                "event_interest-interested",
                "event_interest-not_interested", "users-birthyear"):
         assert f'"rel-event.{tn}:1.0"' in src, (
             f"rel-event default tasks must include {tn!r}"
         )
-    # rel-f1 lookup must cover all 5 entity binary/regression tasks
-    # (3 forecasting + 2 autocomplete). driver-circuit-compete is
-    # link-prediction and stays out of the launcher's defaults.
-    for tn in ("driver-position", "driver-dnf", "driver-top3",
-               "results-position", "qualifying-position"):
-        assert f'"rel-f1.{tn}:1.0"' in src, (
-            f"rel-f1 default tasks must include {tn!r}"
-        )
-    # rel-hm lookup must cover all 3 entity binary/regression tasks
-    # (2 forecasting + 1 autocomplete unlocked by FULL_GRAPH=1).
-    for tn in ("user-churn", "item-sales", "transactions-price"):
-        assert f'"rel-hm.{tn}:1.0"' in src, (
-            f"rel-hm default tasks must include {tn!r}"
-        )
-    # rel-arxiv lookup defined (paper-citation + author-publication).
-    assert '"rel-arxiv.paper-citation:1.0"' in src
-    assert '"rel-arxiv.author-publication:1.0"' in src
+    # Per-dataset task lookups must cover every supported entity
+    # binary/regression task per relbench. Pinned so future relbench
+    # additions / removals are caught at test time.
+    EXPECTED = {
+        "rel-f1": [
+            "driver-position", "driver-dnf", "driver-top3",
+            "results-position", "qualifying-position",
+        ],
+        "rel-hm": ["user-churn", "item-sales", "transactions-price"],
+        "rel-arxiv": ["paper-citation", "author-publication"],
+        "rel-amazon": [
+            "user-churn", "item-churn", "user-ltv", "item-ltv",
+        ],
+        "rel-avito": [
+            "ad-ctr", "user-visits", "user-clicks",
+            "searchstream-click", "searchinfo-isuserloggedon",
+        ],
+        "rel-stack": ["user-engagement", "user-badge", "post-votes"],
+        "rel-trial": [
+            "study-outcome", "study-adverse", "site-success",
+            "studies-enrollment", "studies-has_dmc",
+            "eligibilities-adult", "eligibilities-child",
+        ],
+        "rel-ratebeer": [
+            "beer-churn", "user-churn", "brewer-dormant",
+            "user-count", "beer_ratings-total_score",
+        ],
+    }
+    for ds, tasks in EXPECTED.items():
+        for tn in tasks:
+            assert f'"{ds}.{tn}:1.0"' in src, (
+                f"{ds} default tasks must include {tn!r}"
+            )
 
 
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):
