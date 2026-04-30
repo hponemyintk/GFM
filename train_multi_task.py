@@ -746,6 +746,12 @@ def run(args, local_rank: int, device, gpu_handle):
                             aggregation=args.loss_balance).to(device)
 
     world_size = dist.get_world_size()
+    # Secondary gloo process group for CPU-tensor gathers in eval. The
+    # primary NCCL group is GPU-only -- attempting dist.gather on a
+    # CPU tensor through it raises "No backend type associated with
+    # device type cpu" on p4d.24xlarge. Created once here, reused
+    # every epoch by _gather_preds_cpu below.
+    _gloo_group = dist.new_group(backend="gloo")
     optim = torch.optim.Adam(
         list(model.parameters()) + list(loss_fn.parameters()),
         lr=args.lr * world_size, weight_decay=args.weight_decay,
@@ -832,13 +838,16 @@ def run(args, local_rank: int, device, gpu_handle):
 
     def _gather_preds_cpu(local_idxs: np.ndarray, local_preds: np.ndarray,
                            dataset_len: int):
-        """Gather per-rank predictions to rank 0 over CPU tensors.
+        """Gather per-rank predictions to rank 0 via gloo (CPU tensors).
 
         ``dist.gather_object`` with the NCCL backend allocates GPU memory
         for the pickled buffers, which OOMs a 40 GB A100 once the CUDA
-        allocator cache is fragmented after a training epoch. Packing the
-        (idx, pred) pairs into a flat float64 CPU tensor and using
-        ``dist.gather`` keeps the transfer off the GPU entirely.
+        allocator cache is fragmented after a training epoch. Packing
+        the (idx, pred) pairs into a flat float64 CPU tensor and using
+        ``dist.gather`` over a gloo subgroup keeps the transfer off the
+        GPU entirely. NCCL itself rejects CPU tensors on p4d (\"No
+        backend type associated with device type cpu\"), so the
+        ``_gloo_group`` created above this function is required.
         """
         n_local = len(local_idxs)
         flat = torch.zeros(2 * n_local, dtype=torch.float64)
@@ -848,7 +857,7 @@ def run(args, local_rank: int, device, gpu_handle):
 
         local_size = torch.tensor([2 * n_local], dtype=torch.long)
         all_sizes = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
-        dist.all_gather(all_sizes, local_size)
+        dist.all_gather(all_sizes, local_size, group=_gloo_group)
 
         if local_rank == 0:
             gather_list = [torch.zeros(int(s.item()), dtype=torch.float64)
@@ -856,7 +865,7 @@ def run(args, local_rank: int, device, gpu_handle):
         else:
             gather_list = None
 
-        dist.gather(flat, gather_list=gather_list, dst=0)
+        dist.gather(flat, gather_list=gather_list, dst=0, group=_gloo_group)
 
         if local_rank == 0:
             full = np.full((dataset_len,), -100.0)
