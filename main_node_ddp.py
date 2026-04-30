@@ -87,6 +87,15 @@ parser.add_argument(
     default=os.path.expanduser("~/.cache/relbench_examples"),
 )
 parser.add_argument("--train_stage", type=str, default="finetune", choices=["finetune"])
+parser.add_argument(
+    "--backbone_init", type=str, default=None,
+    help="Path to a pretrained backbone weights file (e.g. "
+         "<run>/best_backbone.pt) to warm-start the model. Loads with "
+         "strict=False so per-table encoder buffers (which differ when "
+         "fine-tuning on a held-out target dataset) stay at fresh init "
+         "while shared transformer/centroid/etc. layers transfer. "
+         "When unset, the model trains from scratch (current behavior).",
+)
 # PR2 data-layer mode flags. Default keeps dev-kyaw / PR1 behavior intact.
 parser.add_argument(
     "--mode",
@@ -475,6 +484,30 @@ model = RelGT(
     sample_node_len=args.num_neighbors,
     args=args,
 ).to(device)
+
+if args.backbone_init is not None:
+    # Warm-start from a pretrained backbone. Load with strict=False:
+    # per-table NeighborTfsEncoder buffers differ between the source
+    # datasets (rel-f1 + rel-hm in our pretrains) and the target dataset
+    # of this fine-tune (rel-arxiv etc.), so source-side encoder keys
+    # are unexpected and target-side ones are missing -- both fine,
+    # they keep their fresh init. Shared transformer / centroid /
+    # global-attention layers carry the multi-source signal across.
+    state = torch.load(args.backbone_init, map_location=device,
+                       weights_only=False)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if local_rank == 0:
+        print(
+            f"[backbone_init] loaded from {args.backbone_init}: "
+            f"transferred={len(state) - len(unexpected)} "
+            f"unexpected={len(unexpected)} missing={len(missing)}"
+        )
+        # Keep the lists short in the log -- one prefix per group is
+        # enough to confirm the right things crossed over.
+        if missing:
+            print(f"[backbone_init]   sample missing: {missing[:3]}")
+        if unexpected:
+            print(f"[backbone_init]   sample unexpected: {unexpected[:3]}")
 
 # Before DDP initialization, cast problematic tensors
 for name, param in model.named_parameters():
