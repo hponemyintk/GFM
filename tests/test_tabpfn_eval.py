@@ -94,6 +94,35 @@ def test_maybe_project_unknown_raises():
         _maybe_project(train, train, train, kind="learned256")
 
 
+def test_maybe_project_auto_passes_raw_below_cap():
+    """auto: channels<=TABPFN_MAX_FEATURES -> identity passthrough."""
+    from tools.tabpfn_eval import _maybe_project, TABPFN_MAX_FEATURES
+    n, d = 32, 128
+    assert d <= TABPFN_MAX_FEATURES
+    train = np.random.randn(n, d)
+    val = np.random.randn(n // 2, d)
+    test = np.random.randn(n // 2, d)
+    t, v, te = _maybe_project(train, val, test, kind="auto")
+    # identity, not just same shape
+    np.testing.assert_array_equal(t, train)
+    np.testing.assert_array_equal(v, val)
+    np.testing.assert_array_equal(te, test)
+
+
+def test_maybe_project_auto_pca_caps_above_cap():
+    """auto: channels>TABPFN_MAX_FEATURES -> PCA at exactly the cap."""
+    from tools.tabpfn_eval import _maybe_project, TABPFN_MAX_FEATURES
+    n = TABPFN_MAX_FEATURES + 256       # need >cap rows so PCA can hit it
+    d = TABPFN_MAX_FEATURES + 100
+    train = np.random.randn(n, d)
+    val = np.random.randn(n // 4, d)
+    test = np.random.randn(n // 4, d)
+    t, v, te = _maybe_project(train, val, test, kind="auto")
+    assert t.shape == (n, TABPFN_MAX_FEATURES)
+    assert v.shape == (n // 4, TABPFN_MAX_FEATURES)
+    assert te.shape == (n // 4, TABPFN_MAX_FEATURES)
+
+
 def test_main_end_to_end_with_mocked_tabpfn(tmp_path):
     """End-to-end main() against synthetic embeddings, with TabPFN
     fit + predict mocked. Verifies the IO contract."""

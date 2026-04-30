@@ -5,19 +5,19 @@ Loads the .pt files produced by ``tools/extract_embeddings.py``
 test_emb, and reports metrics via the RelBench task's
 ``evaluate(...)``. No backbone gradient anywhere.
 
-TabPFN v2 supports up to ~500 input features, so backbone embeddings
-of channels=128 (laptop) or 512 (paper-config) fit raw -- no
-projection is required by the model. The ``--projector`` flag picks
-how (or whether) to reduce dimensionality:
+TabPFN v2 declines inputs above ~500 features, so backbone
+embeddings of channels=128 (laptop) or 512 (paper-config) fit raw,
+but channels=1024 etc. need a cap. The ``--projector`` flag:
 
-  * ``none``   -- pass raw embeddings as-is. Default; the right
-                  choice for channels<=500. Empirical sweep on
+  * ``auto``   -- DEFAULT. Pass raw if channels<=500; otherwise PCA
+                  to exactly 500 (fit on TRAIN only, no leakage).
+                  Adapts to whatever channels the backbone produces.
+  * ``none``   -- always pass raw, even above the cap. Useful as a
+                  baseline / forcing flag.
+  * ``pca64``  -- fixed PCA-64. Legacy default for v1 (~100-feature
+                  cap); kept for ablation. Empirical sweep on
                   rel-f1.driver-top3 (laptop, channels=128) showed
-                  this beats PCA-64 on every metric.
-  * ``pca64``  -- fit a PCA-64 on TRAIN embeddings only, project
-                  train/val/test through it. No leakage. Useful only
-                  if the backbone produces channels>500 (TabPFN v2's
-                  cap) or as a noise-reduction ablation.
+                  raw beats PCA-64 on every metric.
 
 Note: ``tabpfn>=2.0,<3`` is the recommended pin -- v7.x line gates
 model-weight downloads behind a TABPFN_TOKEN, which doesn't fit a
@@ -28,7 +28,7 @@ Usage::
     python -m tools.tabpfn_eval \\
         --embeddings_dir <run>/embeddings/ \\
         --dataset rel-f1 --task driver-top3 \\
-        --projector none \\
+        --projector auto \\
         --out <run>/tabpfn_eval.json
 """
 
@@ -69,6 +69,11 @@ def _infer_task_kind(labels) -> str:
     return "regression"
 
 
+# TabPFN v2 declines inputs above ~500 features. Auto-projector caps at
+# this width; raise it only if the upstream model actually supports more.
+TABPFN_MAX_FEATURES = 500
+
+
 def _maybe_project(
     train_emb: np.ndarray,
     val_emb: np.ndarray,
@@ -80,6 +85,22 @@ def _maybe_project(
     only (no val/test leakage)."""
     if kind == "none":
         return train_emb, val_emb, test_emb
+    if kind == "auto":
+        # Pass raw when channels fit; otherwise cap at TABPFN_MAX_FEATURES
+        # via PCA. No fixed knob to tune -- adapts to whatever channels
+        # the backbone produces.
+        d = train_emb.shape[1]
+        if d <= TABPFN_MAX_FEATURES:
+            return train_emb, val_emb, test_emb
+        from sklearn.decomposition import PCA
+        n_components = min(TABPFN_MAX_FEATURES, train_emb.shape[0], d)
+        pca = PCA(n_components=n_components)
+        pca.fit(train_emb)
+        return (
+            pca.transform(train_emb),
+            pca.transform(val_emb),
+            pca.transform(test_emb),
+        )
     if kind == "pca64":
         from sklearn.decomposition import PCA
         n_components = min(64, train_emb.shape[1], train_emb.shape[0])
@@ -144,7 +165,13 @@ def main(argv=None):
     p.add_argument("--embeddings_dir", required=True, type=str)
     p.add_argument("--dataset", required=True, type=str)
     p.add_argument("--task", required=True, type=str)
-    p.add_argument("--projector", default="none", choices=["none", "pca64"])
+    p.add_argument(
+        "--projector", default="auto",
+        choices=["none", "auto", "pca64"],
+        help="'auto' (default): pass raw embeddings if channels<=500, "
+             "else PCA-cap at 500. 'none': always raw. 'pca64': fixed "
+             "PCA-64 (legacy / ablation only).",
+    )
     p.add_argument("--out", type=str, default=None,
                    help="If set, save the metrics dict as JSON here.")
     args = p.parse_args(argv)

@@ -408,12 +408,12 @@ for f in "$META" "$WEIGHTS" "$SCHEMA"; do
 done
 
 # ----------------- 3+4. Per-holdout adoption: extract -> head -> tabpfn -----------------
-# TabPFN v2 supports up to ~500 input features, and our backbone
-# embeddings are 128-dim (laptop) or 512-dim (paper-config). Passing the
-# raw embedding wins on every metric we measured vs PCA-64 (laptop sweep:
-# AUC 0.862 vs 0.857), so default to no projection. Override with
-# PROJECTOR=pca64 if a future channels>500 backbone hits TabPFN's cap.
-PROJECTOR="${PROJECTOR:-none}"
+# 'auto': pass raw embeddings if channels<=500 (TabPFN v2's cap), else
+# PCA-cap at 500. No tuning needed across backbone widths; the laptop
+# (channels=128) and paper-config (channels=512) both pass raw, while a
+# hypothetical channels=1024 backbone would auto-PCA to 500. Override
+# with PROJECTOR=none / pca64 for ablations.
+PROJECTOR="${PROJECTOR:-auto}"
 HOLDOUT_DIRS=()
 
 echo
