@@ -204,6 +204,33 @@ def test_holdout_dataset_eval_rejects_same_source_target(tmp_path):
     assert "holdout_task_dev.sh" in err  # redirect the user
 
 
+def test_holdout_dataset_eval_default_multi_source_to_relarxiv():
+    """Defaults: pretrain on rel-f1 + rel-event multi-source, adopt to
+    rel-arxiv. FULL_GRAPH=1 by default. Pins the p4d-ready config."""
+    src = (SCRIPTS / "holdout_dataset_eval.sh").read_text()
+    assert 'SOURCE="${SOURCE:-rel-f1 rel-event}"' in src, (
+        "default SOURCE should be the multi-source rel-f1 + rel-event"
+    )
+    assert 'TARGET="${TARGET:-rel-arxiv}"' in src, (
+        "default TARGET should be rel-arxiv"
+    )
+    assert 'FULL_GRAPH="${FULL_GRAPH:-1}"' in src, (
+        "FULL_GRAPH default must be 1 so rel-event autocomplete tasks "
+        "(users-birthyear / event_interest-*) build cleanly"
+    )
+    # rel-event lookup includes all 6 entity tasks (3 paper-safe + 3
+    # autocomplete unlocked by FULL_GRAPH=1).
+    for tn in ("user-attendance", "user-repeat", "user-ignore",
+               "event_interest-interested",
+               "event_interest-not_interested", "users-birthyear"):
+        assert f'"rel-event.{tn}:1.0"' in src, (
+            f"rel-event default tasks must include {tn!r}"
+        )
+    # rel-arxiv lookup defined (paper-citation + author-publication).
+    assert '"rel-arxiv.paper-citation:1.0"' in src
+    assert '"rel-arxiv.author-publication:1.0"' in src
+
+
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):
     bash = _bash()
     p = SCRIPTS / "holdout_dataset_eval.sh"

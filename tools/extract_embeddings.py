@@ -156,11 +156,15 @@ def _maybe_register_new_dataset(backbone, args) -> None:
         return
     from tools.compute_dataset_stats import compute_dataset_stats
 
-    tf_store_root = os.path.join(args.cache_dir, "tf_store", args.dataset)
+    # Match build_tf_store / _build_cache: read from tf_store_full when
+    # the adoption build is in full-graph mode, else tf_store.
+    tf_suffix = "tf_store_full" if args.full_graph else "tf_store"
+    tf_store_root = os.path.join(args.cache_dir, tf_suffix, args.dataset)
     if not os.path.exists(tf_store_root):
         raise FileNotFoundError(
             f"--register_new_dataset requires a TF store at "
-            f"{tf_store_root}; run tools/build_tf_store.py first."
+            f"{tf_store_root}; run tools/build_tf_store.py "
+            f"{'--full_graph ' if args.full_graph else ''}first."
         )
     col_stats = compute_dataset_stats(
         tf_store_root, name_prefix=f"{args.dataset}::",
