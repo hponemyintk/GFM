@@ -830,9 +830,50 @@ def run(args, local_rank: int, device, gpu_handle):
                 break
         return (loss_accum / count) if count > 0 else float("inf")
 
+    def _gather_preds_cpu(local_idxs: np.ndarray, local_preds: np.ndarray,
+                           dataset_len: int):
+        """Gather per-rank predictions to rank 0 over CPU tensors.
+
+        ``dist.gather_object`` with the NCCL backend allocates GPU memory
+        for the pickled buffers, which OOMs a 40 GB A100 once the CUDA
+        allocator cache is fragmented after a training epoch. Packing the
+        (idx, pred) pairs into a flat float64 CPU tensor and using
+        ``dist.gather`` keeps the transfer off the GPU entirely.
+        """
+        n_local = len(local_idxs)
+        flat = torch.zeros(2 * n_local, dtype=torch.float64)
+        if n_local > 0:
+            flat[0::2] = torch.from_numpy(local_idxs.astype(np.float64))
+            flat[1::2] = torch.from_numpy(local_preds.astype(np.float64))
+
+        local_size = torch.tensor([2 * n_local], dtype=torch.long)
+        all_sizes = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+        dist.all_gather(all_sizes, local_size)
+
+        if local_rank == 0:
+            gather_list = [torch.zeros(int(s.item()), dtype=torch.float64)
+                           for s in all_sizes]
+        else:
+            gather_list = None
+
+        dist.gather(flat, gather_list=gather_list, dst=0)
+
+        if local_rank == 0:
+            full = np.full((dataset_len,), -100.0)
+            for buf in gather_list:
+                arr = buf.numpy()
+                for j in range(0, len(arr), 2):
+                    full[int(arr[j])] = arr[j + 1]
+            return full
+        return None
+
     @torch.no_grad()
     def _eval(loader_dict, split, epoch):
         model.eval()
+        # Reclaim cached allocator blocks left over from training so
+        # NCCL's internal cudaMalloc has headroom; pairs with the
+        # CPU-side gather below.
+        torch.cuda.empty_cache()
         per_task_metrics: Dict[int, dict] = {}
         for ti, loader in loader_dict.items():
             if loader.sampler is not None and hasattr(loader.sampler, "set_epoch"):
@@ -868,15 +909,8 @@ def run(args, local_rank: int, device, gpu_handle):
                 idxs_local.append(batch["global_idx"].cpu().numpy())
             local_preds = np.concatenate(preds_local) if preds_local else np.array([])
             local_idxs = np.concatenate(idxs_local) if idxs_local else np.array([])
-            gathered = [None] * world_size if local_rank == 0 else None
-            dist.gather_object((local_idxs, local_preds),
-                               object_gather_list=gathered, dst=0)
+            full = _gather_preds_cpu(local_idxs, local_preds, len(loader.dataset))
             if local_rank == 0:
-                full = np.full((len(loader.dataset),), -100.0)
-                for g in gathered:
-                    g_i, g_p = g
-                    for i, p in zip(g_i, g_p):
-                        full[i] = p
                 metrics = task_objs[ti].evaluate(
                     full, task_objs[ti].get_table(split)
                 ) if split == "val" else task_objs[ti].evaluate(full)
