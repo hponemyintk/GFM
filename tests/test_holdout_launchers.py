@@ -280,6 +280,53 @@ def test_holdout_dataset_eval_default_loo_to_relevent():
             )
 
 
+def test_holdout_dataset_eval_runs_extracts_in_parallel():
+    """Adoption phase must dispatch up to NPROC concurrent extract jobs,
+    each on its own GPU and with its own --precomputed_dir so the
+    per-row HDF5 caches don't race. Pinned via source-grep so a
+    revert to the sequential path fails the test."""
+    src = (SCRIPTS / "holdout_dataset_eval.sh").read_text()
+    # Phase markers.
+    assert "Phase A: parallel extracts" in src, (
+        "adoption phase must announce a parallel extract phase"
+    )
+    assert "Phase B: finetune_head + tabpfn_eval" in src, (
+        "adoption phase must run finetune + tabpfn after extracts"
+    )
+    # GPU dispatcher primitives.
+    assert "_acquire_gpu" in src and "_reap_finished" in src, (
+        "GPU pool dispatcher must be defined"
+    )
+    assert 'CUDA_VISIBLE_DEVICES="$GPU"' in src, (
+        "each parallel extract must pin to a specific GPU"
+    )
+    # Per-(task, seed) precomputed_dir override prevents shared HDF5 races.
+    assert '--precomputed_dir "$PRECOMP_DIR"' in src, (
+        "extract_embeddings must be invoked with a per-seed "
+        "--precomputed_dir so concurrent jobs don't race on the "
+        "shared HDF5 cache"
+    )
+    assert 'PRECOMP_DIR="$SEED_DIR/precomputed"' in src, (
+        "PRECOMP_DIR must scope under the per-seed dir"
+    )
+
+
+def test_extract_embeddings_supports_precomputed_dir_flag():
+    """The --precomputed_dir override is wired in argparse so the
+    launcher can run several extracts in parallel without sharing
+    HDF5 cache directories."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ee", str(SCRIPTS.parent / "tools" / "extract_embeddings.py"),
+    )
+    src = (SCRIPTS.parent / "tools" / "extract_embeddings.py").read_text()
+    assert '--precomputed_dir' in src
+    assert "_resolve_precomputed_dir" in src, (
+        "_resolve_precomputed_dir helper must exist so callers can "
+        "verify the override path is honored"
+    )
+
+
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):
     bash = _bash()
     p = SCRIPTS / "holdout_dataset_eval.sh"

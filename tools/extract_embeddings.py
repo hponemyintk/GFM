@@ -45,6 +45,21 @@ from torch.utils.data.distributed import DistributedSampler
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 
+def _resolve_precomputed_dir(args) -> str:
+    """Pick the directory the per-row neighbor HDF5 cache lives under.
+
+    ``--precomputed_dir`` overrides everything; when unset we fall back
+    to ``<cache_dir>/precomputed/<dataset>/<task>``. The override lets
+    the launcher run several extractions in parallel (one per seed /
+    one per task) without them racing on the same shared HDF5 files.
+    """
+    if getattr(args, "precomputed_dir", None):
+        return args.precomputed_dir
+    return os.path.join(
+        args.cache_dir, "precomputed", args.dataset, args.task,
+    )
+
+
 def _build_loader(args, split: str, cache, task) -> Tuple[object, object]:
     """Construct (dataset, loader) for one split. Mirrors the per-task
     val/test loader construction in train_multi_task.py:606-619 so the
@@ -52,13 +67,12 @@ def _build_loader(args, split: str, cache, task) -> Tuple[object, object]:
     """
     from gfm_data import TaskTokens, collate_single_task
 
+    precomputed_dir = _resolve_precomputed_dir(args)
     tok = TaskTokens(
         cache=cache, task=task, K=args.num_neighbors,
         split=split, mode=args.mode,
         precompute=args.precompute,
-        precomputed_dir=os.path.join(
-            args.cache_dir, "precomputed", args.dataset, args.task,
-        ),
+        precomputed_dir=precomputed_dir,
         shards_dir=None,
         train_stage="finetune",
     )
@@ -71,9 +85,7 @@ def _build_loader(args, split: str, cache, task) -> Tuple[object, object]:
             cache=cache, task=task, K=args.num_neighbors,
             split="train", mode=args.mode,
             precompute=args.precompute,
-            precomputed_dir=os.path.join(
-                args.cache_dir, "precomputed", args.dataset, args.task,
-            ),
+            precomputed_dir=precomputed_dir,
             shards_dir=None,
             train_stage="finetune",
         )
@@ -278,6 +290,14 @@ def main(argv=None):
         "--split", default="all", choices=["train", "val", "test", "all"],
     )
     p.add_argument("--out_dir", required=True, type=str)
+    p.add_argument(
+        "--precomputed_dir", type=str, default=None,
+        help="Override the per-row neighbor HDF5 cache location. Default "
+             "is <cache_dir>/precomputed/<dataset>/<task>. Pass a unique "
+             "path per parallel extraction (e.g. one per seed) so several "
+             "extracts can run concurrently without racing on the same "
+             "HDF5 files.",
+    )
     p.add_argument("--num_neighbors", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=2)

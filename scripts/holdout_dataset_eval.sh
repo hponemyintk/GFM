@@ -504,42 +504,85 @@ fi
 # Parse TARGET_TASKS_CSV "ds.task:weight,..." -> just the task names.
 IFS=',' read -ra TGT_PAIRS <<< "$TARGET_TASKS_CSV"
 TASK_SUMMARIES=()
+TASK_NAMES=()
 for pair in "${TGT_PAIRS[@]}"; do
-  # Strip optional weight, then leading "<ds>." prefix.
   pair_no_weight="${pair%%:*}"
   task_name="${pair_no_weight#${TARGET}.}"
-
   TASK_DIR="$RUN_DIR/${task_name}"
   mkdir -p "$TASK_DIR"
-
-  echo
-  echo "=== TARGET task: ${TARGET}.${task_name} (seeds=[${SEED_LIST[*]}]) ==="
-
+  TASK_SUMMARIES+=("$TASK_DIR")
+  TASK_NAMES+=("$task_name")
   for ADOPT_SEED in "${SEED_LIST[@]}"; do
-    SEED_DIR="$TASK_DIR/seed${ADOPT_SEED}"
-    EMB_DIR="$SEED_DIR/embeddings"
-    FT_DIR="$SEED_DIR/finetune_head"
-    TABPFN_DIR="$SEED_DIR/tabpfn"
-    mkdir -p "$EMB_DIR" "$FT_DIR" "$TABPFN_DIR"
-    echo
-    echo "  ---- seed=$ADOPT_SEED ----"
+    mkdir -p \
+      "$TASK_DIR/seed${ADOPT_SEED}/embeddings" \
+      "$TASK_DIR/seed${ADOPT_SEED}/finetune_head" \
+      "$TASK_DIR/seed${ADOPT_SEED}/tabpfn"
+  done
+done
 
-    EMB_LOG="$EMB_DIR/extract.log"
-    if [ ! -f "$EMB_DIR/test.pt" ]; then
-      # Wipe the cached HDF5 of per-row neighbor lists so the
-      # sampler regenerates them under the new RNG. Different
-      # ($TARGET, $task_name) pairs have isolated dirs; we only
-      # touch this task's. cache_dir has the FULL_GRAPH suffix
-      # built into the path indirectly (extract_embeddings writes
-      # to precomputed/<dataset>/<task>/<K>/), so K is part of the
-      # path and the wipe matches whichever K we're running.
-      PRECOMP_DIR="$CACHE/precomputed/$TARGET/$task_name/$K"
-      if [ -d "$PRECOMP_DIR" ]; then
-        echo "    [extract] wiping $PRECOMP_DIR (per-seed re-sample)"
-        rm -rf "$PRECOMP_DIR"
+# ---- Phase A: parallel extracts, one per (task, seed), each on its own GPU ----
+# GPU pool: 0..NPROC-1. Each parallel extract picks a free GPU via
+# CUDA_VISIBLE_DEVICES. Per-(task, seed) precomputed_dir keeps the
+# HDF5 caches isolated so concurrent jobs never race.
+GPU_POOL=()
+for ((_g=0; _g<NPROC; _g++)); do GPU_POOL+=("$_g"); done
+declare -A PID_GPU
+declare -A PID_DESC
+declare -A PID_LOG
+
+_reap_finished() {
+  local pid
+  for pid in "${!PID_GPU[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null
+      local rc=$?
+      GPU_POOL+=("${PID_GPU[$pid]}")
+      if [ "$rc" -ne 0 ]; then
+        echo "  WARN: extract ${PID_DESC[$pid]} (gpu=${PID_GPU[$pid]}) FAILED rc=$rc; see ${PID_LOG[$pid]}" >&2
+      else
+        echo "  [extract] ${PID_DESC[$pid]} done (gpu=${PID_GPU[$pid]})"
       fi
-      echo "    [extract] register_new_dataset on $TARGET, then forward (seed=$ADOPT_SEED)"
-      python3 -m tools.extract_embeddings \
+      unset "PID_GPU[$pid]"
+      unset "PID_DESC[$pid]"
+      unset "PID_LOG[$pid]"
+    fi
+  done
+}
+
+_acquire_gpu() {
+  while [ ${#GPU_POOL[@]} -eq 0 ]; do
+    _reap_finished
+    [ ${#GPU_POOL[@]} -eq 0 ] && sleep 1
+  done
+  local g="${GPU_POOL[0]}"
+  GPU_POOL=("${GPU_POOL[@]:1}")
+  echo "$g"
+}
+
+_wait_all() {
+  while [ ${#PID_GPU[@]} -gt 0 ]; do
+    _reap_finished
+    [ ${#PID_GPU[@]} -gt 0 ] && sleep 1
+  done
+}
+
+echo
+echo "=== Phase A: parallel extracts (NPROC=$NPROC GPUs, $((${#TGT_PAIRS[@]} * ${#SEED_LIST[@]})) jobs) ==="
+for task_name in "${TASK_NAMES[@]}"; do
+  for ADOPT_SEED in "${SEED_LIST[@]}"; do
+    SEED_DIR="$RUN_DIR/${task_name}/seed${ADOPT_SEED}"
+    EMB_DIR="$SEED_DIR/embeddings"
+    EMB_LOG="$EMB_DIR/extract.log"
+    if [ -f "$EMB_DIR/test.pt" ]; then
+      echo "  [extract] ${task_name} seed=$ADOPT_SEED cached"
+      continue
+    fi
+    GPU=$(_acquire_gpu)
+    PRECOMP_DIR="$SEED_DIR/precomputed"
+    desc="${task_name} seed=$ADOPT_SEED"
+    echo "  [extract] $desc launching on gpu=$GPU"
+    (
+      CUDA_VISIBLE_DEVICES="$GPU" python3 -u -m tools.extract_embeddings \
         --backbone_meta "$META" \
         --backbone_weights "$WEIGHTS" \
         --backbone_schema "$SCHEMA" \
@@ -551,13 +594,37 @@ for pair in "${TGT_PAIRS[@]}"; do
         --cache_dir "$CACHE" \
         --use_tf_store \
         --seed "$ADOPT_SEED" \
-        --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG \
-        > "$EMB_LOG" 2>&1
-    else
-      echo "    [extract] embeddings cached for seed=$ADOPT_SEED"
-    fi
+        --precomputed_dir "$PRECOMP_DIR" \
+        --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG
+    ) > "$EMB_LOG" 2>&1 &
+    pid=$!
+    PID_GPU[$pid]="$GPU"
+    PID_DESC[$pid]="$desc"
+    PID_LOG[$pid]="$EMB_LOG"
+  done
+done
+_wait_all
+echo "=== Phase A complete ==="
 
-    echo "    [finetune] linear head (seed=$ADOPT_SEED)"
+# ---- Phase B: finetune_head + tabpfn_eval (cheap, sequential) ----
+# Each finetune is ~minutes and tabpfn ~10-20 min on this scale; the
+# bottleneck was the extract above. Stay sequential here so we don't
+# fight the multi-GPU phase A and so logs stay readable.
+echo
+echo "=== Phase B: finetune_head + tabpfn_eval (sequential) ==="
+for task_name in "${TASK_NAMES[@]}"; do
+  echo
+  echo "  ${TARGET}.${task_name}"
+  for ADOPT_SEED in "${SEED_LIST[@]}"; do
+    SEED_DIR="$RUN_DIR/${task_name}/seed${ADOPT_SEED}"
+    EMB_DIR="$SEED_DIR/embeddings"
+    FT_DIR="$SEED_DIR/finetune_head"
+    TABPFN_DIR="$SEED_DIR/tabpfn"
+    if [ ! -f "$EMB_DIR/test.pt" ]; then
+      echo "    seed=$ADOPT_SEED: extract missing -- skipping (see $EMB_DIR/extract.log)"
+      continue
+    fi
+    echo "    seed=$ADOPT_SEED finetune"
     python3 -m tools.finetune_head \
       --embeddings_dir "$EMB_DIR" \
       --dataset "$TARGET" --task "$task_name" \
@@ -565,9 +632,8 @@ for pair in "${TGT_PAIRS[@]}"; do
       --seed "$ADOPT_SEED" \
       --out "$FT_DIR/finetuned.pt" \
       > "$FT_DIR/finetune.log" 2>&1 || \
-        echo "    WARN: finetune_head failed; see $FT_DIR/finetune.log"
-
-    echo "    [tabpfn] post-hoc (seed=$ADOPT_SEED)"
+        echo "      WARN: finetune_head failed; see $FT_DIR/finetune.log"
+    echo "    seed=$ADOPT_SEED tabpfn"
     python3 -m tools.tabpfn_eval \
       --embeddings_dir "$EMB_DIR" \
       --dataset "$TARGET" --task "$task_name" \
@@ -575,10 +641,8 @@ for pair in "${TGT_PAIRS[@]}"; do
       --seed "$ADOPT_SEED" \
       --out "$TABPFN_DIR/tabpfn.json" \
       > "$TABPFN_DIR/tabpfn.log" 2>&1 || \
-        echo "    WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
+        echo "      WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
   done
-
-  TASK_SUMMARIES+=("$TASK_DIR")
 done
 
 # ----------------- 4. Aggregate (per-task mean +/- SD across seeds) -----------------
