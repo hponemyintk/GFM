@@ -244,6 +244,12 @@ def precompute_split(cache, task, split, K, out_dir, shard_size, workers=1):
             initializer=_worker_init,
             initargs=(cache, seed_node_type_prefixed, type_to_id, K),
         )
+    else:
+        # Sequential path: set the module globals once, here, so
+        # _worker_sample can be reused across every shard without
+        # re-binding _W_CACHE / _W_SEED_TYPE / _W_TYPE_TO_ID / _W_K
+        # on each iteration.
+        _worker_init(cache, seed_node_type_prefixed, type_to_id, K)
 
     try:
         for s_idx in range(writer.num_shards):
@@ -273,10 +279,7 @@ def precompute_split(cache, task, split, K, out_dir, shard_size, workers=1):
                 work.append((k, node_idx, seed_t))
 
             if pool is None:
-                # Sequential: keep the dev-kyaw / pre-PR loop intact.
-                _worker_init(
-                    cache, seed_node_type_prefixed, type_to_id, K,
-                )
+                # Sequential: globals already set above.
                 for item in tqdm(work, desc=f"shard {s_idx:04d}", leave=False):
                     k, t_row, i_row, h_row, ti_row, edge_index = (
                         _worker_sample(item)
