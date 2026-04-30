@@ -218,9 +218,11 @@ PARALLEL_TF_BUILDS="${PARALLEL_TF_BUILDS:-$PARALLEL_BUILDS}"
 _default_shard_builds=$(( NPROC < 8 ? NPROC : 8 ))
 PARALLEL_SHARD_BUILDS="${PARALLEL_SHARD_BUILDS:-$_default_shard_builds}"
 # Intra-task parallelism: workers per builder for sample sampling.
-# Default 1 keeps existing behavior; set SHARD_WORKERS=10 for the full
-# p4d 96-core utilization (10*8=80 worker procs, ~83% of vCPUs).
-SHARD_WORKERS="${SHARD_WORKERS:-1}"
+# Default 8 -> 8 builders x 8 workers = 64 fork procs (~67% of p4d's
+# 96 vCPUs); leaves headroom for the OS / page cache / etc. Bump to
+# SHARD_WORKERS=10 (80 procs, ~83% of vCPUs) for max throughput, or
+# drop to 1 (sequential, no intra-task fork) on memory-tight pods.
+SHARD_WORKERS="${SHARD_WORKERS:-8}"
 
 mkdir -p "$OUT_DIR" "$TF_STORE" "$SHARDS"
 
