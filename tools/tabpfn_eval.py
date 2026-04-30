@@ -73,6 +73,45 @@ def _infer_task_kind(labels) -> str:
 # this width; raise it only if the upstream model actually supports more.
 TABPFN_MAX_FEATURES = 500
 
+# TabPFN v2's in-context budget is 10k rows. Above this the package raises
+# ValueError unless ``ignore_pretraining_limits=True`` is set, and even
+# then the inference cost grows quadratically. We subsample on the
+# Python side rather than override the package guardrail.
+TABPFN_MAX_TRAIN_SAMPLES = 10000
+
+
+def _maybe_subsample(
+    emb: np.ndarray,
+    labels: np.ndarray,
+    *,
+    n_max: int,
+    task_kind: str,
+    seed: int = 0,
+):
+    """Cap train support set at ``n_max`` rows.
+
+    Binary: stratified so positive-class share survives -- uniform
+    sampling would distort ROC-AUC on imbalanced labels (rel-arxiv
+    paper-citation is ~5% positive). Regression: uniform.
+    """
+    n = emb.shape[0]
+    if n <= n_max:
+        return emb, labels
+    rng = np.random.default_rng(seed)
+    if task_kind == "binary":
+        pos_idx = np.where(labels > 0.5)[0]
+        neg_idx = np.where(labels <= 0.5)[0]
+        share = len(pos_idx) / n
+        n_pos = int(round(share * n_max))
+        n_neg = n_max - n_pos
+        sel_pos = rng.choice(pos_idx, size=min(n_pos, len(pos_idx)), replace=False)
+        sel_neg = rng.choice(neg_idx, size=min(n_neg, len(neg_idx)), replace=False)
+        sel = np.concatenate([sel_pos, sel_neg])
+        rng.shuffle(sel)
+    else:
+        sel = rng.choice(n, size=n_max, replace=False)
+    return emb[sel], labels[sel]
+
 
 def _maybe_project(
     train_emb: np.ndarray,
@@ -114,27 +153,53 @@ def _maybe_project(
     raise ValueError(f"unknown projector kind: {kind!r}")
 
 
-def _fit_predict(train_emb, train_labels, test_emb, *, task_kind: str):
+def _fit_predict(
+    train_emb, train_labels, test_emb, *, task_kind: str,
+    test_chunk_size: int = 10000,
+    device: str = "auto",
+    n_estimators: int = 4,
+):
     """Fit TabPFN on train, predict on test. Returns predictions
     (probabilities for binary, scalar for regression).
+
+    Test is chunked: TabPFN's attention spans support_set x test_batch
+    so a 193k-row test set against a 10k support set can OOM a 12 GB
+    GPU in one shot. Chunking is exact (no approximation), it just
+    splits the in-context inference into independent passes.
+
+    ``device='cpu'`` is the safe fallback when even chunked GPU
+    inference OOMs (e.g. 12 GB laptop GPU). ``memory_saving_mode=True``
+    lets TabPFN auto-tune its own batch sizes on top.
 
     Imports tabpfn lazily so the test suite can mock it without the
     real package installed in CI.
     """
     if task_kind == "binary":
         from tabpfn import TabPFNClassifier
-        clf = TabPFNClassifier()
+        clf = TabPFNClassifier(
+            device=device, n_estimators=n_estimators,
+            memory_saving_mode=True,
+        )
         clf.fit(train_emb, train_labels.astype(int))
-        proba = clf.predict_proba(test_emb)
-        # Probability of the positive class.
-        if proba.ndim == 2 and proba.shape[1] >= 2:
-            return proba[:, 1]
-        return proba.ravel()
+        preds = []
+        for i in range(0, len(test_emb), test_chunk_size):
+            proba = clf.predict_proba(test_emb[i:i + test_chunk_size])
+            if proba.ndim == 2 and proba.shape[1] >= 2:
+                preds.append(proba[:, 1])
+            else:
+                preds.append(proba.ravel())
+        return np.concatenate(preds)
     else:
         from tabpfn import TabPFNRegressor
-        reg = TabPFNRegressor()
+        reg = TabPFNRegressor(
+            device=device, n_estimators=n_estimators,
+            memory_saving_mode=True,
+        )
         reg.fit(train_emb, train_labels)
-        return reg.predict(test_emb)
+        preds = []
+        for i in range(0, len(test_emb), test_chunk_size):
+            preds.append(reg.predict(test_emb[i:i + test_chunk_size]))
+        return np.concatenate(preds)
 
 
 def _final_evaluate(
@@ -172,6 +237,27 @@ def main(argv=None):
              "else PCA-cap at 500. 'none': always raw. 'pca64': fixed "
              "PCA-64 (legacy / ablation only).",
     )
+    p.add_argument(
+        "--max_train_samples", type=int, default=TABPFN_MAX_TRAIN_SAMPLES,
+        help="Cap train support set at N rows (TabPFN v2 limit is 10000). "
+             "Binary tasks subsample stratified, regression uniform.",
+    )
+    p.add_argument(
+        "--device", default="auto",
+        help="'auto' (default): GPU if available. 'cpu': force CPU. "
+             "Use 'cpu' on small GPUs (~12 GB) where chunked GPU "
+             "inference still OOMs.",
+    )
+    p.add_argument(
+        "--n_estimators", type=int, default=4,
+        help="TabPFN ensemble size (default 4). Lower reduces memory "
+             "and runtime, at small accuracy cost.",
+    )
+    p.add_argument(
+        "--test_chunk_size", type=int, default=10000,
+        help="Test rows per TabPFN inference pass. Drop this if GPU "
+             "OOMs even at chunk_size=10k.",
+    )
     p.add_argument("--out", type=str, default=None,
                    help="If set, save the metrics dict as JSON here.")
     args = p.parse_args(argv)
@@ -199,8 +285,23 @@ def main(argv=None):
     )
     print(f"[tabpfn] post-projection train={train_emb.shape}")
 
+    n_train_full = train_emb.shape[0]
+    train_emb, train_lab = _maybe_subsample(
+        train_emb, train_lab,
+        n_max=args.max_train_samples,
+        task_kind=task_kind,
+    )
+    if train_emb.shape[0] != n_train_full:
+        print(
+            f"[tabpfn] subsampled train {n_train_full} -> "
+            f"{train_emb.shape[0]} (cap={args.max_train_samples}, "
+            f"task_kind={task_kind})"
+        )
+
     test_pred = _fit_predict(
         train_emb, train_lab, test_emb, task_kind=task_kind,
+        test_chunk_size=args.test_chunk_size,
+        device=args.device, n_estimators=args.n_estimators,
     )
 
     metrics = _final_evaluate(
@@ -218,6 +319,8 @@ def main(argv=None):
                 "projector": args.projector,
                 "channels_in": int(train["channels"]),
                 "channels_post_projector": int(train_emb.shape[1]),
+                "n_train_full": int(n_train_full),
+                "n_train_used": int(train_emb.shape[0]),
                 "test_metrics": metrics,
             }, f, indent=2)
         print(f"[tabpfn] saved -> {out_path}")

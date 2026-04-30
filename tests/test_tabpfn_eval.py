@@ -123,6 +123,48 @@ def test_maybe_project_auto_pca_caps_above_cap():
     assert te.shape == (n // 4, TABPFN_MAX_FEATURES)
 
 
+def test_maybe_subsample_passthrough_below_cap():
+    """If n <= cap, the subsample is the identity."""
+    from tools.tabpfn_eval import _maybe_subsample
+    rng = np.random.default_rng(0)
+    emb = rng.standard_normal((100, 8)).astype(np.float32)
+    lab = (rng.standard_normal(100) > 0).astype(np.float32)
+    e2, l2 = _maybe_subsample(emb, lab, n_max=10000, task_kind="binary")
+    np.testing.assert_array_equal(e2, emb)
+    np.testing.assert_array_equal(l2, lab)
+
+
+def test_maybe_subsample_binary_preserves_class_share():
+    """Stratified subsample keeps positive-class share within ~1pp of
+    the source. Random sampling on a 5%-positive set would frequently
+    miss the share by several pp -- this guards the AUC computation."""
+    from tools.tabpfn_eval import _maybe_subsample
+    rng = np.random.default_rng(7)
+    n = 50000
+    emb = rng.standard_normal((n, 4)).astype(np.float32)
+    # 5% positive (matches rel-arxiv.paper-citation prevalence).
+    lab = (rng.random(n) < 0.05).astype(np.float32)
+    src_share = lab.mean()
+    e2, l2 = _maybe_subsample(emb, lab, n_max=10000, task_kind="binary")
+    assert e2.shape == (10000, 4)
+    assert l2.shape == (10000,)
+    new_share = l2.mean()
+    assert abs(new_share - src_share) < 0.01, (
+        f"share drift {src_share:.4f}->{new_share:.4f} too large"
+    )
+
+
+def test_maybe_subsample_regression_uniform():
+    """Regression: uniform sample, returns shape (n_max, d)."""
+    from tools.tabpfn_eval import _maybe_subsample
+    rng = np.random.default_rng(3)
+    emb = rng.standard_normal((20000, 16)).astype(np.float32)
+    lab = rng.standard_normal(20000).astype(np.float32)
+    e2, l2 = _maybe_subsample(emb, lab, n_max=10000, task_kind="regression")
+    assert e2.shape == (10000, 16)
+    assert l2.shape == (10000,)
+
+
 def test_main_end_to_end_with_mocked_tabpfn(tmp_path):
     """End-to-end main() against synthetic embeddings, with TabPFN
     fit + predict mocked. Verifies the IO contract."""
@@ -155,6 +197,12 @@ def test_main_end_to_end_with_mocked_tabpfn(tmp_path):
 
     # Mock the TabPFN classifier so we don't pull the real package.
     class _StubClassifier:
+        def __init__(self, **kwargs):
+            # Accept arbitrary kwargs (device, n_estimators,
+            # memory_saving_mode, ...) -- the real TabPFNClassifier
+            # uses kwargs and our wrapper passes a few; tests should
+            # not care which.
+            self._kwargs = kwargs
         def fit(self, X, y): pass
         def predict_proba(self, X):
             # Deterministic positive-class prob in [0, 1].
