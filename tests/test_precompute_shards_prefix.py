@@ -84,5 +84,81 @@ def test_cache_with_prefix_yields_prefixed_node_types():
             f"expected prefixed type name, got {nt!r}"
         )
     # node_type_to_index must use the prefixed names as keys.
-    for prefixed in cache.node_types:
+    for prefixed in cache.node_type_to_index:
         assert prefixed in cache.node_type_to_index
+
+
+def test_parse_args_accepts_workers():
+    """The --workers CLI flag is wired in argparse and respects the
+    SHARD_WORKERS env var when not passed explicitly."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ps", str(Path(__file__).resolve().parents[1] / "tools" / "precompute_shards.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    # Explicit --workers wins.
+    import sys as _sys
+    saved = _sys.argv
+    try:
+        _sys.argv = [
+            "ps", "--dataset", "x", "--task", "y", "--out_dir", "/tmp/z",
+            "--workers", "4",
+        ]
+        ns = mod.parse_args()
+        assert ns.workers == 4
+    finally:
+        _sys.argv = saved
+
+
+def test_workers_default_reads_shard_workers_env(monkeypatch):
+    """Default --workers picks up SHARD_WORKERS so pretrain_p4d.sh can
+    set it once and have the per-task subprocess inherit it."""
+    monkeypatch.setenv("SHARD_WORKERS", "7")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ps_env", str(Path(__file__).resolve().parents[1] / "tools" / "precompute_shards.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    import sys as _sys
+    saved = _sys.argv
+    try:
+        _sys.argv = [
+            "ps", "--dataset", "x", "--task", "y", "--out_dir", "/tmp/z",
+        ]
+        ns = mod.parse_args()
+        assert ns.workers == 7
+    finally:
+        _sys.argv = saved
+
+
+def test_worker_sample_is_deterministic_given_seed():
+    """Each sample's RNG is self-seeded by hash((seed_type, idx, t, K)),
+    so calling _worker_sample twice with the same input must yield the
+    same packed row -- this is what guarantees bit-identical shards
+    regardless of pool worker count or completion order."""
+    from tests._fake_heterodata import make_toy_graph
+    from gfm_data.graph_cache import DatasetGraphCache
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "ps_det", str(Path(__file__).resolve().parents[1] / "tools" / "precompute_shards.py"),
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    g = make_toy_graph()
+    cache = DatasetGraphCache(data=g, undirected=True, name_prefix="rel-foo")
+    seed_type = next(iter(cache.node_types))
+    type_to_id = cache.node_type_to_index
+    K = 8
+
+    mod._worker_init(cache, seed_type, type_to_id, K)
+    a = mod._worker_sample((0, 0, 0.0))
+    b = mod._worker_sample((0, 0, 0.0))
+    # (k, types, indices, hops, times, edge_index)
+    assert a[0] == b[0]
+    assert (a[1] == b[1]).all()
+    assert (a[2] == b[2]).all()
+    assert (a[3] == b[3]).all()
+    assert (a[4] == b[4]).all()

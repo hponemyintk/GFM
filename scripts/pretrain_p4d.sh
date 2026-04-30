@@ -196,25 +196,36 @@ SHARD_SIZE="${SHARD_SIZE:-50000}"
 # Phase 1 (TF memmap) and Phase 2 (shards) have different bottlenecks:
 #   * Phase 1 is GPU-bound (text embedding). Default concurrency
 #     PARALLEL_TF_BUILDS = NPROC, one A100 per dataset.
-#   * Phase 2 is RAM-bound. Each process loads make_pkey_fkey_graph
-#     and even with the post-load TF drop, peak per-process RSS can
-#     still hit ~5-10 GB on rel-event during seed-pass-build. With
-#     PARALLEL_BUILDS=8 concurrent shard builders that's 40-80 GB --
-#     fine on p4d's 1.1 TB but easy to OOM on smaller pods. Default
-#     PARALLEL_SHARD_BUILDS = min(NPROC, 4) keeps it conservative.
+#   * Phase 2 is CPU-bound (per-row neighbor sampling). Two-level
+#     parallelism: PARALLEL_SHARD_BUILDS picks how many tasks to
+#     build concurrently (each process owns one cache + steady-state
+#     ~3-5 GB on rel-event after the TF drop), and SHARD_WORKERS
+#     picks how many fork-workers each builder spins up to share
+#     that cache via copy-on-write. Default 8 builders x 1 worker
+#     matches the prior behavior; SHARD_WORKERS=10 saturates
+#     p4d.24xlarge's 96 vCPUs (~12-16x speedup, see
+#     speedup-precompute-shards.md).
 #
 # Both can be overridden independently. PARALLEL_BUILDS is kept as a
 # back-compat catch-all that overrides BOTH if neither phase-specific
 # var is set.
 PARALLEL_BUILDS="${PARALLEL_BUILDS:-$NPROC}"
 PARALLEL_TF_BUILDS="${PARALLEL_TF_BUILDS:-$PARALLEL_BUILDS}"
-_default_shard_builds=$(( NPROC < 4 ? NPROC : 4 ))
+# Inter-task parallelism: number of shard-builder *processes*. Default
+# raised to min(NPROC, 8) -- p4d.24xlarge has 1.1 TB RAM so even 8
+# concurrent rel-event builds (~25 GB peak transient each) leave
+# headroom. Override with PARALLEL_SHARD_BUILDS for tighter pods.
+_default_shard_builds=$(( NPROC < 8 ? NPROC : 8 ))
 PARALLEL_SHARD_BUILDS="${PARALLEL_SHARD_BUILDS:-$_default_shard_builds}"
+# Intra-task parallelism: workers per builder for sample sampling.
+# Default 1 keeps existing behavior; set SHARD_WORKERS=10 for the full
+# p4d 96-core utilization (10*8=80 worker procs, ~83% of vCPUs).
+SHARD_WORKERS="${SHARD_WORKERS:-1}"
 
 mkdir -p "$OUT_DIR" "$TF_STORE" "$SHARDS"
 
 # Validate concurrency knobs early (catch typos like PARALLEL_BUILDS=0).
-for _name in PARALLEL_BUILDS PARALLEL_TF_BUILDS PARALLEL_SHARD_BUILDS NPROC; do
+for _name in PARALLEL_BUILDS PARALLEL_TF_BUILDS PARALLEL_SHARD_BUILDS SHARD_WORKERS NPROC; do
     _val="${!_name}"
     if ! [[ "$_val" =~ ^[0-9]+$ ]] || [ "$_val" -lt 1 ]; then
         echo "ERROR: $_name must be a positive integer (got '$_val')." >&2
@@ -233,7 +244,7 @@ echo "  datasets filter: $DATASETS_FILTER"
 echo "  K=$K  batch=$BATCH  channels=$CHANNELS  layers=$NUM_LAYERS  heads=$HEADS"
 echo "  ff_dropout=$FF_DROPOUT  attn_dropout=$ATTN_DROPOUT"
 echo "  epochs=$EPOCHS  steps_per_task=$STEPS_PER_TASK  workers=$WORKERS  nproc=$NPROC"
-echo "  parallel_tf=$PARALLEL_TF_BUILDS  parallel_shard=$PARALLEL_SHARD_BUILDS"
+echo "  parallel_tf=$PARALLEL_TF_BUILDS  parallel_shard=$PARALLEL_SHARD_BUILDS  shard_workers=$SHARD_WORKERS"
 echo "  lr=$LR  warmup=$WARMUP  loss_balance=$LOSS_BALANCE"
 echo "  cache=$CACHE  out=$OUT_DIR"
 echo "  full_graph=$FULL_GRAPH  tf_store=$TF_STORE  shards=$SHARDS"
@@ -392,6 +403,7 @@ phase2_build_one() {
         --K "$K" --shard_size "$SHARD_SIZE" \
         --out_dir "$out" \
         --name_prefix "$ds" \
+        --workers "$SHARD_WORKERS" \
         --splits train val test $FULL_GRAPH_FLAG \
         > "$log" 2>&1; then
         mkdir -p "$k_dir"

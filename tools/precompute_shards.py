@@ -51,6 +51,17 @@ def parse_args():
     p.add_argument("--cache_dir", default=os.path.expanduser("~/.cache/relbench_examples"))
     p.add_argument("--undirected", action="store_true", default=True)
     p.add_argument(
+        "--workers", type=int,
+        default=int(os.environ.get("SHARD_WORKERS", 1)),
+        help="Intra-shard parallelism via multiprocessing. Workers fork "
+             "after the cache is built and inherit it via copy-on-write, "
+             "so per-worker RSS is the inherited steady-state plus a few "
+             "hundred MB of sampling scratch. Default 1 (sequential, "
+             "matches the original behavior). Bit-exact regardless of "
+             "worker count -- each sample is self-seeded by hash, results "
+             "are gathered indexed by k.",
+    )
+    p.add_argument(
         "--name_prefix",
         default=None,
         help="Prefix for node type names (e.g. dataset name). MUST match "
@@ -150,8 +161,60 @@ def load_data(args):
     return data, task
 
 
-def precompute_split(cache, task, split, K, out_dir, shard_size):
-    """Write one split's shards under ``<out_dir>/<K>/<split>/``."""
+# Module-level globals populated in worker processes via Pool's
+# initializer callback. Forked workers inherit the cache via
+# copy-on-write so we don't pickle DatasetGraphCache (which holds
+# numpy arrays + a HeteroData reference). Avoids ~GB pickle overhead
+# per task and matches the design in speedup-precompute-shards.md.
+_W_CACHE = None
+_W_SEED_TYPE = None
+_W_TYPE_TO_ID = None
+_W_K = None
+
+
+def _worker_init(cache, seed_type_prefixed, type_to_id, K):
+    global _W_CACHE, _W_SEED_TYPE, _W_TYPE_TO_ID, _W_K
+    _W_CACHE = cache
+    _W_SEED_TYPE = seed_type_prefixed
+    _W_TYPE_TO_ID = type_to_id
+    _W_K = K
+
+
+def _worker_sample(item):
+    """Sample one seed; pack the result into row arrays.
+
+    Each sample's RNG seed is derived from (type, node_idx, seed_t, K)
+    so the per-shard output is identical regardless of worker
+    assignment / completion order -- callers index by ``k`` into the
+    pre-allocated arrays.
+    """
+    k, node_idx, seed_t = item
+    seed_val = hash((_W_SEED_TYPE, node_idx, seed_t, _W_K)) & 0xFFFFFFFF
+    final_nodes, edge_index = sample_local_subgraph(
+        _W_CACHE, K=_W_K, seed_node_type=_W_SEED_TYPE,
+        seed_node_idx=node_idx, seed_time=seed_t, seed_val=seed_val,
+    )
+    types_row = np.zeros(_W_K, dtype=np.int16)
+    indices_row = np.zeros(_W_K, dtype=np.int32)
+    hops_row = np.zeros(_W_K, dtype=np.int8)
+    times_row = np.zeros(_W_K, dtype=np.float32)
+    for j, (t_str, nbr_loc, hop, t_val, _c) in enumerate(final_nodes):
+        types_row[j] = _W_TYPE_TO_ID[t_str]
+        indices_row[j] = nbr_loc
+        hops_row[j] = hop
+        times_row[j] = t_val
+    return k, types_row, indices_row, hops_row, times_row, edge_index
+
+
+def precompute_split(cache, task, split, K, out_dir, shard_size, workers=1):
+    """Write one split's shards under ``<out_dir>/<K>/<split>/``.
+
+    ``workers`` controls intra-shard parallelism. ``workers=1`` runs
+    the original sequential loop (no fork, no pool overhead). With
+    ``workers > 1`` the cache is shared via fork+COW; output is
+    bit-identical because each sample is self-seeded by a hash of
+    ``(seed_type, node_idx, seed_t, K)``.
+    """
     table = task.get_table(split)
     table_input = get_node_train_table_input(table, task)
     raw_seed_type, seed_idxs = table_input.nodes
@@ -163,40 +226,88 @@ def precompute_split(cache, task, split, K, out_dir, shard_size):
     writer = ShardWriter(split_root, K=K, total_samples=n, shard_size=shard_size)
 
     print(f"[{split}] precomputing {n} samples into {writer.num_shards} shards "
-          f"of up to {shard_size} ...")
+          f"of up to {shard_size} (workers={workers}) ...")
 
     type_to_id = cache.node_type_to_index
     seed_node_type_prefixed = cache.raw_to_prefixed[raw_seed_type]
 
-    for s_idx in range(writer.num_shards):
-        lo, hi = writer.shard_range(s_idx)
-        size = hi - lo
-        types = np.zeros((size, K), dtype=np.int16)
-        indices = np.zeros((size, K), dtype=np.int32)
-        hops = np.zeros((size, K), dtype=np.int8)
-        times = np.zeros((size, K), dtype=np.float32)
-        edges = []
+    pool = None
+    if workers > 1:
+        # 'fork' is required so workers share the cache via COW. The
+        # parent must not have initialized CUDA before this point;
+        # phase2_build_one in pretrain_p4d.sh already sets
+        # CUDA_VISIBLE_DEVICES="" so this is safe in production.
+        import multiprocessing as mp
+        ctx = mp.get_context("fork")
+        pool = ctx.Pool(
+            workers,
+            initializer=_worker_init,
+            initargs=(cache, seed_node_type_prefixed, type_to_id, K),
+        )
 
-        for k in tqdm(range(size), desc=f"shard {s_idx:04d}", leave=False):
-            global_k = lo + k
-            node_idx_t = seed_idxs[global_k]
-            node_idx = int(node_idx_t.item() if hasattr(node_idx_t, "item") else node_idx_t)
-            seed_t = float(seed_times[global_k].item()) if seed_times is not None else 0.0
-            seed_val = hash((seed_node_type_prefixed, node_idx, seed_t, K)) & 0xFFFFFFFF
+    try:
+        for s_idx in range(writer.num_shards):
+            lo, hi = writer.shard_range(s_idx)
+            size = hi - lo
+            types = np.zeros((size, K), dtype=np.int16)
+            indices = np.zeros((size, K), dtype=np.int32)
+            hops = np.zeros((size, K), dtype=np.int8)
+            times = np.zeros((size, K), dtype=np.float32)
+            edges = [None] * size
 
-            final_nodes, edge_index = sample_local_subgraph(
-                cache, K=K, seed_node_type=seed_node_type_prefixed,
-                seed_node_idx=node_idx, seed_time=seed_t, seed_val=seed_val,
-            )
-            for j, (t_str, nbr_loc, hop, t_val, _c) in enumerate(final_nodes):
-                types[k, j] = type_to_id[t_str]
-                indices[k, j] = nbr_loc
-                hops[k, j] = hop
-                times[k, j] = t_val
-            edges.append(edge_index)
+            # Build the work list once per shard. Pull seed times out
+            # eagerly so the worker payload is plain Python types
+            # (no torch tensors crossing the fork boundary).
+            work = []
+            for k in range(size):
+                global_k = lo + k
+                node_idx_t = seed_idxs[global_k]
+                node_idx = int(
+                    node_idx_t.item() if hasattr(node_idx_t, "item")
+                    else node_idx_t
+                )
+                seed_t = (
+                    float(seed_times[global_k].item())
+                    if seed_times is not None else 0.0
+                )
+                work.append((k, node_idx, seed_t))
 
-        writer.write_shard(s_idx, types, indices, hops, times, edges)
-    writer.finalize()
+            if pool is None:
+                # Sequential: keep the dev-kyaw / pre-PR loop intact.
+                _worker_init(
+                    cache, seed_node_type_prefixed, type_to_id, K,
+                )
+                for item in tqdm(work, desc=f"shard {s_idx:04d}", leave=False):
+                    k, t_row, i_row, h_row, ti_row, edge_index = (
+                        _worker_sample(item)
+                    )
+                    types[k] = t_row
+                    indices[k] = i_row
+                    hops[k] = h_row
+                    times[k] = ti_row
+                    edges[k] = edge_index
+            else:
+                # Parallel: imap_unordered for throughput; chunksize
+                # amortizes IPC overhead across small pure-Python
+                # samples. Order doesn't matter -- we index by k.
+                it = pool.imap_unordered(
+                    _worker_sample, work, chunksize=256,
+                )
+                for k, t_row, i_row, h_row, ti_row, edge_index in tqdm(
+                    it, total=size, desc=f"shard {s_idx:04d}", leave=False,
+                ):
+                    types[k] = t_row
+                    indices[k] = i_row
+                    hops[k] = h_row
+                    times[k] = ti_row
+                    edges[k] = edge_index
+
+            writer.write_shard(s_idx, types, indices, hops, times, edges)
+        writer.finalize()
+    finally:
+        if pool is not None:
+            pool.terminate()
+            pool.join()
     print(f"[{split}] done: {split_root}")
 
 
@@ -207,7 +318,10 @@ def main():
         data=data, undirected=args.undirected, name_prefix=args.name_prefix,
     )
     for split in args.splits:
-        precompute_split(cache, task, split, args.K, args.out_dir, args.shard_size)
+        precompute_split(
+            cache, task, split, args.K, args.out_dir, args.shard_size,
+            workers=args.workers,
+        )
 
 
 if __name__ == "__main__":

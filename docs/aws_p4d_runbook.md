@@ -119,14 +119,19 @@ smaller pods:
 | Knob | Default | Phase | Notes |
 |---|---|---|---|
 | `PARALLEL_TF_BUILDS` | `NPROC` (8) | 1 (TF memmap, GPU) | One A100 per dataset; clamped to physical GPU count at runtime |
-| `PARALLEL_SHARD_BUILDS` | `min(NPROC, 4)` (4) | 2 (shards, RAM) | Each builder loads HeteroData (~25 GB peak transiently for rel-event); 4 concurrent → ~100 GB transient, sustained ~few GB after TF drop |
+| `PARALLEL_SHARD_BUILDS` | `min(NPROC, 8)` (8) | 2 (shards, inter-task) | Each builder loads HeteroData (~25 GB peak transiently for rel-event); 8 concurrent → ~200 GB transient, sustained ~30-40 GB after TF drop |
+| `SHARD_WORKERS` | `1` | 2 (shards, intra-task) | Fork-workers per builder that share the cache via copy-on-write. `SHARD_WORKERS=10` x `PARALLEL_SHARD_BUILDS=8` gives 80 worker procs (~83% of p4d's 96 vCPUs); ~12-16x speedup over the 1×4 default |
 | `NPROC` | 8 | 3 (training, DDP) | Number of GPUs; matches `torchrun --nproc_per_node` |
 
 If your pod has less than the standard 1.1 TB RAM, drop
-`PARALLEL_SHARD_BUILDS`:
+`PARALLEL_SHARD_BUILDS` and/or `SHARD_WORKERS`:
 
 ```bash
-PARALLEL_SHARD_BUILDS=2 ... ./scripts/pretrain_p4d.sh
+# Tighter memory: 4 builders, no intra-task fork.
+PARALLEL_SHARD_BUILDS=4 SHARD_WORKERS=1 ... ./scripts/pretrain_p4d.sh
+
+# Full p4d.24xlarge utilization (96 vCPUs, 1.1 TB RAM):
+PARALLEL_SHARD_BUILDS=8 SHARD_WORKERS=10 ... ./scripts/pretrain_p4d.sh
 ```
 
 ---
