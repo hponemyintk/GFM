@@ -868,8 +868,9 @@ class NeighborTfsEncoder(nn.Module):
         """Rebuild (mean, std) sized to ``n_cols`` aligned by column name.
 
         Pretrained columns keep their saved stats; columns the backbone
-        never saw at registration get identity (0, 1). Falls back to
-        truncate/pad if column names aren't recoverable from the TF.
+        never saw at registration get identity (0, 1). Raises if the
+        column names aren't recoverable -- positional alignment would
+        silently apply the wrong stats to the wrong columns.
         """
         pretrain_cols = self._num_col_names.get(safe_name)
         actual_cols = None
@@ -879,30 +880,31 @@ class NeighborTfsEncoder(nn.Module):
             if isinstance(cand, (list, tuple)) and len(cand) == n_cols:
                 actual_cols = list(cand)
 
-        if pretrain_cols is not None and actual_cols is not None:
-            pretrain_idx = {c: i for i, c in enumerate(pretrain_cols)}
-            aligned_mean = torch.zeros(
-                n_cols, dtype=mean.dtype, device=mean.device,
+        if pretrain_cols is None or actual_cols is None:
+            raise RuntimeError(
+                f"Cannot align numerical buffers for table '{safe_name}': "
+                f"width mismatch (buffer={mean.shape[0]}, feat={n_cols}) "
+                f"and column names are not recoverable "
+                f"(pretrain_cols={pretrain_cols!r}, "
+                f"feat col_names_dict numerical entry length="
+                f"{None if not isinstance(cnd, dict) else len(cnd.get(torch_frame.numerical) or [])}). "
+                "Positional fallback would silently apply the wrong stats; "
+                "either ensure the TensorFrame carries col_names_dict or "
+                "re-register the dataset so _num_col_names is populated."
             )
-            aligned_std = torch.ones(
-                n_cols, dtype=std.dtype, device=std.device,
-            )
-            for j, col in enumerate(actual_cols):
-                if col in pretrain_idx:
-                    aligned_mean[j] = mean[pretrain_idx[col]]
-                    aligned_std[j] = std[pretrain_idx[col]]
-            return aligned_mean, aligned_std
 
-        # Fallback: TF has no col_names_dict (or it's empty). Truncate
-        # the buffer if the TF is narrower; pad with identity if wider.
-        buf_len = mean.shape[0]
-        if n_cols < buf_len:
-            return mean[:n_cols], std[:n_cols]
-        pad_mean = torch.zeros(n_cols, dtype=mean.dtype, device=mean.device)
-        pad_std = torch.ones(n_cols, dtype=std.dtype, device=std.device)
-        pad_mean[:buf_len] = mean
-        pad_std[:buf_len] = std
-        return pad_mean, pad_std
+        pretrain_idx = {c: i for i, c in enumerate(pretrain_cols)}
+        aligned_mean = torch.zeros(
+            n_cols, dtype=mean.dtype, device=mean.device,
+        )
+        aligned_std = torch.ones(
+            n_cols, dtype=std.dtype, device=std.device,
+        )
+        for j, col in enumerate(actual_cols):
+            if col in pretrain_idx:
+                aligned_mean[j] = mean[pretrain_idx[col]]
+                aligned_std[j] = std[pretrain_idx[col]]
+        return aligned_mean, aligned_std
 
     def _get_col_semantic_embeddings(self, big_tf, device):
         """Build [num_cols, channels] semantic embedding for the columns in big_tf.

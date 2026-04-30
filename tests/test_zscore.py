@@ -360,20 +360,18 @@ class TestNumericalColumnAlignment:
         # y gets y-stats: (100 - 100) / 10 = 0; x gets x-stats: (10 - 10) / 1 = 0.
         assert torch.allclose(result, torch.zeros(1, 2), atol=1e-6)
 
-    def test_fallback_truncates_when_no_col_names(self):
-        """If TF doesn't carry col_names_dict, fall back to positional
-        truncate/pad rather than crashing -- the buffer width vs feat
-        width mismatch must not propagate to the broadcast op."""
+    def test_width_mismatch_without_col_names_raises(self):
+        """If the TF can't be aligned by name (no col_names_dict) AND
+        the width mismatches, the encoder must raise -- positional
+        fallback would silently apply the wrong stats. Loud failure
+        makes the bug traceable instead of producing bad embeddings."""
         enc = self._enc_with_two_cols()
         feat = torch.tensor([[10.0]])  # 1 column, buffer has 2
         tf = MagicMock()
         tf.feat_dict = {torch_frame.numerical: feat.clone()}
-        tf.col_names_dict = None  # signal: not available
-        enc._normalize_numerical(tf, "t")
-        result = tf.feat_dict[torch_frame.numerical]
-        assert result.shape == (1, 1)
-        # Truncate keeps first stat (x): (10-10)/1 = 0.
-        assert result[0, 0].item() == pytest.approx(0.0, abs=1e-6)
+        tf.col_names_dict = None  # not available -> alignment impossible
+        with pytest.raises(RuntimeError, match="Cannot align numerical buffers"):
+            enc._normalize_numerical(tf, "t")
 
 
 class TestZScoreSerializationGuard:
