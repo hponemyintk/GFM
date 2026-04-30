@@ -120,7 +120,7 @@ smaller pods:
 |---|---|---|---|
 | `PARALLEL_TF_BUILDS` | `NPROC` (8) | 1 (TF memmap, GPU) | One A100 per dataset; clamped to physical GPU count at runtime |
 | `PARALLEL_SHARD_BUILDS` | `min(NPROC, 8)` (8) | 2 (shards, inter-task) | Each builder loads HeteroData (~25 GB peak transiently for rel-event); 8 concurrent → ~200 GB transient, sustained ~30-40 GB after TF drop |
-| `SHARD_WORKERS` | `8` | 2 (shards, intra-task) | Fork-workers per builder that share the cache via copy-on-write. Default 8 × `PARALLEL_SHARD_BUILDS=8` gives 64 worker procs (~67% of p4d's 96 vCPUs); set `SHARD_WORKERS=10` for ~83% utilization, or `SHARD_WORKERS=1` to fall back to single-process per builder on tighter pods |
+| `SHARD_WORKERS` | `10` | 2 (shards, intra-task) | Fork-workers per builder that share the cache via copy-on-write. Default 10 × `PARALLEL_SHARD_BUILDS=8` gives 80 worker procs (~83% of p4d's 96 vCPUs), max throughput; drop to `SHARD_WORKERS=1` for single-process-per-builder on tighter pods |
 | `NPROC` | 8 | 3 (training, DDP) | Number of GPUs; matches `torchrun --nproc_per_node` |
 
 If your pod has less than the standard 1.1 TB RAM, drop
