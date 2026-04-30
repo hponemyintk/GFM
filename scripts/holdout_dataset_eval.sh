@@ -295,7 +295,10 @@ for f in "$META" "$WEIGHTS" "$SCHEMA"; do
 done
 
 # ----------------- 3. For each TARGET task, extract + finetune + tabpfn -----------------
-PROJECTOR="${PROJECTOR:-pca64}"
+# Pass raw embeddings (TabPFN v2 supports up to ~500 features; our
+# backbone is 128-dim laptop / 512-dim paper-config). Override with
+# PROJECTOR=pca64 only if a future channels>500 backbone needs it.
+PROJECTOR="${PROJECTOR:-none}"
 
 # Parse TARGET_TASKS_CSV "ds.task:weight,..." -> just the task names.
 IFS=',' read -ra TGT_PAIRS <<< "$TARGET_TASKS_CSV"

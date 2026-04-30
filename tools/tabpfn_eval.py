@@ -5,22 +5,30 @@ Loads the .pt files produced by ``tools/extract_embeddings.py``
 test_emb, and reports metrics via the RelBench task's
 ``evaluate(...)``. No backbone gradient anywhere.
 
-TabPFN's pretrained tabular transformer has a soft input-feature cap
-(~100 features for the classifier; the regressor is similar). For
-backbone embeddings of channels=128/256/512, exceeding that cap is
-the normal case. The ``--projector`` flag picks how to compress:
+TabPFN v2 supports up to ~500 input features, so backbone embeddings
+of channels=128 (laptop) or 512 (paper-config) fit raw -- no
+projection is required by the model. The ``--projector`` flag picks
+how (or whether) to reduce dimensionality:
 
-  * ``none``   -- pass raw embeddings as-is. TabPFN may warn or
-                  underperform; useful as a baseline.
+  * ``none``   -- pass raw embeddings as-is. Default; the right
+                  choice for channels<=500. Empirical sweep on
+                  rel-f1.driver-top3 (laptop, channels=128) showed
+                  this beats PCA-64 on every metric.
   * ``pca64``  -- fit a PCA-64 on TRAIN embeddings only, project
-                  train/val/test through it. No leakage.
+                  train/val/test through it. No leakage. Useful only
+                  if the backbone produces channels>500 (TabPFN v2's
+                  cap) or as a noise-reduction ablation.
+
+Note: ``tabpfn>=2.0,<3`` is the recommended pin -- v7.x line gates
+model-weight downloads behind a TABPFN_TOKEN, which doesn't fit a
+hands-off pipeline.
 
 Usage::
 
     python -m tools.tabpfn_eval \\
         --embeddings_dir <run>/embeddings/ \\
         --dataset rel-f1 --task driver-top3 \\
-        --projector pca64 \\
+        --projector none \\
         --out <run>/tabpfn_eval.json
 """
 
