@@ -161,11 +161,12 @@ HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance}"
 #              paper Tables 1a (user-attendance MAE 0.2502) and 1b
 #              (user-repeat AUC 0.7609, user-ignore AUC 0.8157).
 #   rel-hm:    expts/run-large-base-experiments.sh -- user-churn,
-#              item-sales.
+#              item-sales. transactions-price is a RelBench v2
+#              autocomplete regression and joins under FULL_GRAPH=1.
 declare -A DEFAULT_ALL_TASKS=(
   [rel-f1]="driver-position driver-dnf driver-top3 results-position qualifying-position"
   [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested users-birthyear"
-  [rel-hm]="user-churn item-sales"
+  [rel-hm]="user-churn item-sales transactions-price"
 )
 
 # Parse HOLDOUTS into an associative array: {dataset -> task}

@@ -150,12 +150,14 @@ def test_holdout_task_dev_default_paper_safe_subset():
         "rel-event default task list must include all 6 task variants "
         "(3 paper-safe + 3 autocomplete enabled by FULL_GRAPH=1)"
     )
-    # rel-hm task list still available for opt-in via DATASETS override.
+    # rel-hm task list available for opt-in via DATASETS override.
+    # transactions-price is the RelBench v2 autocomplete regression
+    # and joins under FULL_GRAPH=1 (default).
     assert (
-        '[rel-hm]="user-churn item-sales"'
+        '[rel-hm]="user-churn item-sales transactions-price"'
     ) in src, (
-        "rel-hm default task list must be the paper-safe subset; "
-        "transactions-price excluded"
+        "rel-hm default task list must include all 3 entity binary/"
+        "regression tasks (transactions-price unlocked by FULL_GRAPH=1)"
     )
 
 
@@ -225,6 +227,20 @@ def test_holdout_dataset_eval_default_multi_source_to_relarxiv():
                "event_interest-not_interested", "users-birthyear"):
         assert f'"rel-event.{tn}:1.0"' in src, (
             f"rel-event default tasks must include {tn!r}"
+        )
+    # rel-f1 lookup must cover all 5 entity binary/regression tasks
+    # (3 forecasting + 2 autocomplete). driver-circuit-compete is
+    # link-prediction and stays out of the launcher's defaults.
+    for tn in ("driver-position", "driver-dnf", "driver-top3",
+               "results-position", "qualifying-position"):
+        assert f'"rel-f1.{tn}:1.0"' in src, (
+            f"rel-f1 default tasks must include {tn!r}"
+        )
+    # rel-hm lookup must cover all 3 entity binary/regression tasks
+    # (2 forecasting + 1 autocomplete unlocked by FULL_GRAPH=1).
+    for tn in ("user-churn", "item-sales", "transactions-price"):
+        assert f'"rel-hm.{tn}:1.0"' in src, (
+            f"rel-hm default tasks must include {tn!r}"
         )
     # rel-arxiv lookup defined (paper-citation + author-publication).
     assert '"rel-arxiv.paper-citation:1.0"' in src

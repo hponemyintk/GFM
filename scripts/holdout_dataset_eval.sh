@@ -122,21 +122,28 @@ for _s in "${SOURCE_LIST[@]}"; do
   fi
 done
 
-# Source pretraining task lists. Restricted to the paper-benchmarked
-# subset per docs/truncated_graph_caveat.md -- the omitted tasks
-# (driver-circuit-compete, results-position, qualifying-position,
-# transactions-price) IndexError on val/test seeds against the
-# truncated CSR adjacency. Override SOURCE_TASKS_CSV /
-# TARGET_TASKS_CSV to opt in (and accept the crash unless
-# upto_test_timestamp is also flipped).
+# Source pretraining task lists. Coverage rule: every entity-level
+# binary classification + regression task supported by RelBench v2 is
+# included by default. Excluded by structural reason only:
+#   * link-prediction / recommendation tasks (driver-circuit-compete,
+#     paper-paper-cocitation) -- adoption pipeline has no ranking head
+#   * multiclass tasks (author-category) -- finetune_head /
+#     tabpfn_eval only have binary + regression branches
+# Autocomplete tasks (results-position, qualifying-position,
+# transactions-price, users-birthyear, event_interest-*) build
+# cleanly under FULL_GRAPH=1 (the default below). Override the lists
+# with SOURCE_TASKS_CSV / TARGET_TASKS_CSV for ablations.
 DEFAULT_RELF1_ALL=(
   "rel-f1.driver-position:1.0"
   "rel-f1.driver-dnf:1.0"
   "rel-f1.driver-top3:1.0"
+  "rel-f1.results-position:1.0"
+  "rel-f1.qualifying-position:1.0"
 )
 DEFAULT_RELHM_ALL=(
   "rel-hm.user-churn:1.0"
   "rel-hm.item-sales:1.0"
+  "rel-hm.transactions-price:1.0"
 )
 # rel-event: 6 entity tasks. user-* are paper-benchmarked
 # (RelGT paper Table 1a/1b); event_interest-* and users-birthyear
