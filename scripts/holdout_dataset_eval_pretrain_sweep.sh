@@ -42,15 +42,17 @@
 #   FT_HEAD         mlp2       2-layer MLP head (override =linear for
 #                              the legacy linear-probe ablation)
 #   OUT_DIR         results/holdout_dataset_eval_pretrain_sweep
-#   INNER           scripts/holdout_dataset_eval.sh   (the launcher
-#                                                     to wrap; switch
-#                                                     to ..._clean.sh
-#                                                     for the
-#                                                     low-quality-
-#                                                     filtered subset)
+#   INNER           scripts/holdout_dataset_eval_clean.sh
+#                              The inner launcher to wrap. Defaults
+#                              to the clean variant (35 tasks across
+#                              9 datasets, drops the 5 RelBench v2
+#                              tasks whose supervised GNN baseline
+#                              is at-or-below random per the paper).
+#                              Set INNER=scripts/holdout_dataset_eval.sh
+#                              for the full 40-task setup.
 #
-# Example -- backbone variance for rel-f1+rel-event -> rel-arxiv,
-# no TabPFN, single adoption seed per backbone:
+# Recommended invocation (rel-f1 + rel-event -> rel-arxiv, no
+# TabPFN, single adoption seed per pretrain seed):
 #
 #   NPROC=8 SHARD_WORKERS=10 \
 #     PRETRAIN_SEEDS="0 1 2" \
@@ -73,7 +75,7 @@ NPROC="${NPROC:-8}"
 SHARD_WORKERS="${SHARD_WORKERS:-10}"
 RUN_TABPFN="${RUN_TABPFN:-0}"
 FT_HEAD="${FT_HEAD:-mlp2}"
-INNER="${INNER:-scripts/holdout_dataset_eval.sh}"
+INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval_pretrain_sweep}"
 
 if [ ! -x "$REPO_ROOT/$INNER" ] && [ ! -f "$REPO_ROOT/$INNER" ]; then

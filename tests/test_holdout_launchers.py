@@ -466,6 +466,12 @@ def test_holdout_dataset_eval_pretrain_sweep_wraps_inner_launcher():
     assert 'AGG="$SWEEP_DIR/aggregate.json"' in src, (
         "aggregate path must be <sweep>/aggregate.json"
     )
+    # Default INNER must point at the "clean" launcher so the sweep
+    # uses the high-signal task subset by default. Override INNER to
+    # the unfiltered launcher for the all-tasks ablation.
+    assert 'INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"' in src, (
+        "default INNER must be holdout_dataset_eval_clean.sh"
+    )
 
 
 def test_pretrain_p4d_forwards_seed_to_torchrun():
