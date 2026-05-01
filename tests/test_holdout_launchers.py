@@ -331,6 +331,29 @@ def test_holdout_dataset_eval_runs_extracts_in_parallel():
     )
 
 
+def test_holdout_task_dev_runs_extracts_in_parallel():
+    """Phase-4 launcher must dispatch extracts to NPROC GPUs in
+    parallel (mirrors the holdout_dataset_eval.sh design). Different
+    (ds, holdout) pairs already have isolated cache dirs so we don't
+    need a per-job --precomputed_dir override here."""
+    src = (SCRIPTS / "holdout_task_dev.sh").read_text()
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "Phase A: parallel extracts" in src
+    assert "Phase B: finetune_head" in src
+    assert "_acquire_gpu" in src and "_reap_finished" in src
+    assert 'CUDA_VISIBLE_DEVICES="$GPU"' in src, (
+        "each parallel extract must pin to a specific GPU"
+    )
+    # Same subshell-trap regression check as the dataset launcher.
+    assert "$(_acquire_gpu)" not in code_only, (
+        "_acquire_gpu must NOT be wrapped in $() -- subshell would "
+        "make every job land on gpu=0"
+    )
+    assert 'GPU="$ACQUIRED_GPU"' in code_only
+
+
 def test_finetune_head_defaults_to_mlp2_in_both_launchers():
     """Both launchers must default --head to mlp2 (2-layer MLP). Linear
     leaves predictive headroom on 128/512-d frozen embeddings; mlp2

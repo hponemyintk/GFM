@@ -415,35 +415,94 @@ done
 # hypothetical channels=1024 backbone would auto-PCA to 500. Override
 # with PROJECTOR=none / pca64 for ablations.
 PROJECTOR="${PROJECTOR:-auto}"
+# mlp2 by default: a 2-layer MLP head fits a richer decision boundary
+# on the 128/512-d embeddings than Linear(C, 1) and adds negligible
+# compute (a few extra GEMMs per epoch on a frozen backbone). Override
+# with FT_HEAD=linear for the legacy ablation.
+FT_HEAD="${FT_HEAD:-mlp2}"
+
+# Build the list of (ds, holdout) jobs. Each pair has isolated
+# extract output + precompute paths (cache_dir keyed by dataset and
+# task), so concurrent extracts cannot race on shared HDF5 files.
 HOLDOUT_DIRS=()
-
-echo
-echo "=== [3/4] Per-holdout adoption (frozen backbone) ==="
-
+HD_DS=()
+HD_TASK=()
 for ds in $DATASETS; do
   holdout="${HOLDOUT_OF[$ds]:-}"
   if [ -z "$holdout" ]; then
     continue
   fi
   TASK_DIR="$OUT_DIR_BASE/${ds}.${holdout}"
-  EMB_DIR="$TASK_DIR/embeddings"
-  FT_DIR="$TASK_DIR/finetune_head"
-  TABPFN_DIR="$TASK_DIR/tabpfn"
-  mkdir -p "$EMB_DIR" "$FT_DIR" "$TABPFN_DIR"
+  mkdir -p "$TASK_DIR/embeddings" "$TASK_DIR/finetune_head" "$TASK_DIR/tabpfn"
   HOLDOUT_DIRS+=("$TASK_DIR")
+  HD_DS+=("$ds")
+  HD_TASK+=("$holdout")
+done
 
-  echo
-  echo "--- ${ds}.${holdout} ---"
+# ---- Phase A: parallel extracts, one per holdout, on its own GPU ----
+# GPU pool: 0..NPROC-1. Each parallel extract pins to a distinct GPU
+# via CUDA_VISIBLE_DEVICES; finetune + tabpfn stay sequential below.
+GPU_POOL=()
+for ((_g=0; _g<NPROC; _g++)); do GPU_POOL+=("$_g"); done
+declare -A PID_GPU
+declare -A PID_DESC
+declare -A PID_LOG
 
-  # Extract: same dataset as pretrain, so register_dataset has
-  # already populated the encoder with this dataset's prefixed
-  # types -- no --register_new_dataset needed.
+_reap_finished() {
+  local pid
+  for pid in "${!PID_GPU[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null
+      local rc=$?
+      GPU_POOL+=("${PID_GPU[$pid]}")
+      if [ "$rc" -ne 0 ]; then
+        echo "  WARN: extract ${PID_DESC[$pid]} (gpu=${PID_GPU[$pid]}) FAILED rc=$rc; see ${PID_LOG[$pid]}" >&2
+      else
+        echo "  [extract] ${PID_DESC[$pid]} done (gpu=${PID_GPU[$pid]})"
+      fi
+      unset "PID_GPU[$pid]"
+      unset "PID_DESC[$pid]"
+      unset "PID_LOG[$pid]"
+    fi
+  done
+}
+
+_acquire_gpu() {
+  # Direct invocation only -- $() would fork a subshell that mutates
+  # its own copy of GPU_POOL. Returns the index in ACQUIRED_GPU.
+  while [ ${#GPU_POOL[@]} -eq 0 ]; do
+    _reap_finished
+    [ ${#GPU_POOL[@]} -eq 0 ] && sleep 1
+  done
+  ACQUIRED_GPU="${GPU_POOL[0]}"
+  GPU_POOL=("${GPU_POOL[@]:1}")
+}
+
+_wait_all() {
+  while [ ${#PID_GPU[@]} -gt 0 ]; do
+    _reap_finished
+    [ ${#PID_GPU[@]} -gt 0 ] && sleep 1
+  done
+}
+
+echo
+echo "=== [3/4] Phase A: parallel extracts (NPROC=$NPROC GPUs, ${#HD_DS[@]} jobs) ==="
+for _i in "${!HD_DS[@]}"; do
+  ds="${HD_DS[$_i]}"
+  holdout="${HD_TASK[$_i]}"
+  TASK_DIR="${HOLDOUT_DIRS[$_i]}"
+  EMB_DIR="$TASK_DIR/embeddings"
   EMB_LOG="$EMB_DIR/extract.log"
   if [ -f "$EMB_DIR/test.pt" ] && [ -f "$EMB_DIR/train.pt" ] && [ -f "$EMB_DIR/val.pt" ]; then
-    echo "  [extract] embeddings cached"
-  else
-    echo "  [extract] backbone forward(task_id=None) on ${ds}.${holdout}"
-    python3 -m tools.extract_embeddings \
+    echo "  [extract] ${ds}.${holdout} cached"
+    continue
+  fi
+  _acquire_gpu
+  GPU="$ACQUIRED_GPU"
+  desc="${ds}.${holdout}"
+  echo "  [extract] $desc launching on gpu=$GPU"
+  (
+    CUDA_VISIBLE_DEVICES="$GPU" python3 -u -m tools.extract_embeddings \
       --backbone_meta "$META" \
       --backbone_weights "$WEIGHTS" \
       --backbone_schema "$SCHEMA" \
@@ -452,19 +511,35 @@ for ds in $DATASETS; do
       --num_neighbors "$K" --batch_size "$BATCH" \
       --num_workers 0 \
       --cache_dir "$CACHE" \
-      --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG \
-      > "$EMB_LOG" 2>&1
-  fi
+      --out_dir "$EMB_DIR" $FULL_GRAPH_FLAG
+  ) > "$EMB_LOG" 2>&1 &
+  pid=$!
+  PID_GPU[$pid]="$GPU"
+  PID_DESC[$pid]="$desc"
+  PID_LOG[$pid]="$EMB_LOG"
+done
+_wait_all
+echo "=== Phase A complete ==="
 
-  # Frozen-backbone fine-tune: only the head sees gradients. This
-  # is the GFM-claim test -- can a Linear(channels, 1) on top of
-  # the frozen backbone hit reasonable test metric on a held-out
-  # task head?
-  # mlp2 by default: a 2-layer MLP head fits a richer decision
-  # boundary on the 128/512-d embeddings than Linear(C, 1) and adds
-  # negligible compute (a few extra GEMMs per epoch on a frozen
-  # backbone). Override with FT_HEAD=linear for the legacy ablation.
-  FT_HEAD="${FT_HEAD:-mlp2}"
+# ---- Phase B: finetune_head + tabpfn_eval (sequential) ----
+# Same dataset as pretrain, so the encoder already knows the prefixed
+# types -- no --register_new_dataset needed. These steps are minutes
+# each; sequential keeps the logs readable.
+echo
+echo "=== [4/4] Phase B: finetune_head ($FT_HEAD) + tabpfn_eval (sequential) ==="
+for _i in "${!HD_DS[@]}"; do
+  ds="${HD_DS[$_i]}"
+  holdout="${HD_TASK[$_i]}"
+  TASK_DIR="${HOLDOUT_DIRS[$_i]}"
+  EMB_DIR="$TASK_DIR/embeddings"
+  FT_DIR="$TASK_DIR/finetune_head"
+  TABPFN_DIR="$TASK_DIR/tabpfn"
+  echo
+  echo "--- ${ds}.${holdout} ---"
+  if [ ! -f "$EMB_DIR/test.pt" ]; then
+    echo "    extract missing -- skipping (see $EMB_DIR/extract.log)"
+    continue
+  fi
   echo "  [finetune] $FT_HEAD head, frozen backbone"
   python3 -m tools.finetune_head \
     --embeddings_dir "$EMB_DIR" \
@@ -475,7 +550,6 @@ for ds in $DATASETS; do
     > "$FT_DIR/finetune.log" 2>&1 || \
       echo "    WARN: finetune_head failed; see $FT_DIR/finetune.log"
 
-  # Pure post-hoc TabPFN -- no gradient anywhere.
   echo "  [tabpfn] post-hoc with $PROJECTOR projector"
   if ! python3 -m tools.tabpfn_eval \
       --embeddings_dir "$EMB_DIR" \
