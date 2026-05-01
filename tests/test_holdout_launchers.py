@@ -309,6 +309,26 @@ def test_holdout_dataset_eval_runs_extracts_in_parallel():
     assert 'PRECOMP_DIR="$SEED_DIR/precomputed"' in src, (
         "PRECOMP_DIR must scope under the per-seed dir"
     )
+    # Regression guard: _acquire_gpu MUST run in the parent shell, not
+    # in a $() subshell. A subshell would mutate its own copy of
+    # GPU_POOL / PID_GPU and the parent's pool would never drain --
+    # every job would land on gpu=0. The function therefore returns
+    # the acquired index via the global ACQUIRED_GPU.
+    #
+    # Strip comment lines before grep-checking so the cautionary note
+    # in the function's own docstring doesn't false-positive.
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert "$(_acquire_gpu)" not in code_only, (
+        "_acquire_gpu must NOT be called via $() -- the subshell would "
+        "make every job land on gpu=0. Call directly and read "
+        "ACQUIRED_GPU."
+    )
+    assert 'GPU="$ACQUIRED_GPU"' in code_only, (
+        "caller must read the acquired index from the global "
+        "ACQUIRED_GPU set by _acquire_gpu"
+    )
 
 
 def test_extract_embeddings_supports_precomputed_dir_flag():

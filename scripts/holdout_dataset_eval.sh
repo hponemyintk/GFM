@@ -550,13 +550,17 @@ _reap_finished() {
 }
 
 _acquire_gpu() {
+  # IMPORTANT: this function MUST be invoked directly, not via
+  # ``$(_acquire_gpu)`` -- a $() subshell would mutate its own copy
+  # of GPU_POOL / PID_GPU and the parent's pool would never drain,
+  # so every job would land on gpu=0. The function returns the
+  # acquired index in the global ``ACQUIRED_GPU``.
   while [ ${#GPU_POOL[@]} -eq 0 ]; do
     _reap_finished
     [ ${#GPU_POOL[@]} -eq 0 ] && sleep 1
   done
-  local g="${GPU_POOL[0]}"
+  ACQUIRED_GPU="${GPU_POOL[0]}"
   GPU_POOL=("${GPU_POOL[@]:1}")
-  echo "$g"
 }
 
 _wait_all() {
@@ -577,7 +581,8 @@ for task_name in "${TASK_NAMES[@]}"; do
       echo "  [extract] ${task_name} seed=$ADOPT_SEED cached"
       continue
     fi
-    GPU=$(_acquire_gpu)
+    _acquire_gpu
+    GPU="$ACQUIRED_GPU"
     PRECOMP_DIR="$SEED_DIR/precomputed"
     desc="${task_name} seed=$ADOPT_SEED"
     echo "  [extract] $desc launching on gpu=$GPU"
