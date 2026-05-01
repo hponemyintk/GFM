@@ -386,6 +386,44 @@ def test_extract_embeddings_supports_precomputed_dir_flag():
     )
 
 
+def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
+    """The 'clean' variant must drop the 5 RelBench v2 tasks whose
+    supervised single-task GNN baseline is at-or-below random per the
+    paper. Pinned so a future relaxation requires an explicit test
+    update + paper rationale."""
+    p = SCRIPTS / "holdout_dataset_eval_clean.sh"
+    assert p.exists(), f"missing {p}"
+    src = p.read_text()
+    EXCLUDED = [
+        "rel-event.event_interest-interested",
+        "rel-event.event_interest-not_interested",
+        "rel-event.users-birthyear",
+        "rel-trial.site-success",
+        "rel-amazon.item-ltv",
+    ]
+    for tn in EXCLUDED:
+        assert f'"{tn}:1.0"' not in src, (
+            f"clean variant must NOT include {tn!r} -- paper baseline "
+            "is at or below random; including it dilutes the signal"
+        )
+    # Sanity: the kept rel-event tasks (3 user-* forecasting) and
+    # kept rel-trial tasks must still be present.
+    KEPT = [
+        "rel-event.user-attendance",
+        "rel-event.user-repeat",
+        "rel-event.user-ignore",
+        "rel-trial.study-outcome",
+        "rel-trial.study-adverse",
+        "rel-amazon.user-churn",
+        "rel-amazon.item-churn",
+        "rel-amazon.user-ltv",
+    ]
+    for tn in KEPT:
+        assert f'"{tn}:1.0"' in src, (
+            f"clean variant should keep {tn!r}"
+        )
+
+
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):
     bash = _bash()
     p = SCRIPTS / "holdout_dataset_eval.sh"
