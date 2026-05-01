@@ -460,11 +460,16 @@ for ds in $DATASETS; do
   # is the GFM-claim test -- can a Linear(channels, 1) on top of
   # the frozen backbone hit reasonable test metric on a held-out
   # task head?
-  echo "  [finetune] linear head, frozen backbone"
+  # mlp2 by default: a 2-layer MLP head fits a richer decision
+  # boundary on the 128/512-d embeddings than Linear(C, 1) and adds
+  # negligible compute (a few extra GEMMs per epoch on a frozen
+  # backbone). Override with FT_HEAD=linear for the legacy ablation.
+  FT_HEAD="${FT_HEAD:-mlp2}"
+  echo "  [finetune] $FT_HEAD head, frozen backbone"
   python3 -m tools.finetune_head \
     --embeddings_dir "$EMB_DIR" \
     --dataset "$ds" --task "$holdout" \
-    --head linear --epochs 50 --lr 1e-3 \
+    --head "$FT_HEAD" --epochs 50 --lr 1e-3 \
     --out "$FT_DIR/finetuned.pt" \
     --device cpu \
     > "$FT_DIR/finetune.log" 2>&1 || \

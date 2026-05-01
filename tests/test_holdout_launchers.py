@@ -331,6 +331,22 @@ def test_holdout_dataset_eval_runs_extracts_in_parallel():
     )
 
 
+def test_finetune_head_defaults_to_mlp2_in_both_launchers():
+    """Both launchers must default --head to mlp2 (2-layer MLP). Linear
+    leaves predictive headroom on 128/512-d frozen embeddings; mlp2
+    fits a richer decision boundary at negligible cost. Caller can
+    still flip back to FT_HEAD=linear for ablations."""
+    for fn in ("holdout_task_dev.sh", "holdout_dataset_eval.sh"):
+        src = (SCRIPTS / fn).read_text()
+        assert 'FT_HEAD="${FT_HEAD:-mlp2}"' in src, (
+            f"{fn} must default FT_HEAD to mlp2"
+        )
+        assert '--head "$FT_HEAD"' in src, (
+            f"{fn} must pass --head \"$FT_HEAD\" so the env override "
+            f"actually flows into finetune_head"
+        )
+
+
 def test_extract_embeddings_supports_precomputed_dir_flag():
     """The --precomputed_dir override is wired in argparse so the
     launcher can run several extracts in parallel without sharing

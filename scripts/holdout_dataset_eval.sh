@@ -615,8 +615,14 @@ echo "=== Phase A complete ==="
 # Each finetune is ~minutes and tabpfn ~10-20 min on this scale; the
 # bottleneck was the extract above. Stay sequential here so we don't
 # fight the multi-GPU phase A and so logs stay readable.
+#
+# Default to mlp2 (2-layer MLP w/ GELU) -- a richer head than Linear
+# fits the 128/512-d frozen embeddings better at negligible compute
+# cost (a few extra GEMMs per epoch on a frozen backbone). Override
+# with FT_HEAD=linear for the legacy linear-probe ablation.
+FT_HEAD="${FT_HEAD:-mlp2}"
 echo
-echo "=== Phase B: finetune_head + tabpfn_eval (sequential) ==="
+echo "=== Phase B: finetune_head ($FT_HEAD) + tabpfn_eval (sequential) ==="
 for task_name in "${TASK_NAMES[@]}"; do
   echo
   echo "  ${TARGET}.${task_name}"
@@ -629,11 +635,11 @@ for task_name in "${TASK_NAMES[@]}"; do
       echo "    seed=$ADOPT_SEED: extract missing -- skipping (see $EMB_DIR/extract.log)"
       continue
     fi
-    echo "    seed=$ADOPT_SEED finetune"
+    echo "    seed=$ADOPT_SEED finetune ($FT_HEAD)"
     python3 -m tools.finetune_head \
       --embeddings_dir "$EMB_DIR" \
       --dataset "$TARGET" --task "$task_name" \
-      --head linear --epochs 50 --lr 1e-3 \
+      --head "$FT_HEAD" --epochs 50 --lr 1e-3 \
       --seed "$ADOPT_SEED" \
       --out "$FT_DIR/finetuned.pt" \
       > "$FT_DIR/finetune.log" 2>&1 || \
