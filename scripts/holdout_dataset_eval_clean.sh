@@ -209,13 +209,16 @@ DEFAULT_RELHM_ALL=(
   "rel-hm.item-sales:1.0"
   "rel-hm.transactions-price:1.0"
 )
-# rel-event (clean): 3 user-* tasks only. Drops event_interest-*
-# (paper Table 3 GNN AUC 0.4764 / 0.6040, at-or-near random) and
-# users-birthyear (paper Table 5 GNN R^2 -0.030, negative).
+# rel-event (clean): 3 user-* tasks only. event_interest-* and
+# users-birthyear are commented out below with their RelBench v2
+# baseline numbers -- uncomment if you want to ablate.
 DEFAULT_RELEVENT_ALL=(
   "rel-event.user-attendance:1.0"
   "rel-event.user-repeat:1.0"
   "rel-event.user-ignore:1.0"
+  # "rel-event.event_interest-interested:1.0"      # paper Table 3 GNN AUC 0.4764 -- below random
+  # "rel-event.event_interest-not_interested:1.0"  # paper Table 3 GNN AUC 0.6040 -- ~random
+  # "rel-event.users-birthyear:1.0"                # paper Table 5 GNN R^2 -0.030 -- negative
 )
 # rel-arxiv: paper-citation (binary) + author-publication (regression).
 # author-category is multiclass and paper-paper-cocitation is link-pred;
@@ -225,12 +228,14 @@ DEFAULT_RELARXIV_ALL=(
   "rel-arxiv.author-publication:1.0"
 )
 # rel-amazon (clean): 3 entity tasks (2 binary churn + 1 reg LTV).
-# Drops item-ltv (paper Table 9 GNN R^2 0.032, near zero signal).
-# review-rating is autocomplete classification; not supported here.
+# item-ltv is commented out below with its baseline number --
+# uncomment to ablate. review-rating is autocomplete classification
+# and not supported by the adoption pipeline today.
 DEFAULT_RELAMAZON_ALL=(
   "rel-amazon.user-churn:1.0"
   "rel-amazon.item-churn:1.0"
   "rel-amazon.user-ltv:1.0"
+  # "rel-amazon.item-ltv:1.0"  # paper Table 9 GNN R^2 0.032 -- near zero signal
 )
 # rel-avito: 5 entity tasks. ad-ctr (reg) + user-* (binary
 # forecasting) + 2 autocomplete binaries (searchstream-click,
@@ -249,14 +254,15 @@ DEFAULT_RELSTACK_ALL=(
   "rel-stack.user-badge:1.0"
   "rel-stack.post-votes:1.0"
 )
-# rel-trial (clean): 6 entity tasks. Drops site-success
-# (paper Table 9 GNN R^2 -0.483, strongly negative). Keeps the rest:
+# rel-trial (clean): 6 entity tasks. site-success is commented out
+# below with its baseline -- uncomment to ablate. Keeps the rest:
 # study-outcome (binary forecasting), study-adverse (reg), plus the
 # 4 autocomplete tasks (studies-enrollment reg, studies-has_dmc bin,
 # eligibilities-{adult,child} bin).
 DEFAULT_RELTRIAL_ALL=(
   "rel-trial.study-outcome:1.0"
   "rel-trial.study-adverse:1.0"
+  # "rel-trial.site-success:1.0"  # paper Table 9 GNN R^2 -0.483 -- strongly negative
   "rel-trial.studies-enrollment:1.0"
   "rel-trial.studies-has_dmc:1.0"
   "rel-trial.eligibilities-adult:1.0"

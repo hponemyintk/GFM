@@ -389,11 +389,17 @@ def test_extract_embeddings_supports_precomputed_dir_flag():
 def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
     """The 'clean' variant must drop the 5 RelBench v2 tasks whose
     supervised single-task GNN baseline is at-or-below random per the
-    paper. Pinned so a future relaxation requires an explicit test
-    update + paper rationale."""
+    paper. The exclusions are kept as commented-out lines in the
+    arrays (with baseline rationale) so an ablation is one-line; the
+    test enforces that the lines are commented out, not deleted."""
     p = SCRIPTS / "holdout_dataset_eval_clean.sh"
     assert p.exists(), f"missing {p}"
     src = p.read_text()
+    # Strip lines whose first non-space char is '#' so we only check
+    # the live (uncommented) array entries.
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
     EXCLUDED = [
         "rel-event.event_interest-interested",
         "rel-event.event_interest-not_interested",
@@ -402,9 +408,17 @@ def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
         "rel-amazon.item-ltv",
     ]
     for tn in EXCLUDED:
-        assert f'"{tn}:1.0"' not in src, (
-            f"clean variant must NOT include {tn!r} -- paper baseline "
-            "is at or below random; including it dilutes the signal"
+        assert f'"{tn}:1.0"' not in code_only, (
+            f"clean variant must NOT include {tn!r} as a live array "
+            "entry -- paper baseline is at or below random. Comment "
+            "the line out (with the paper rationale inline) instead "
+            "of leaving it active."
+        )
+        # And: the line must STILL exist in the file as a comment, so
+        # the rationale stays visible and re-enabling is one tweak.
+        assert f'"{tn}:1.0"' in src, (
+            f"{tn!r} should remain in the file as a commented-out "
+            "line so the exclusion rationale is visible inline"
         )
     # Sanity: the kept rel-event tasks (3 user-* forecasting) and
     # kept rel-trial tasks must still be present.
