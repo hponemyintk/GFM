@@ -1,0 +1,1368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RelGT / GFM — Interactive System Map</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel-bg: #ffffff;
+    --border: #d4d4d8;
+    --text: #18181b;
+    --muted: #71717a;
+    --accent: #2563eb;
+    --pillar-data: #d1fae5;
+    --pillar-data-border: #10b981;
+    --pillar-model: #dbeafe;
+    --pillar-model-border: #3b82f6;
+    --pillar-training: #ede9fe;
+    --pillar-training-border: #8b5cf6;
+    --pillar-adoption: #fed7aa;
+    --pillar-adoption-border: #f97316;
+    --pillar-script: #e4e4e7;
+    --pillar-script-border: #71717a;
+    --pillar-external: #fef3c7;
+    --pillar-external-border: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  header {
+    padding: 12px 20px;
+    background: var(--panel-bg);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 6px; font-size: 17px; font-weight: 600; }
+  header p  { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+  nav.tabs { display: flex; gap: 4px; flex-wrap: wrap; }
+  nav.tabs button {
+    background: transparent;
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    font-family: inherit;
+  }
+  nav.tabs button.active { background: var(--accent); color: white; border-color: var(--accent); }
+  nav.tabs button:hover:not(.active) { background: var(--bg); }
+  main {
+    display: grid;
+    grid-template-columns: 1fr 400px;
+    gap: 0;
+    height: calc(100vh - 110px);
+    min-height: 600px;
+  }
+  section.canvas {
+    background: var(--panel-bg);
+    border-right: 1px solid var(--border);
+    overflow: auto;
+    padding: 16px 20px;
+  }
+  aside.details {
+    background: var(--panel-bg);
+    overflow-y: auto;
+    padding: 20px;
+  }
+  aside.details h2 { margin: 0 0 4px; font-size: 16px; }
+  aside.details .file {
+    font-family: ui-monospace, SF Mono, Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 12px;
+    word-break: break-all;
+  }
+  aside.details h3 {
+    margin: 16px 0 6px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  aside.details p { margin: 0 0 8px; }
+  aside.details ul { margin: 0 0 8px; padding-left: 18px; }
+  aside.details li { margin-bottom: 4px; }
+  aside.details code {
+    font-family: ui-monospace, SF Mono, Menlo, Consolas, monospace;
+    font-size: 12px;
+    background: var(--bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+  aside.details a.xref { color: var(--accent); cursor: pointer; text-decoration: underline; }
+  aside.details a.xref:hover { color: #1e40af; }
+  .legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid; }
+  /* SVG */
+  .node rect {
+    stroke-width: 1.5;
+    cursor: pointer;
+    transition: filter 0.15s;
+  }
+  .node:hover rect { filter: brightness(0.95); }
+  .node.selected rect {
+    stroke-width: 3;
+    filter: drop-shadow(0 0 4px rgba(37, 99, 235, 0.4));
+  }
+  .node text {
+    font-family: ui-monospace, SF Mono, Menlo, Consolas, monospace;
+    font-size: 11px;
+    pointer-events: none;
+    text-anchor: middle;
+    dominant-baseline: middle;
+    user-select: none;
+  }
+  .node text.title { font-weight: 600; font-size: 12px; }
+  .node text.subtitle { font-size: 10px; fill: var(--muted); }
+  .pillar-data rect       { fill: var(--pillar-data); stroke: var(--pillar-data-border); }
+  .pillar-model rect      { fill: var(--pillar-model); stroke: var(--pillar-model-border); }
+  .pillar-training rect   { fill: var(--pillar-training); stroke: var(--pillar-training-border); }
+  .pillar-adoption rect   { fill: var(--pillar-adoption); stroke: var(--pillar-adoption-border); }
+  .pillar-script rect     { fill: var(--pillar-script); stroke: var(--pillar-script-border); }
+  .pillar-external rect   { fill: var(--pillar-external); stroke: var(--pillar-external-border); }
+  .edge { fill: none; stroke: #6b7280; stroke-width: 1.5; }
+  .edge.highlighted { stroke: var(--accent); stroke-width: 2.5; }
+  .edge-label {
+    font-size: 10px;
+    fill: var(--muted);
+    font-family: ui-monospace, SF Mono, Menlo, Consolas, monospace;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>RelGT / GFM — Interactive System Map</h1>
+  <p>Click any node to inspect its role, file location, inputs, outputs, and connections. The "Connects to" links cross-reference (and hop views) other components.</p>
+  <nav class="tabs" id="tabs">
+    <button data-view="components" class="active">Component Map</button>
+    <button data-view="batch">Per-Batch Tensor Flow</button>
+    <button data-view="pretrain">Pretraining Pipeline</button>
+    <button data-view="phase4">Phase-4 Holdout-Task</button>
+    <button data-view="phase5">Phase-5 Holdout-Dataset</button>
+  </nav>
+</header>
+<main>
+  <section class="canvas">
+    <div class="legend">
+      <div class="legend-item"><span class="legend-swatch" style="background: #fef3c7; border-color: #f59e0b"></span>External</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #d1fae5; border-color: #10b981"></span>Data layer</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #dbeafe; border-color: #3b82f6"></span>Model</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #ede9fe; border-color: #8b5cf6"></span>Training</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #fed7aa; border-color: #f97316"></span>Adoption</div>
+      <div class="legend-item"><span class="legend-swatch" style="background: #e4e4e7; border-color: #71717a"></span>Script / orchestration</div>
+    </div>
+    <div id="svg-host"></div>
+  </section>
+  <aside class="details" id="details">
+    <h2>Click a node</h2>
+    <p style="color: var(--muted)">Each node carries inputs, outputs, file location, and links to related components.</p>
+  </aside>
+</main>
+<script>
+// ============================================================
+// Per-node DETAILS — keyed by id; shared across views.
+// ============================================================
+const DETAILS = {};
+
+DETAILS.relbench = {
+  title: "relbench (external)",
+  file: "relbench.datasets.get_dataset / relbench.tasks.get_task / relbench.modeling.graph.make_pkey_fkey_graph",
+  pillar: "external",
+  role: "Source of truth for raw multi-table data and entity tasks. Returns a HeteroData graph plus per-table column stypes; provides task.evaluate(predictions) for the official metric set.",
+  inputs: ["dataset name (e.g. rel-event)", "task name (e.g. user-attendance)"],
+  outputs: ["HeteroData (PyG)", "col_to_stype dict", "EntityTask with task.evaluate"],
+  connections: ["graph_cache", "task_tokens", "task_evaluate"],
+  notes: [
+    "get_dataset(...).get_db is `@lru_cache(maxsize=None)`; the raw pickle (~25 GiB on rel-event) stays pinned to the bound method's cache. main_node_ddp.py and train_multi_task.py call `dataset.get_db.cache_clear()` after the HeteroData is materialized.",
+    "`upto_test_timestamp=True` (default) truncates entity rows past `train_cutoff` — the dev-kyaw / RelGT-paper guardrail. `--full_graph` flips it to False so autocomplete-task seeds (users-birthyear, results-position, ...) don't IndexError on val/test."
+  ]
+};
+DETAILS.graph_cache = {
+  title: "DatasetGraphCache",
+  file: "gfm_data/graph_cache.py:72",
+  pillar: "data",
+  role: "Per-dataset CSR adjacency. Replaces the dev-kyaw `dict[node_type] -> list[set]` (~80 B/edge) with packed int16/int32 arrays (~12 B/edge).",
+  inputs: [
+    "data: HeteroData",
+    "undirected: bool",
+    "name_prefix: optional str (multi-dataset namespace, e.g. 'rel-event')",
+    "tf_store_root: optional path → memmap-backed TF reads"
+  ],
+  outputs: [
+    "neighbors_set(src_type, src_idx) → Set[(dst_type, dst_idx)]",
+    "tf_view(raw_type, idx) → TensorFrame slice (in-RAM tf or TFStoreReader)",
+    "node_types / node_type_to_index / prefixed_to_raw mappings"
+  ],
+  connections: ["sampler", "task_tokens", "tf_store"],
+  notes: [
+    "Set iteration order is hash-determined and matches dev-kyaw bit-for-bit, so `random.sample` reproducibility holds across the refactor.",
+    "Out-of-bounds `src_idx` returns an empty set (Layer-1 safety net for autocomplete tasks under truncated CSR; see `docs/truncated_graph_caveat.md`).",
+    "`all_nodes` is lazy: eager materialization would cost ~8 GiB per rel-event rank just for Python tuple objects."
+  ]
+};
+DETAILS.tf_store = {
+  title: "TFStoreReader / build_dataset_tf_store",
+  file: "gfm_data/tf_store.py + tools/build_tf_store.py",
+  pillar: "data",
+  role: "Per-table memmap of TensorFrame columns so training can run on datasets too big to keep TFs in RAM.",
+  inputs: ["HeteroData (built from RelBench)", "out_dir for memmap files"],
+  outputs: [
+    "<out_dir>/<raw_type>/{numerical.bin, categorical.bin, ...} + meta.json",
+    "TFStoreReader.view(idx) → TensorFrame slice"
+  ],
+  connections: ["graph_cache", "build_tf_store"],
+  notes: [
+    "GPU is used for text embedding when available; CPU GloVe on rel-event is the difference between 5 minutes and 11 hours.",
+    "Phase 1 of `pretrain_p4d.sh` builds one dataset's TF store at a time so peak CPU RAM is bounded by the biggest single dataset."
+  ]
+};
+DETAILS.sampler = {
+  title: "sample_local_subgraph / gather_1_and_2_hop",
+  file: "gfm_data/sampler.py:118 / :34",
+  pillar: "data",
+  role: "Line-for-line port of dev-kyaw's seed sampler with CSR adjacency. Returns the K-token local subgraph and its [2, E] edge_index, bit-equal under fixed `random.seed`.",
+  inputs: ["DatasetGraphCache", "K", "seed (type, idx, time)", "seed_val for random.seed"],
+  outputs: [
+    "K NbrTokens = (type, idx, hop ∈ {0,1,2,3}, rel_time_days, connecting_1hops)",
+    "edge_index ∈ int32[2, E] over the K tokens"
+  ],
+  connections: ["graph_cache", "task_tokens", "precompute_shards"],
+  notes: [
+    "Time filter at sampler.py:69 (`data[type].time[idx] <= seed_time`) is the actual temporal-leakage barrier in both `--full_graph` modes.",
+    "Hop fallback: if too few 1+2-hop candidates exist, samples from `cache.all_nodes` with hop=3.",
+    "Three call sites: TaskTokens streaming `__getitem__`, in-process HDF5 precompute, and offline `tools/precompute_shards.py`."
+  ]
+};
+DETAILS.task_tokens = {
+  title: "TaskTokens",
+  file: "gfm_data/task_tokens.py:133",
+  pillar: "data",
+  role: "Per-(dataset, task, split) Dataset that yields a sample dict + label. Three sample-materialization modes.",
+  inputs: [
+    "DatasetGraphCache",
+    "EntityTask",
+    "K",
+    "split",
+    "mode ∈ {hdf5, streaming, precomputed_shards}",
+    "shards_dir / precomputed_dir",
+    "unified_type_map (multi-dataset)"
+  ],
+  outputs: [
+    "__getitem__(i) → (sample, label) with: types, indices, hops, times, edge_index, tfs, first_type, first_index, global_idx, task_id, task_type_id"
+  ],
+  connections: ["graph_cache", "sampler", "multi_task_concat", "collate"],
+  notes: [
+    "Regression targets are z-scored on the TRAIN split only; val/test call `adopt_target_stats(...)` so all three splits use the same μ/σ.",
+    "`_OffsetProxy` / `_ReverseOffsetProxy` replace per-node id dicts (saved ~22 GiB per instance on rel-event).",
+    "When `unified_type_map` is set, shard ids (per-cache local) are remapped to unified ids via a vectorized lookup; sentinel-fill catches stale/inconsistent shards."
+  ]
+};
+DETAILS.multi_task_concat = {
+  title: "MultiTaskConcat",
+  file: "gfm_data/multi_task_dataset.py:44",
+  pillar: "data",
+  role: "Concatenates N TaskTokens into a single Dataset. Stores per-task offsets and weights for the sampler.",
+  inputs: ["[(name, TaskTokens), ...]", "weights: list of float"],
+  outputs: ["__getitem__(global_idx) → child TaskTokens' (sample, label)", "task_of(idx) → task_id"],
+  connections: ["task_tokens", "dist_sampler", "collate"],
+  notes: ["Single-task-per-batch is a deliberate invariant (enforced by `DistributedMultiTaskSampler`) — keeps `grouped_tfs` a single-namespace dict and avoids cross-rank shape mismatches in DDP."]
+};
+DETAILS.dist_sampler = {
+  title: "DistributedMultiTaskSampler",
+  file: "gfm_data/multi_task_dataset.py:106",
+  pillar: "data",
+  role: "DDP-aware sampler that draws ONE task per step with prob ∝ w_t·|D_t|, using a global RNG seeded only by epoch so all ranks pick the same task at the same step.",
+  inputs: ["MultiTaskConcat", "batch_size", "seed", "drop_last"],
+  outputs: ["yields global indices into MultiTaskConcat in batch_size-sized contiguous runs"],
+  connections: ["multi_task_concat"],
+  notes: [
+    "Rank-partitioning uses round-robin (`perm[rank::world_size]`) AFTER the same shuffle on all ranks — so all ranks agree on which indices each rank holds without an extra sync.",
+    "Anchor-task step budget: `steps_t = round(B0 · w_t / w_0)`. Heavy-weight tasks oversample by wrapping their pool cursor."
+  ]
+};
+DETAILS.collate = {
+  title: "collate_single_task / collate_multi_task",
+  file: "gfm_data/collate.py:34 / :127",
+  pillar: "data",
+  role: "Stacks a list of (sample, label) into the runtime batch dict the model consumes.",
+  inputs: ["List[(sample, label)] from TaskTokens / MultiTaskConcat"],
+  outputs: [
+    "neighbor_{types,indices,hops,times}: [B, K]",
+    "grouped_tfs / grouped_indices: per-type bucketing of the K tokens",
+    "flat_batch_idx, flat_nbr_idx: scatter indices to put per-type encoder outputs back in [B,K,C]",
+    "edge_index: [2, ΣE_i] with K-offset",
+    "batch: [B*K], node_indices: [B] (global seed id)",
+    "labels, task_id, task_type_id, global_idx"
+  ],
+  connections: ["task_tokens", "multi_task_concat", "relgt"],
+  notes: ["Multi-task variant asserts single-task-per-batch and dispatches to the owning child TaskTokens for the per-type TF lookup."]
+};
+DETAILS.encoders = {
+  title: "Token-element Encoders",
+  file: "encoders.py — NeighborNodeTypeEncoder / NeighborHopEncoder / NeighborTimeEncoder / NeighborTfsEncoder / GNNPEEncoder",
+  pillar: "model",
+  role: "One encoder per token element. Outputs are LayerNorm'd then concatenated and fused via the `in_mixture` MLP.",
+  inputs: ["per-batch tensors: types[B,K] / hops[B,K] / times[B,K] / grouped_tfs / edge_index"],
+  outputs: ["five [B, K, C] tensors → concat to [B, K, 5C] → in_mixture → [B, K, C]"],
+  connections: ["relgt", "register_dataset"],
+  notes: [
+    "`NeighborNodeTypeEncoder` has a 'name path' (`List[List[str]]`): known names hit precomputed GloVe; unseen names go through `_resolve_unseen` which lazily computes and caches GloVe vectors. Used by the Phase-5 adoption path.",
+    "`NeighborTfsEncoder.register_dataset()` is the Phase-5 hook — adds new prefixed types onto its `node_type_map` and populates per-table `Shared{Numerical,Categorical,...}` encoders.",
+    "`ablate` flag drops one of {type, hop, time, tfs, gnn} so the in_mixture input goes from 5C → 4C."
+  ]
+};
+DETAILS.local_module = {
+  title: "LocalModule",
+  file: "local_module.py:7",
+  pillar: "model",
+  role: "Standard transformer encoder block over the K tokens (flash SDPA), followed by a learned attention pool that mixes the seed token with weighted neighbors.",
+  inputs: ["x_set: [B, K, C]"],
+  outputs: ["[B, C] (seed token + attn-pooled neighbors)"],
+  connections: ["relgt_layer"],
+  notes: ["EncoderLayer uses `F.scaled_dot_product_attention` — flash attention when available."]
+};
+DETAILS.codebook = {
+  title: "VectorQuantizerEMA",
+  file: "codebook.py:9",
+  pillar: "model",
+  role: "Learnable centroid bank with EMA-updated codebook + cluster sizes. Provides K/V for the global-attention path and the popularity bias.",
+  inputs: ["x: [B, C] (the seed-token projection)"],
+  outputs: [
+    "_embedding_output: [num_centroids, C] (K/V tensors)",
+    "_ema_cluster_size: [num_centroids] (popularity bias log term)"
+  ],
+  connections: ["relgt_layer"],
+  notes: [
+    "EMA update is wrapped in `autocast(disabled)` to keep FP32 precision on the buffers.",
+    "Raw stats (encodings_sum, dw) are `all_reduce`'d across DDP ranks BEFORE the EMA blend so the codebook stays in sync.",
+    "Laplace smoothing on cluster size; running BN stats are folded into `_embedding_output`."
+  ]
+};
+DETAILS.relgt_layer = {
+  title: "RelGTLayer",
+  file: "model.py:19",
+  pillar: "model",
+  role: "One transformer-style block: local attention (LocalModule) + optional global attention to VQ centroids, with `conv_type ∈ {local, global, full}`.",
+  inputs: ["x_set: [B, K, C]", "x: [B, C] (seed token)", "node_indices"],
+  outputs: ["[B, C] (local) or [B, 2C] (full = concat of local + global)"],
+  connections: ["local_module", "codebook", "relgt"],
+  notes: [
+    "Global path: Q from seed projection, K/V from VQ codebook (detached). Logits get a `log(_ema_cluster_size)` bias so popular centroids dominate — 'cluster popularity bias'.",
+    "`vq.update` is called only in training mode; the bias term feeds the NEXT batch."
+  ]
+};
+DETAILS.relgt = {
+  title: "RelGT",
+  file: "model.py:169",
+  pillar: "model",
+  role: "The backbone. Wraps the five encoders + `in_mixture` MLP + a stack of RelGTLayer blocks + a final MLP head.",
+  inputs: [
+    "neighbor_types/hops/times: [B, K]",
+    "node_indices: [B]",
+    "grouped_tf_dict (per-type TF buckets)",
+    "edge_index, batch (PE input)"
+  ],
+  outputs: [
+    "[B, out_channels] when out_channels=1 (single-task) → scalar prediction",
+    "[B, channels] when out_channels=channels (multi-task pretrain / adoption) → embedding"
+  ],
+  connections: ["encoders", "relgt_layer", "mt_relgt", "load_backbone"],
+  notes: [
+    "`load_backbone(meta_json, weights, schema_pt)` is the adoption-time classmethod: reads architectural constants from meta, schema_pt for `col_names_dict + col_stats_dict`, then loads `state_dict(strict=True)`. Defaults: eval+freeze on.",
+    "The trailing MLP head is a transient wrapper; at multi-task pretrain time `out_channels=channels` so the model's output is the embedding."
+  ]
+};
+DETAILS.mt_head = {
+  title: "MultiTaskHead",
+  file: "heads/multi_task_head.py:38",
+  pillar: "model",
+  role: "Per-task `Linear(channels, 1)`. Indexed by `task_id` at forward.",
+  inputs: ["h: [B, C] embedding from backbone", "task_id: [B] int64"],
+  outputs: ["[B] (logit for binary, real-valued for regression)"],
+  connections: ["mt_relgt"],
+  notes: ["Earlier shared boolean / numeric heads produced F1=0 on every binary task — the shared head defaulted to majority class across tasks with very different class balance. Per-task heads cost negligibly (5.6K vs 34M backbone)."]
+};
+DETAILS.mt_relgt = {
+  title: "MultiTaskRelGT",
+  file: "heads/multi_task_head.py:116",
+  pillar: "model",
+  role: "Wraps a `RelGT(out_channels=channels)` backbone with the per-task heads. `forward(task_id=None)` returns the raw embedding — the adoption-time extraction path.",
+  inputs: ["RelGT backbone", "channels", "num_tasks", "task_type_ids"],
+  outputs: [
+    "with task_id: [B] head prediction for the indexed task",
+    "with task_id=None: [B, channels] backbone embedding"
+  ],
+  connections: ["relgt", "mt_head", "mt_loss", "extract_emb"],
+  notes: ["`forward(task_id=None)` is exactly what `tools/extract_embeddings.py` calls."]
+};
+DETAILS.mt_loss = {
+  title: "MultiTaskLoss",
+  file: "losses/multi_task_loss.py:32",
+  pillar: "training",
+  role: "Per-row Huber (regression) / BCE (binary) dispatched by `task_type_id`. Aggregation modes: `none|per_task_mean|fixed:..|uncertainty`.",
+  inputs: ["pred [B]", "labels [B]", "task_id [B]", "task_type_id [B]"],
+  outputs: ["scalar loss", "info dict (per-task mean loss, counts — logged per step)"],
+  connections: ["mt_relgt", "train_multi_task"],
+  notes: [
+    "Default `none` = RT formula = plain batch mean over rows. Works because Huber on z-scored targets ~ O(1) and BCE ~ O(0.7).",
+    "`uncertainty` mode = Kendall et al. log σ² per task: L = Σ_t [(1/(2σ²)) L_t + log σ_t]."
+  ]
+};
+DETAILS.main_node_ddp = {
+  title: "main_node_ddp.py",
+  file: "main_node_ddp.py:1",
+  pillar: "training",
+  role: "torchrun entry point. Parses args, init_process_group, and dispatches: `--tasks` set → multi-task; otherwise → single-task dev-kyaw path (preserved for parity).",
+  inputs: [
+    "--dataset / --task (single-task)",
+    "--tasks 'ds.task[:w],...' (multi-task)",
+    "--mode {hdf5,streaming,precomputed_shards}",
+    "--shards_dir, --tf_store_dir",
+    "--full_graph, --backbone_init",
+    "--load_concurrency"
+  ],
+  outputs: ["finetuned.pt (single-task) OR delegates to train_multi_task.run"],
+  connections: ["train_multi_task", "relgt"],
+  notes: [
+    "`--backbone_init <path>` warm-starts shared layers from a pretrained backbone with `strict=False` — per-table encoder buffers stay at fresh init.",
+    "Single-task path: SyncBN convert + DDP wrap with `find_unused_parameters=True`; eval gather via `dist.gather_object` on rank 0."
+  ]
+};
+DETAILS.train_multi_task = {
+  title: "train_multi_task.run",
+  file: "train_multi_task.py:668",
+  pillar: "training",
+  role: "Multi-task pretraining run. Builds caches/tokens, the model + per-task heads, and runs the train/val loop with best-by-macro checkpointing.",
+  inputs: ["args (from main_node_ddp.py argparse)", "TASKS_CSV"],
+  outputs: [
+    "{out_dir}/multi_task/best_full.pt",
+    "{out_dir}/multi_task/best_backbone.pt",
+    "{out_dir}/multi_task/backbone_meta.json",
+    "{out_dir}/multi_task/backbone_schema.pt",
+    "{seed}.json (per-task test metrics)"
+  ],
+  connections: ["main_node_ddp", "mt_relgt", "mt_loss", "save_ckpt", "dist_sampler"],
+  notes: [
+    "Datasets are loaded under chunked DDP barriers (`load_concurrency`, default 1) so peak transient RAM is one rank's load, not 8x.",
+    "`_release_cache_data` drops `cache.data` + `token.data` references AFTER `_build_model` so DataLoader worker forks don't COW-duplicate the HeteroData.",
+    "Eval gather goes through a gloo subgroup (CPU tensors) — NCCL on p4d rejects CPU-tensor `dist.gather`.",
+    "Macro score = mean over tasks of (AUROC | 1/(1+MAE)) — both in (0,1], higher is better, comparable across binary+regression."
+  ]
+};
+DETAILS.save_ckpt = {
+  title: "_save_best_checkpoint → 4 artifacts",
+  file: "train_multi_task.py:583",
+  pillar: "training",
+  role: "Writes the best-val-macro checkpoint as four files. The three highlighted ones constitute the adoption-portable artifact set.",
+  inputs: ["MultiTaskRelGT model", "meta_dict (architectural constants + node_type_map + col_names_dict + col_stats_dict)"],
+  outputs: [
+    "best_full.pt — full state_dict (resume / final test eval)",
+    "best_backbone.pt — backbone state_dict only (adoption-portable)",
+    "backbone_meta.json — channels / num_layers / num_heads / num_neighbors / num_centroids / max_neighbor_hop / global_dim / dropouts / gt_conv_type / ablate / gnn_pe_dim / node_type_map / best_epoch / best_val_macro",
+    "backbone_schema.pt — col_names_dict + col_stats_dict (StatType enum + NaN/inf floats not JSON-friendly)"
+  ],
+  connections: ["train_multi_task", "load_backbone"],
+  notes: [
+    "Order matters: best_full first so a partial-write crash leaves the more-conservative artifact behind.",
+    "`RelGT.load_backbone` reads `{meta_json_path, weights_path, schema_pt_path}` — that's the contract for adoption."
+  ]
+};
+DETAILS.load_backbone = {
+  title: "RelGT.load_backbone",
+  file: "model.py:327 (also: heads/multi_task_head.py:174)",
+  pillar: "adoption",
+  role: "Adoption-time classmethod: reconstruct the backbone from the four artifacts. Used by `extract_embeddings`.",
+  inputs: [
+    "backbone_meta.json",
+    "best_backbone.pt",
+    "backbone_schema.pt",
+    "map_location, eval_mode=True (default), freeze=True (default)"
+  ],
+  outputs: ["RelGT instance with backbone weights loaded (strict=True), in eval mode, requires_grad=False"],
+  connections: ["save_ckpt", "extract_emb"],
+  notes: [
+    "`out_channels` is set to `channels` at load — the saved backbone was trained with the multi-task convention so its forward returns embeddings.",
+    "`register_dataset` is auto-called by NeighborTfsEncoder (PR1.2 backward-compat) so per-table buffers populate to the same shape as the saved state_dict."
+  ]
+};
+DETAILS.register_dataset = {
+  title: "NeighborTfsEncoder.register_dataset / NeighborNodeTypeEncoder._resolve_unseen",
+  file: "encoders.py — NeighborTfsEncoder + NeighborNodeTypeEncoder._forward_names",
+  pillar: "adoption",
+  role: "Phase-5 adoption hook: extends the encoder onto a target dataset whose prefixed types weren't part of pretraining.",
+  inputs: [
+    "node_type_map (new prefixed → integer ids appended after the existing max)",
+    "col_names_dict per new table",
+    "col_stats_dict per new table (from compute_dataset_stats)"
+  ],
+  outputs: ["mutated encoder state: new prefixed types in node_type_map; new SharedX encoder buffers; lazy GloVe cache for unseen names"],
+  connections: ["encoders", "compute_dataset_stats", "extract_emb"],
+  notes: [
+    "Triggered by `tools/extract_embeddings.py --register_new_dataset`.",
+    "Without this, extract on a held-out target dataset would either KeyError on the prefixed type or silently alias into a wrong type id."
+  ]
+};
+DETAILS.compute_dataset_stats = {
+  title: "compute_dataset_stats",
+  file: "tools/compute_dataset_stats.py",
+  pillar: "adoption",
+  role: "Walks a TF store + per-table meta.json to construct the col_stats_dict needed by `register_dataset`.",
+  inputs: [
+    "tf_store_root (e.g. ~/.cache/relbench_examples/tf_store_full/rel-event)",
+    "name_prefix (e.g. 'rel-event::')"
+  ],
+  outputs: ["col_stats_dict keyed by prefixed type"],
+  connections: ["tf_store", "register_dataset", "extract_emb"]
+};
+DETAILS.extract_emb = {
+  title: "tools/extract_embeddings",
+  file: "tools/extract_embeddings.py",
+  pillar: "adoption",
+  role: "Step 1 of adoption: load the backbone, build the target dataset's cache + TaskTokens, run `forward(task_id=None)`, dump per-split [N, C] embeddings + labels + global_idx.",
+  inputs: [
+    "--backbone_meta / --backbone_weights / --backbone_schema (the 4-file trio minus best_full)",
+    "--dataset / --task / --split (all|train|val|test)",
+    "--num_neighbors / --batch_size (must match pretrain)",
+    "--register_new_dataset (Phase 5 only)",
+    "--full_graph (must match pretrain)",
+    "--use_tf_store (memmap TF reads)",
+    "--precomputed_dir (override per-seed for parallel extracts)"
+  ],
+  outputs: ["{out_dir}/{train,val,test}.pt = {embeddings, labels, global_idx, channels, dataset, task, split}"],
+  connections: ["load_backbone", "register_dataset", "graph_cache", "task_tokens", "finetune_head", "tabpfn_eval"],
+  notes: [
+    "Adopts train target stats on val/test — otherwise z-score divergence at the head's input.",
+    "Seeds random / numpy / torch BEFORE precompute since `gfm_data/sampler` picks K-of-N via `random.sample`. For per-seed sweeps the launcher also wipes the per-row HDF5 cache so the sampler regenerates."
+  ]
+};
+DETAILS.finetune_head = {
+  title: "tools/finetune_head",
+  file: "tools/finetune_head.py",
+  pillar: "adoption",
+  role: "Step 2a: train a `Linear(C,1)` or 2-layer MLP head on the extracted embeddings (frozen backbone). Best-val-loss epoch → `task.evaluate` on test.",
+  inputs: ["embeddings_dir/{train,val,test}.pt", "--head linear|mlp2", "--epochs / --lr / --batch_size", "--seed"],
+  outputs: ["finetuned.pt = {head_state_dict, head_kind, channels, task_kind, seed, best_epoch, best_val_loss, test_metrics}"],
+  connections: ["extract_emb", "task_evaluate"],
+  notes: [
+    "Loss = BCEWithLogits (binary) / L1 (regression).",
+    "Test predictions are scattered into [num_test_rows] by global_idx so RelBench's evaluator matches them to the test table's row order.",
+    "`--unfreeze_after_epoch` is reserved for warm-then-unfreeze; not yet implemented."
+  ]
+};
+DETAILS.tabpfn_eval = {
+  title: "tools/tabpfn_eval",
+  file: "tools/tabpfn_eval.py",
+  pillar: "adoption",
+  role: "Step 2b: post-hoc TabPFN v2 fit on (train_emb, train_labels), predict on test_emb. No gradient anywhere.",
+  inputs: [
+    "embeddings_dir/{train,test[,val]}.pt",
+    "--projector auto|none|pca64",
+    "--max_train_samples (cap 10k)",
+    "--device / --n_estimators / --test_chunk_size",
+    "--seed"
+  ],
+  outputs: ["tabpfn.json = {task_kind, projector, channels_in, channels_post_projector, n_train_full, n_train_used, test_metrics}"],
+  connections: ["extract_emb", "task_evaluate"],
+  notes: [
+    "`auto`: pass raw if channels ≤ 500, else PCA-cap to 500 (fit on TRAIN only, no leakage).",
+    "Train support set capped at 10k (TabPFN v2 limit); binary tasks subsample stratified to preserve class share.",
+    "Test inference is chunked: TabPFN's attention is `support_set × test_batch`, so a 193k-row test set against a 10k support OOMs a 12 GB GPU in one shot."
+  ]
+};
+DETAILS.task_evaluate = {
+  title: "EntityTask.evaluate(predictions)",
+  file: "relbench (external)",
+  pillar: "external",
+  role: "Official RelBench evaluator. Reads the masked test labels via `task.get_table('test', mask_input_cols=False)` internally and computes the task's metric set (roc_auc / mae / multilabel_auprc_macro / ...).",
+  inputs: ["predictions: np.ndarray of shape [num_test_rows]"],
+  outputs: ["metrics dict (e.g. {roc_auc: 0.78, accuracy: 0.71, f1: 0.42})"],
+  connections: ["finetune_head", "tabpfn_eval", "train_multi_task"],
+  notes: ["finetune_head and tabpfn_eval both scatter predictions into a [num_test_rows] array indexed by global_idx so the evaluator's row order matches."]
+};
+DETAILS.build_tf_store = {
+  title: "tools/build_tf_store",
+  file: "tools/build_tf_store.py",
+  pillar: "adoption",
+  role: "Phase-1 of pretrain_p4d.sh: per-dataset memmap TF store. Run once per dataset before training.",
+  inputs: ["--dataset", "--out_dir", "--full_graph"],
+  outputs: ["<out_dir>/<raw_table>/{numerical.bin, categorical.bin, multicategorical.bin, ...} + meta.json"],
+  connections: ["tf_store", "pretrain_p4d"]
+};
+DETAILS.precompute_shards = {
+  title: "tools/precompute_shards",
+  file: "tools/precompute_shards.py",
+  pillar: "adoption",
+  role: "Phase-2 of pretrain_p4d.sh: per-(dataset, task) memmap sample shards via fork+COW worker pool.",
+  inputs: ["--dataset / --task / --K / --shard_size / --workers / --name_prefix / --splits / --full_graph"],
+  outputs: ["<out_dir>/<K>/<split>/shard_NNNN.{types,indices,hops,times,edges,edges_offsets} + meta.json"],
+  connections: ["sampler", "shard_io", "pretrain_p4d"],
+  notes: [
+    "`--name_prefix` MUST match the prefix the multi-task trainer uses at runtime (`train_multi_task.py` passes `name_prefix=ds_name`). Mismatch = KeyError on prefixed-type lookup.",
+    "Workers fork after one cache load so per-table memmap TF + CSR adjacency are COW-shared. Default `SHARD_WORKERS=10` saturates p4d.24xlarge's 96 vCPUs."
+  ]
+};
+DETAILS.shard_io = {
+  title: "ShardWriter / ShardReader",
+  file: "gfm_data/shard_io.py",
+  pillar: "data",
+  role: "Memmap layout for sample shards. Replaces the dev-kyaw single-HDF5-per-task layout so DataLoader workers don't contend on HDF5's process-wide lock.",
+  inputs: ["shard_NNNN.{types,indices,hops,times,edges,edges_offsets} files"],
+  outputs: ["read(idx) → {types, indices, hops, times, edge_index} dict"],
+  connections: ["task_tokens", "precompute_shards"]
+};
+DETAILS.pretrain_p4d = {
+  title: "scripts/pretrain_p4d.sh",
+  file: "scripts/pretrain_p4d.sh",
+  pillar: "script",
+  role: "End-to-end multi-task pretraining orchestrator on p4d.24xlarge. 3 phases + cgroup-aware memory watchdog.",
+  inputs: [
+    "DATASETS / TASKS_CSV (override)",
+    "K / BATCH / CHANNELS / NUM_LAYERS / HEADS / CENTROIDS",
+    "EPOCHS / STEPS_PER_TASK (= MAX_STEPS / N_tasks)",
+    "FULL_GRAPH (1 → use upto_test_timestamp=False)",
+    "PARALLEL_TF_BUILDS / PARALLEL_SHARD_BUILDS / SHARD_WORKERS",
+    "MEM_WATCHDOG_PCT (default 92, anon only — page cache excluded)"
+  ],
+  outputs: [
+    "Phase 1: TF stores at $TF_STORE/<ds>/...",
+    "Phase 2: shards at $SHARDS/<ds>/<task>/<K>/...",
+    "Phase 3: best_full.pt + best_backbone.pt + backbone_meta.json + backbone_schema.pt + train.log"
+  ],
+  connections: ["build_tf_store", "precompute_shards", "main_node_ddp", "save_ckpt", "holdout_task_dev", "holdout_dataset_eval"],
+  notes: [
+    "Watchdog samples cgroup `memory.stat` (anon on v2, rss on v1) — excludes file-backed page cache so memmap TF reads don't trip false alarms.",
+    "Pre-flight kills any stale `main_node_ddp.py` procs so the rdzv port doesn't EADDRINUSE.",
+    "`SKIP_BUILD` / `SKIP_PHASE_1` / `SKIP_PHASE_2` jump straight to phase 3 after verifying `.done` sentinels."
+  ]
+};
+DETAILS.holdout_task_dev = {
+  title: "scripts/holdout_task_dev.sh",
+  file: "scripts/holdout_task_dev.sh",
+  pillar: "script",
+  role: "Phase-4 driver. Pretrain ONE backbone on the union of (all-but-one) tasks across DATASETS, then for each held-out task run extract → finetune_head + tabpfn.",
+  inputs: [
+    "DATASETS (default 'rel-f1 rel-event')",
+    "HOLDOUTS ('rel-f1:driver-top3 rel-event:user-attendance')",
+    "EPOCHS / STEPS_PER_TASK / SEED",
+    "NPROC (≥2 → delegates to pretrain_p4d.sh; =1 → inline streaming)",
+    "FULL_GRAPH (default 1)"
+  ],
+  outputs: [
+    "$OUT_DIR_BASE/pretrain/multi_task/{best_*, backbone_meta.json, backbone_schema.pt}",
+    "$OUT_DIR_BASE/<ds>.<holdout>/embeddings/{train,val,test}.pt",
+    "$OUT_DIR_BASE/<ds>.<holdout>/finetune_head/finetuned.pt",
+    "$OUT_DIR_BASE/<ds>.<holdout>/tabpfn/tabpfn.json",
+    "$OUT_DIR_BASE/summary.json"
+  ],
+  connections: ["pretrain_p4d", "main_node_ddp", "extract_emb", "finetune_head", "tabpfn_eval"],
+  notes: [
+    "PRETRAIN_TASKS_CSV = ⋃_ds (DEFAULT_ALL_TASKS[ds] − HOLDOUT_OF[ds]).",
+    "Holdouts are mixed-metric (1 binary + 1 regression) so the GFM claim is tested across both head kinds.",
+    "Defensive check: holdout tasks must NOT appear in PRETRAIN_TASKS_CSV; the script aborts if they do."
+  ]
+};
+DETAILS.holdout_dataset_eval = {
+  title: "scripts/holdout_dataset_eval.sh",
+  file: "scripts/holdout_dataset_eval.sh",
+  pillar: "script",
+  role: "Phase-5 driver: leave-one-dataset-out across the 9 RelBench v2 datasets supported by the adoption pipeline. Pretrain on SOURCE, adopt to TARGET via `register_dataset`.",
+  inputs: [
+    "TARGET (default 'rel-event'; holdout dataset)",
+    "SOURCE (default = SUPPORTED_DATASETS minus TARGET)",
+    "SOURCE_TASKS_CSV / TARGET_TASKS_CSV (auto-resolve from per-dataset defaults)",
+    "SEEDS (default '0 1 2'; 3-seed adoption sweep)",
+    "EPOCHS / STEPS_PER_TASK / NPROC / FULL_GRAPH"
+  ],
+  outputs: [
+    "$RUN_DIR/pretrain/multi_task/{best_*, backbone_meta.json, backbone_schema.pt}",
+    "$RUN_DIR/<task>/seed<S>/embeddings/{train,val,test}.pt",
+    "$RUN_DIR/<task>/seed<S>/finetune_head/finetuned.pt",
+    "$RUN_DIR/<task>/seed<S>/tabpfn/tabpfn.json",
+    "$RUN_DIR/summary.json (mean ± SD across seeds per task)"
+  ],
+  connections: ["pretrain_p4d", "build_tf_store", "extract_emb", "register_dataset", "finetune_head", "tabpfn_eval"],
+  notes: [
+    "Phase A: parallel extracts via GPU pool (one job per (task, seed), each on its own GPU; per-seed `--precomputed_dir` avoids HDF5 races).",
+    "Phase B: finetune_head + tabpfn_eval sequential (cheap; bottleneck was extract).",
+    "Per-seed each repeat wipes `~/.cache/relbench_examples/precomputed/<TARGET>/<task>/` so the sampler regenerates under the new RNG.",
+    "FULL_GRAPH must match what pretrain used — otherwise seed-id indexing differs between train and adoption."
+  ]
+};
+// Tensor-flow-specific synthetic nodes
+DETAILS.tf_in_mixture = {
+  title: "in_mixture (concat → MLP → C)",
+  file: "model.py:221",
+  pillar: "model",
+  role: "Fuses the five LayerNorm'd encoder outputs (or four, if `--ablate` drops one).",
+  inputs: ["concat([type_emb, hop_emb, time_emb, tfs_emb, pe_emb]): [B, K, 5C]"],
+  outputs: ["[B, K, C]"],
+  connections: ["encoders", "relgt"]
+};
+DETAILS.tf_seed_pick = {
+  title: "x = x_set[:, 0, :]  (seed token)",
+  file: "model.py:309",
+  pillar: "model",
+  role: "Position 0 in the K-token sequence is the seed entity (fixed by the sampler). The global path uses this as Q.",
+  inputs: ["x_set: [B, K, C]"],
+  outputs: ["x: [B, C]"],
+  connections: ["relgt", "relgt_layer"]
+};
+DETAILS.tf_ffs = {
+  title: "ffs (BN → FFN → BN)",
+  file: "model.py:248",
+  pillar: "model",
+  role: "Per-layer feed-forward block sandwiched between BatchNorms.",
+  inputs: ["[B, K, h_times*C] from RelGTLayer"],
+  outputs: ["[B, K, C]"],
+  connections: ["relgt_layer", "relgt"]
+};
+DETAILS.tf_head_mlp = {
+  title: "head MLP",
+  file: "model.py:261",
+  pillar: "model",
+  role: "Final 2-layer MLP. With `out_channels=channels` (multi-task), this is an identity-shape projection that produces the embedding; with `out_channels=1` it's the single-task scalar prediction.",
+  inputs: ["[B, K, C]"],
+  outputs: ["[B, K, out_channels]"],
+  connections: ["relgt"]
+};
+// Pretraining-pipeline-specific
+DETAILS.phase0 = {
+  title: "Phase 0: enumerate tasks",
+  file: "scripts/pretrain_p4d.sh:256-308",
+  pillar: "script",
+  role: "Lists every BINARY_CLASSIFICATION + REGRESSION task across DATASETS via `relbench.tasks.get_task_names`; emits `'ds.task:1.0,...'` to stdout (relbench's stdout chatter is redirected to stderr). Skipped when `TASKS_CSV` is set.",
+  inputs: ["DATASETS_FILTER env"],
+  outputs: ["TASKS_CSV"],
+  connections: ["pretrain_p4d", "main_node_ddp"]
+};
+DETAILS.watchdog = {
+  title: "Memory watchdog",
+  file: "scripts/pretrain_p4d.sh:610-748",
+  pillar: "script",
+  role: "Polls cgroup `memory.stat` (anon on v2, rss on v1; falls back to `/proc/meminfo` Active+Inactive(anon)). SIGTERMs torchrun's process group when anon ≥ MEM_WATCHDOG_PCT% of the cgroup limit, then SIGKILLs after a 30s grace.",
+  inputs: ["MEM_WATCHDOG_PCT (default 92)", "MEM_WATCHDOG_INTERVAL (default 3s)"],
+  outputs: ["clean SIGTERM → torchrun exits → log flushes; avoids kubelet OOMKilled which would truncate train.log"],
+  connections: ["pretrain_p4d"],
+  notes: ["Anon-only — file-backed page cache (memmap TF + shards) is reclaimable so `memory.current` would trip false alarms."]
+};
+DETAILS.ckpt_files = {
+  title: "Checkpoint artifacts (4 files)",
+  file: "{out_dir}/multi_task/",
+  pillar: "training",
+  role: "The artifact set that constitutes a 'pretrained backbone' for adoption.",
+  inputs: ["best epoch's MultiTaskRelGT state + meta_dict from train_multi_task"],
+  outputs: [
+    "best_full.pt — full state_dict (resume / final test eval)",
+    "best_backbone.pt — backbone state_dict only (adoption-portable)",
+    "backbone_meta.json — architectural constants + node_type_map + best_epoch + best_val_macro",
+    "backbone_schema.pt — col_names_dict + col_stats_dict (StatType enum + NaN/inf floats not JSON-friendly)"
+  ],
+  connections: ["save_ckpt", "load_backbone"]
+};
+// Phase-4 specific
+DETAILS.p4_pretrain_block = {
+  title: "Pretrain on PRETRAIN_TASKS_CSV (= ⋃ all-but-holdout)",
+  file: "scripts/holdout_task_dev.sh:309-409",
+  pillar: "script",
+  role: "Phase-4 pretrain step. NPROC≥2 delegates to pretrain_p4d.sh; NPROC=1 runs `torchrun --nproc_per_node 1 main_node_ddp.py --tasks ... --mode streaming` inline.",
+  inputs: [
+    "PRETRAIN_TASKS_CSV (auto-built: every default task per ds, minus the holdout)",
+    "K, BATCH, CHANNELS, NUM_LAYERS, HEADS, CENTROIDS (paper-config on p4d, laptop-sized otherwise)",
+    "EPOCHS / STEPS_PER_TASK / SEED",
+    "FULL_GRAPH"
+  ],
+  outputs: ["$PRETRAIN_DIR/multi_task/{best_full.pt, best_backbone.pt, backbone_meta.json, backbone_schema.pt} + run.log"],
+  connections: ["holdout_task_dev", "pretrain_p4d", "main_node_ddp", "save_ckpt"]
+};
+DETAILS.p4_extract = {
+  title: "extract_embeddings (Phase 4)",
+  file: "tools/extract_embeddings.py — invoked from holdout_task_dev.sh:435-457",
+  pillar: "adoption",
+  role: "Step 3 of Phase 4. SAME dataset as pretrain → no `--register_new_dataset` needed; the encoder's prefixed types are already populated.",
+  inputs: [
+    "backbone_meta + backbone_weights + backbone_schema (pretrain artifacts)",
+    "--dataset / --task = the held-out task on the same dataset",
+    "--full_graph (must match pretrain)"
+  ],
+  outputs: ["$TASK_DIR/embeddings/{train,val,test}.pt"],
+  connections: ["ckpt_files", "extract_emb", "task_tokens", "load_backbone"]
+};
+DETAILS.p4_finetune = {
+  title: "finetune_head (Phase 4)",
+  file: "tools/finetune_head.py",
+  pillar: "adoption",
+  role: "Linear/mlp2 head trained on the extracted embeddings (frozen backbone). The GFM-claim test: can a `Linear(C,1)` on the frozen backbone hit a reasonable test metric on a held-out task head?",
+  inputs: ["embeddings_dir/{train,val,test}.pt", "--head linear / --epochs 50 / --lr 1e-3"],
+  outputs: ["finetuned.pt with test_metrics from task.evaluate"],
+  connections: ["finetune_head", "extract_emb"]
+};
+DETAILS.p4_tabpfn = {
+  title: "tabpfn_eval (Phase 4)",
+  file: "tools/tabpfn_eval.py",
+  pillar: "adoption",
+  role: "Pure post-hoc TabPFN — no gradient anywhere. Run alongside finetune_head as a complementary adoption method.",
+  inputs: ["embeddings_dir/{train,val,test}.pt", "--projector auto"],
+  outputs: ["tabpfn.json with test_metrics"],
+  connections: ["tabpfn_eval", "extract_emb"]
+};
+DETAILS.p4_summary = {
+  title: "summary.json",
+  file: "$OUT_DIR_BASE/summary.json (written by holdout_task_dev.sh:485-529)",
+  pillar: "script",
+  role: "Cross-holdout verdict: per-holdout test_metrics for both adoption methods (finetune_head + tabpfn).",
+  inputs: ["per-holdout finetuned.pt + tabpfn.json"],
+  outputs: ["JSON dict keyed by '<ds>.<holdout>' with finetune_head and tabpfn entries"],
+  connections: ["holdout_task_dev"]
+};
+// Phase-5 specific
+DETAILS.p5_pretrain_block = {
+  title: "Pretrain on SOURCE",
+  file: "scripts/holdout_dataset_eval.sh:391-489",
+  pillar: "script",
+  role: "Phase-5 pretrain step. NPROC≥2 delegates to pretrain_p4d.sh with `TASKS_CSV=SOURCE_TASKS_CSV`; NPROC=1 runs streaming torchrun inline. The TARGET dataset is NOT in SOURCE — the backbone never sees its schema during pretrain.",
+  inputs: ["SOURCE_TASKS_CSV (⋃ default tasks of each SOURCE dataset)", "DATASETS=SOURCE_LIST"],
+  outputs: ["$PRETRAIN_DIR/multi_task/{best_*, backbone_meta.json, backbone_schema.pt}"],
+  connections: ["holdout_dataset_eval", "pretrain_p4d", "save_ckpt"]
+};
+DETAILS.p5_target_tf = {
+  title: "Pre-build TARGET TF store",
+  file: "scripts/holdout_dataset_eval.sh:401-408",
+  pillar: "script",
+  role: "Builds `tf_store_full/$TARGET` so the adoption-time `extract_embeddings` can use `--use_tf_store` (memmap TF reads). Done outside pretrain_p4d.sh because TARGET isn't in $DATASETS.",
+  inputs: ["TARGET dataset name", "FULL_GRAPH (must match pretrain)"],
+  outputs: ["$TF_STORE/$TARGET/<table>/{numerical.bin, categorical.bin, ...} + meta.json"],
+  connections: ["holdout_dataset_eval", "build_tf_store"]
+};
+DETAILS.p5_extract = {
+  title: "extract_embeddings (Phase 5, parallel)",
+  file: "tools/extract_embeddings.py — invoked from holdout_dataset_eval.sh:567-606",
+  pillar: "adoption",
+  role: "Step 3 of Phase 5. CROSS-dataset → `--register_new_dataset` is REQUIRED so the encoder learns the target's prefixed types + per-table stats. Phase A of the launcher: GPU-pooled parallel run, one job per (target_task × seed).",
+  inputs: [
+    "backbone_meta + backbone_weights + backbone_schema",
+    "--dataset $TARGET --task <each TARGET task>",
+    "--register_new_dataset (calls compute_dataset_stats + register_dataset)",
+    "--use_tf_store (reads from pre-built tf_store_full/$TARGET)",
+    "--seed (per-row sampler RNG)",
+    "--precomputed_dir per-(task, seed) so extracts don't race on HDF5"
+  ],
+  outputs: ["$RUN_DIR/<task>/seed<S>/embeddings/{train,val,test}.pt"],
+  connections: ["holdout_dataset_eval", "extract_emb", "register_dataset", "load_backbone"]
+};
+DETAILS.p5_finetune = {
+  title: "finetune_head (Phase 5, per seed)",
+  file: "tools/finetune_head.py",
+  pillar: "adoption",
+  role: "Linear head per (target_task, seed). Sequential after Phase A.",
+  inputs: ["per-seed embeddings", "--seed $ADOPT_SEED"],
+  outputs: ["seed<S>/finetune_head/finetuned.pt"],
+  connections: ["finetune_head", "extract_emb"]
+};
+DETAILS.p5_tabpfn = {
+  title: "tabpfn_eval (Phase 5, per seed)",
+  file: "tools/tabpfn_eval.py",
+  pillar: "adoption",
+  role: "Post-hoc TabPFN per (target_task, seed). Sequential after Phase A.",
+  inputs: ["per-seed embeddings", "--seed $ADOPT_SEED"],
+  outputs: ["seed<S>/tabpfn/tabpfn.json"],
+  connections: ["tabpfn_eval", "extract_emb"]
+};
+DETAILS.p5_summary = {
+  title: "summary.json",
+  file: "$RUN_DIR/summary.json (written by holdout_dataset_eval.sh:649-741)",
+  pillar: "script",
+  role: "Per-task aggregate: mean ± SD of test_metrics across SEEDS, separately for finetune_head and tabpfn.",
+  inputs: ["per-seed finetuned.pt + tabpfn.json"],
+  outputs: ["JSON: {source, target, source_tasks, target_tasks, epochs, seeds, per_task: {<task>: {finetune_head_seeds, finetune_head_summary, tabpfn_seeds, tabpfn_summary}}}"],
+  connections: ["holdout_dataset_eval"]
+};
+
+// ============================================================
+// Per-view layout: nodes (id + box) + edges
+// ============================================================
+const VIEWS = {
+  components: {
+    width: 1240, height: 920,
+    nodes: [
+      // External top
+      {id: "relbench",          x: 40,  y: 30,  w: 240, h: 50},
+      // Data column (x=40)
+      {id: "graph_cache",       x: 40,  y: 120, w: 240, h: 60},
+      {id: "tf_store",          x: 40,  y: 210, w: 240, h: 50},
+      {id: "sampler",           x: 40,  y: 290, w: 240, h: 50},
+      {id: "task_tokens",       x: 40,  y: 370, w: 240, h: 60},
+      {id: "multi_task_concat", x: 40,  y: 460, w: 240, h: 50},
+      {id: "dist_sampler",      x: 40,  y: 540, w: 240, h: 60},
+      {id: "collate",           x: 40,  y: 630, w: 240, h: 50},
+      // Model column (x=340)
+      {id: "encoders",          x: 340, y: 120, w: 280, h: 80},
+      {id: "local_module",      x: 340, y: 230, w: 280, h: 50},
+      {id: "codebook",          x: 340, y: 310, w: 280, h: 50},
+      {id: "relgt_layer",       x: 340, y: 400, w: 280, h: 60},
+      {id: "relgt",             x: 340, y: 500, w: 280, h: 60},
+      {id: "mt_head",           x: 340, y: 590, w: 280, h: 50},
+      {id: "mt_relgt",          x: 340, y: 670, w: 280, h: 60},
+      // Training column (x=700)
+      {id: "main_node_ddp",     x: 700, y: 30,  w: 240, h: 60},
+      {id: "train_multi_task",  x: 700, y: 130, w: 240, h: 70},
+      {id: "mt_loss",           x: 700, y: 240, w: 240, h: 50},
+      {id: "save_ckpt",         x: 700, y: 320, w: 240, h: 80},
+      // Adoption column (x=700/980)
+      {id: "load_backbone",     x: 700, y: 450, w: 240, h: 60},
+      {id: "register_dataset",  x: 700, y: 540, w: 240, h: 60},
+      {id: "compute_dataset_stats", x: 700, y: 630, w: 240, h: 50},
+      {id: "task_evaluate",     x: 700, y: 720, w: 240, h: 50},
+      {id: "extract_emb",       x: 980, y: 540, w: 220, h: 60},
+      {id: "finetune_head",     x: 980, y: 720, w: 220, h: 50},
+      {id: "tabpfn_eval",       x: 980, y: 800, w: 220, h: 50},
+    ],
+    edges: [
+      {from: "relbench", to: "graph_cache", label: "HeteroData"},
+      {from: "relbench", to: "task_tokens", label: "EntityTask"},
+      {from: "graph_cache", to: "tf_store", label: "tf_view dispatch", style: "dashed"},
+      {from: "graph_cache", to: "sampler"},
+      {from: "graph_cache", to: "task_tokens"},
+      {from: "sampler", to: "task_tokens"},
+      {from: "task_tokens", to: "multi_task_concat"},
+      {from: "multi_task_concat", to: "dist_sampler"},
+      {from: "multi_task_concat", to: "collate"},
+      {from: "dist_sampler", to: "collate"},
+      {from: "collate", to: "relgt", label: "batch dict"},
+      {from: "encoders", to: "relgt"},
+      {from: "local_module", to: "relgt_layer"},
+      {from: "codebook", to: "relgt_layer"},
+      {from: "relgt_layer", to: "relgt"},
+      {from: "relgt", to: "mt_relgt"},
+      {from: "mt_head", to: "mt_relgt"},
+      {from: "mt_relgt", to: "mt_loss"},
+      {from: "main_node_ddp", to: "train_multi_task"},
+      {from: "train_multi_task", to: "mt_loss"},
+      {from: "train_multi_task", to: "save_ckpt"},
+      {from: "save_ckpt", to: "load_backbone", label: "4 files"},
+      {from: "load_backbone", to: "extract_emb"},
+      {from: "register_dataset", to: "extract_emb", label: "Phase 5"},
+      {from: "compute_dataset_stats", to: "register_dataset"},
+      {from: "extract_emb", to: "finetune_head"},
+      {from: "extract_emb", to: "tabpfn_eval"},
+      {from: "finetune_head", to: "task_evaluate"},
+      {from: "tabpfn_eval", to: "task_evaluate"},
+    ]
+  },
+  batch: {
+    width: 1100, height: 760,
+    nodes: [
+      {id: "task_tokens",   x: 40,  y: 40,  w: 220, h: 60},
+      {id: "collate",       x: 320, y: 40,  w: 220, h: 60},
+      {id: "encoders",      x: 600, y: 40,  w: 220, h: 60},
+      {id: "tf_in_mixture", x: 600, y: 140, w: 220, h: 60},
+      {id: "tf_seed_pick",  x: 600, y: 240, w: 220, h: 50},
+      {id: "local_module",  x: 320, y: 320, w: 220, h: 50},
+      {id: "relgt_layer",   x: 600, y: 320, w: 220, h: 60},
+      {id: "codebook",      x: 880, y: 320, w: 200, h: 50},
+      {id: "tf_ffs",        x: 600, y: 420, w: 220, h: 50},
+      {id: "tf_head_mlp",   x: 600, y: 500, w: 220, h: 50},
+      {id: "mt_head",       x: 600, y: 590, w: 220, h: 50},
+      {id: "mt_loss",       x: 600, y: 670, w: 220, h: 50},
+    ],
+    edges: [
+      {from: "task_tokens", to: "collate", label: "list[(s,l)]"},
+      {from: "collate", to: "encoders", label: "batch dict"},
+      {from: "encoders", to: "tf_in_mixture", label: "5 × [B,K,C]"},
+      {from: "tf_in_mixture", to: "tf_seed_pick", label: "[B,K,C]"},
+      {from: "tf_seed_pick", to: "relgt_layer", label: "x [B,C]"},
+      {from: "tf_in_mixture", to: "relgt_layer", label: "x_set"},
+      {from: "local_module", to: "relgt_layer", label: "local"},
+      {from: "codebook", to: "relgt_layer", label: "K/V + bias"},
+      {from: "relgt_layer", to: "tf_ffs"},
+      {from: "tf_ffs", to: "tf_head_mlp"},
+      {from: "tf_head_mlp", to: "mt_head", label: "[B,C]"},
+      {from: "mt_head", to: "mt_loss", label: "[B]"},
+    ]
+  },
+  pretrain: {
+    width: 1140, height: 700,
+    nodes: [
+      {id: "pretrain_p4d",      x: 420, y: 30,  w: 280, h: 70},
+      {id: "phase0",            x: 40,  y: 170, w: 240, h: 60},
+      {id: "build_tf_store",    x: 320, y: 170, w: 240, h: 60},
+      {id: "precompute_shards", x: 600, y: 170, w: 240, h: 60},
+      {id: "main_node_ddp",     x: 880, y: 170, w: 220, h: 60},
+      {id: "train_multi_task",  x: 420, y: 290, w: 280, h: 80},
+      {id: "mt_relgt",          x: 40,  y: 410, w: 240, h: 60},
+      {id: "mt_loss",           x: 320, y: 410, w: 240, h: 60},
+      {id: "save_ckpt",         x: 600, y: 410, w: 240, h: 80},
+      {id: "watchdog",          x: 880, y: 410, w: 220, h: 60},
+      {id: "ckpt_files",        x: 600, y: 540, w: 240, h: 100},
+    ],
+    edges: [
+      {from: "pretrain_p4d", to: "phase0", label: "Phase 0"},
+      {from: "pretrain_p4d", to: "build_tf_store", label: "Phase 1"},
+      {from: "pretrain_p4d", to: "precompute_shards", label: "Phase 2"},
+      {from: "pretrain_p4d", to: "main_node_ddp", label: "Phase 3"},
+      {from: "phase0", to: "main_node_ddp", label: "TASKS_CSV"},
+      {from: "build_tf_store", to: "main_node_ddp", label: "tf_store/"},
+      {from: "precompute_shards", to: "main_node_ddp", label: "shards/"},
+      {from: "main_node_ddp", to: "train_multi_task", label: "--tasks"},
+      {from: "train_multi_task", to: "mt_relgt", label: "_build_model"},
+      {from: "mt_relgt", to: "mt_loss"},
+      {from: "train_multi_task", to: "mt_loss"},
+      {from: "train_multi_task", to: "save_ckpt", label: "best macro"},
+      {from: "save_ckpt", to: "ckpt_files"},
+      {from: "watchdog", to: "main_node_ddp", label: "SIGTERM @ 92%", style: "dashed"},
+    ]
+  },
+  phase4: {
+    width: 1100, height: 740,
+    nodes: [
+      {id: "holdout_task_dev",  x: 380, y: 30,  w: 320, h: 80},
+      {id: "p4_pretrain_block", x: 380, y: 160, w: 320, h: 100},
+      {id: "ckpt_files",        x: 380, y: 310, w: 320, h: 90},
+      {id: "p4_extract",        x: 380, y: 460, w: 320, h: 70},
+      {id: "p4_finetune",       x: 60,  y: 580, w: 280, h: 60},
+      {id: "p4_tabpfn",         x: 740, y: 580, w: 280, h: 60},
+      {id: "task_evaluate",     x: 380, y: 580, w: 280, h: 60},
+      {id: "p4_summary",        x: 380, y: 680, w: 320, h: 50},
+    ],
+    edges: [
+      {from: "holdout_task_dev", to: "p4_pretrain_block"},
+      {from: "p4_pretrain_block", to: "ckpt_files"},
+      {from: "ckpt_files", to: "p4_extract"},
+      {from: "p4_extract", to: "p4_finetune"},
+      {from: "p4_extract", to: "task_evaluate", style: "dashed"},
+      {from: "p4_extract", to: "p4_tabpfn"},
+      {from: "p4_finetune", to: "task_evaluate"},
+      {from: "p4_tabpfn", to: "task_evaluate"},
+      {from: "task_evaluate", to: "p4_summary"},
+    ]
+  },
+  phase5: {
+    width: 1100, height: 900,
+    nodes: [
+      {id: "holdout_dataset_eval", x: 380, y: 30,  w: 320, h: 80},
+      {id: "p5_pretrain_block",    x: 380, y: 160, w: 320, h: 100},
+      {id: "p5_target_tf",         x: 60,  y: 175, w: 240, h: 70},
+      {id: "ckpt_files",           x: 380, y: 300, w: 320, h: 90},
+      {id: "compute_dataset_stats",x: 60,  y: 440, w: 240, h: 60},
+      {id: "register_dataset",     x: 60,  y: 530, w: 240, h: 70},
+      {id: "p5_extract",           x: 380, y: 450, w: 320, h: 80},
+      {id: "p5_finetune",          x: 380, y: 600, w: 240, h: 60},
+      {id: "p5_tabpfn",            x: 660, y: 600, w: 240, h: 60},
+      {id: "task_evaluate",        x: 520, y: 700, w: 240, h: 60},
+      {id: "p5_summary",           x: 380, y: 800, w: 320, h: 60},
+    ],
+    edges: [
+      {from: "holdout_dataset_eval", to: "p5_pretrain_block", label: "Steps 1+2"},
+      {from: "holdout_dataset_eval", to: "p5_target_tf", label: "pre-build"},
+      {from: "p5_pretrain_block", to: "ckpt_files"},
+      {from: "p5_target_tf", to: "p5_extract", label: "--use_tf_store"},
+      {from: "ckpt_files", to: "p5_extract"},
+      {from: "compute_dataset_stats", to: "register_dataset"},
+      {from: "register_dataset", to: "p5_extract", label: "register"},
+      {from: "p5_extract", to: "p5_finetune"},
+      {from: "p5_extract", to: "p5_tabpfn"},
+      {from: "p5_finetune", to: "task_evaluate"},
+      {from: "p5_tabpfn", to: "task_evaluate"},
+      {from: "task_evaluate", to: "p5_summary"},
+    ]
+  },
+};
+
+// Friendly labels per node id (default: DETAILS[id].title)
+const NODE_LABEL_OVERRIDES = {
+  relbench: "relbench\nget_dataset / get_task",
+  graph_cache: "DatasetGraphCache\nCSR adjacency",
+  tf_store: "TFStoreReader\n(memmap TF backend)",
+  sampler: "sampler.sample_local_subgraph\n+ gather_1_and_2_hop",
+  task_tokens: "TaskTokens\n(per ds × task × split)",
+  multi_task_concat: "MultiTaskConcat",
+  dist_sampler: "DistributedMultiTaskSampler\n(one task per step)",
+  collate: "collate_{single,multi}_task\n→ batch dict",
+  encoders: "Encoders\ntype • hop • time • tfs • pe",
+  local_module: "LocalModule\n(transformer over K)",
+  codebook: "VectorQuantizerEMA\n(global centroids)",
+  relgt_layer: "RelGTLayer\nlocal + global attn",
+  relgt: "RelGT (backbone)",
+  mt_head: "MultiTaskHead\n(per-task Linear)",
+  mt_relgt: "MultiTaskRelGT\nforward(task_id=None) → emb",
+  main_node_ddp: "main_node_ddp.py\n(torchrun entry)",
+  train_multi_task: "train_multi_task.run\nbest-by-macro",
+  mt_loss: "MultiTaskLoss\nHuber + BCE",
+  save_ckpt: "_save_best_checkpoint\n→ 4 artifacts",
+  load_backbone: "RelGT.load_backbone\n(eval+freeze)",
+  register_dataset: "NeighborTfsEncoder\n.register_dataset",
+  compute_dataset_stats: "compute_dataset_stats",
+  extract_emb: "tools/extract_embeddings",
+  finetune_head: "tools/finetune_head\nLinear / mlp2",
+  tabpfn_eval: "tools/tabpfn_eval\nTabPFN v2",
+  task_evaluate: "task.evaluate(predictions)",
+  build_tf_store: "tools/build_tf_store",
+  precompute_shards: "tools/precompute_shards",
+  shard_io: "ShardWriter / ShardReader",
+  pretrain_p4d: "scripts/pretrain_p4d.sh",
+  holdout_task_dev: "scripts/holdout_task_dev.sh\n(Phase 4)",
+  holdout_dataset_eval: "scripts/holdout_dataset_eval.sh\n(Phase 5)",
+  tf_in_mixture: "in_mixture\nLinear(5C → 2C → C)",
+  tf_seed_pick: "x = x_set[:, 0, :]\n(seed token)",
+  tf_ffs: "ffs[i]\nBN → FFN → BN",
+  tf_head_mlp: "head MLP\n2-layer",
+  phase0: "Phase 0\nenumerate tasks",
+  watchdog: "Memory watchdog\ncgroup-aware",
+  ckpt_files: "Artifacts\nbest_full.pt\nbest_backbone.pt\nbackbone_meta.json\nbackbone_schema.pt",
+  p4_pretrain_block: "Pretrain on PRETRAIN_TASKS_CSV\n= ⋃ (all_tasks − holdout)",
+  p4_extract: "extract_embeddings\n(same dataset — no register)",
+  p4_finetune: "finetune_head",
+  p4_tabpfn: "tabpfn_eval",
+  p4_summary: "summary.json",
+  p5_pretrain_block: "Pretrain on SOURCE\n(LOO over v2 datasets)",
+  p5_target_tf: "Pre-build TARGET\nTF store",
+  p5_extract: "extract_embeddings\n(parallel × seeds)\n--register_new_dataset",
+  p5_finetune: "finetune_head\n(per seed)",
+  p5_tabpfn: "tabpfn_eval\n(per seed)",
+  p5_summary: "summary.json\nmean ± SD across seeds",
+};
+
+// ============================================================
+// Rendering
+// ============================================================
+const SVG_NS = "http://www.w3.org/2000/svg";
+let currentView = "components";
+let selectedNode = null;
+
+function renderView(viewId) {
+  const view = VIEWS[viewId];
+  const host = document.getElementById("svg-host");
+  host.innerHTML = "";
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 " + view.width + " " + view.height);
+  svg.setAttribute("preserveAspectRatio", "xMinYMin meet");
+  svg.style.width = view.width + "px";
+  svg.style.maxWidth = "100%";
+  svg.style.height = "auto";
+
+  const defs = document.createElementNS(SVG_NS, "defs");
+  defs.innerHTML =
+    '<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">' +
+    '  <path d="M 0 0 L 10 5 L 0 10 z" fill="#6b7280"/>' +
+    '</marker>' +
+    '<marker id="arrow-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">' +
+    '  <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>' +
+    '</marker>';
+  svg.appendChild(defs);
+
+  const nodeMap = {};
+  for (const n of view.nodes) nodeMap[n.id] = n;
+
+  // Edges first so they sit under nodes
+  for (const edge of view.edges) {
+    const a = nodeMap[edge.from];
+    const b = nodeMap[edge.to];
+    if (!a || !b) continue;
+    const ep = computeEdgePath(a, b);
+    const p = document.createElementNS(SVG_NS, "path");
+    p.setAttribute("d", ep.d);
+    p.setAttribute("class", "edge");
+    p.setAttribute("data-from", edge.from);
+    p.setAttribute("data-to", edge.to);
+    p.setAttribute("marker-end", "url(#arrow)");
+    if (edge.style === "dashed") p.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(p);
+    if (edge.label) {
+      const label = document.createElementNS(SVG_NS, "text");
+      label.setAttribute("x", ep.midX);
+      label.setAttribute("y", ep.midY - 4);
+      label.setAttribute("text-anchor", "middle");
+      label.setAttribute("class", "edge-label");
+      // background for legibility
+      const bg = document.createElementNS(SVG_NS, "rect");
+      const labelChars = edge.label.length;
+      const bgW = Math.max(20, labelChars * 6 + 6);
+      bg.setAttribute("x", ep.midX - bgW / 2);
+      bg.setAttribute("y", ep.midY - 14);
+      bg.setAttribute("width", bgW);
+      bg.setAttribute("height", 14);
+      bg.setAttribute("fill", "white");
+      bg.setAttribute("opacity", "0.9");
+      svg.appendChild(bg);
+      label.textContent = edge.label;
+      svg.appendChild(label);
+    }
+  }
+
+  // Nodes
+  for (const n of view.nodes) {
+    const g = document.createElementNS(SVG_NS, "g");
+    const detail = DETAILS[n.id] || {};
+    const pillar = detail.pillar || "model";
+    g.setAttribute("class", "node pillar-" + pillar);
+    g.setAttribute("transform", "translate(" + n.x + "," + n.y + ")");
+    g.setAttribute("data-id", n.id);
+    g.addEventListener("click", function () { selectNode(n.id); });
+
+    const rect = document.createElementNS(SVG_NS, "rect");
+    rect.setAttribute("width", n.w);
+    rect.setAttribute("height", n.h);
+    rect.setAttribute("rx", 6);
+    rect.setAttribute("ry", 6);
+    g.appendChild(rect);
+
+    const labelText = NODE_LABEL_OVERRIDES[n.id] || (detail.title || n.id);
+    const lines = labelText.split("\n");
+    const cx = n.w / 2;
+    const lineHeight = 14;
+    const totalH = lines.length * lineHeight;
+    const startY = n.h / 2 - totalH / 2 + lineHeight / 2 + 1;
+    for (let i = 0; i < lines.length; i++) {
+      const t = document.createElementNS(SVG_NS, "text");
+      t.setAttribute("x", cx);
+      t.setAttribute("y", startY + i * lineHeight);
+      t.setAttribute("class", i === 0 ? "title" : "subtitle");
+      t.textContent = lines[i];
+      g.appendChild(t);
+    }
+    svg.appendChild(g);
+  }
+
+  host.appendChild(svg);
+}
+
+function computeEdgePath(a, b) {
+  // Connect from one rect's edge to the other along the dominant axis.
+  const ax = a.x + a.w / 2, ay = a.y + a.h / 2;
+  const bx = b.x + b.w / 2, by = b.y + b.h / 2;
+  const dx = bx - ax, dy = by - ay;
+  let sx, sy, ex, ey;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    if (dx >= 0) { sx = a.x + a.w; ex = b.x; }
+    else         { sx = a.x;         ex = b.x + b.w; }
+    sy = ay; ey = by;
+  } else {
+    if (dy >= 0) { sy = a.y + a.h; ey = b.y; }
+    else         { sy = a.y;         ey = b.y + b.h; }
+    sx = ax; ex = bx;
+  }
+  // Cubic bend so edges between distant nodes don't overlap straight lines.
+  const horizDom = Math.abs(dx) >= Math.abs(dy);
+  const cx1 = horizDom ? (sx + ex) / 2 : sx;
+  const cy1 = horizDom ? sy : (sy + ey) / 2;
+  const cx2 = horizDom ? (sx + ex) / 2 : ex;
+  const cy2 = horizDom ? ey : (sy + ey) / 2;
+  const d = "M " + sx + " " + sy + " C " + cx1 + " " + cy1 + ", " +
+            cx2 + " " + cy2 + ", " + ex + " " + ey;
+  return { d: d, midX: (sx + ex) / 2, midY: (sy + ey) / 2 };
+}
+
+function selectNode(id) {
+  selectedNode = id;
+  document.querySelectorAll(".node").forEach(function (g) {
+    g.classList.toggle("selected", g.getAttribute("data-id") === id);
+  });
+  document.querySelectorAll(".edge").forEach(function (e) {
+    const from = e.getAttribute("data-from");
+    const to   = e.getAttribute("data-to");
+    const hl = (from === id || to === id);
+    e.classList.toggle("highlighted", hl);
+    e.setAttribute("marker-end", hl ? "url(#arrow-hl)" : "url(#arrow)");
+  });
+  renderDetails(id);
+}
+
+function renderDetails(id) {
+  const d = DETAILS[id];
+  const host = document.getElementById("details");
+  if (!d) {
+    host.innerHTML = "<h2>" + escapeHtml(id) + "</h2>" +
+      '<p style="color: var(--muted)">No details registered.</p>';
+    return;
+  }
+  const sections = [];
+  sections.push("<h2>" + escapeHtml(d.title) + "</h2>");
+  if (d.file) sections.push('<div class="file">' + escapeHtml(d.file) + "</div>");
+  if (d.role) sections.push("<p>" + codeify(d.role) + "</p>");
+  if (d.inputs && d.inputs.length) {
+    sections.push("<h3>Inputs</h3><ul>" +
+      d.inputs.map(function (x) { return "<li>" + codeify(x) + "</li>"; }).join("") +
+      "</ul>");
+  }
+  if (d.outputs && d.outputs.length) {
+    sections.push("<h3>Outputs</h3><ul>" +
+      d.outputs.map(function (x) { return "<li>" + codeify(x) + "</li>"; }).join("") +
+      "</ul>");
+  }
+  if (d.connections && d.connections.length) {
+    const links = d.connections.map(function (cid) {
+      const t = (DETAILS[cid] && DETAILS[cid].title) || cid;
+      return '<a class="xref" data-xref="' + escapeHtml(cid) + '">' + escapeHtml(t) + '</a>';
+    }).join(", ");
+    sections.push("<h3>Connects to</h3><p>" + links + "</p>");
+  }
+  if (d.notes && d.notes.length) {
+    sections.push("<h3>Notes</h3><ul>" +
+      d.notes.map(function (x) { return "<li>" + codeify(x) + "</li>"; }).join("") +
+      "</ul>");
+  }
+  host.innerHTML = sections.join("");
+  host.querySelectorAll("a.xref").forEach(function (a) {
+    a.addEventListener("click", function () {
+      const cid = a.getAttribute("data-xref");
+      if (VIEWS[currentView].nodes.some(function (n) { return n.id === cid; })) {
+        selectNode(cid);
+      } else {
+        for (const v of Object.keys(VIEWS)) {
+          if (VIEWS[v].nodes.some(function (n) { return n.id === cid; })) {
+            switchView(v);
+            selectNode(cid);
+            return;
+          }
+        }
+        renderDetails(cid);
+      }
+    });
+  });
+}
+
+function codeify(s) {
+  return escapeHtml(s).replace(/`([^`]+)`/g, function (_, m) { return "<code>" + m + "</code>"; });
+}
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function switchView(v) {
+  currentView = v;
+  document.querySelectorAll("nav.tabs button").forEach(function (b) {
+    b.classList.toggle("active", b.dataset.view === v);
+  });
+  renderView(v);
+  if (selectedNode && VIEWS[v].nodes.some(function (n) { return n.id === selectedNode; })) {
+    selectNode(selectedNode);
+  }
+}
+document.querySelectorAll("nav.tabs button").forEach(function (b) {
+  b.addEventListener("click", function () { switchView(b.dataset.view); });
+});
+
+renderView("components");
+selectNode("relgt");
+</script>
+</body>
+</html>

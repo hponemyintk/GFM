@@ -70,6 +70,7 @@ wandb-summary.json
 .ipynb_checkpoints/
 *.nbconvert.ipynb
 *.html
+!docs/*.html
 
 # -----------------------------------------------------------------------------
 #  EDITOR / IDE SPECIFIC
