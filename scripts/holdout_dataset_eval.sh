@@ -621,8 +621,11 @@ echo "=== Phase A complete ==="
 # cost (a few extra GEMMs per epoch on a frozen backbone). Override
 # with FT_HEAD=linear for the legacy linear-probe ablation.
 FT_HEAD="${FT_HEAD:-mlp2}"
+# RUN_TABPFN=0 skips the TabPFN post-hoc step (each call is ~10-20
+# min on this scale). Default 1 keeps the prior behavior.
+RUN_TABPFN="${RUN_TABPFN:-1}"
 echo
-echo "=== Phase B: finetune_head ($FT_HEAD) + tabpfn_eval (sequential) ==="
+echo "=== Phase B: finetune_head ($FT_HEAD)$([ "$RUN_TABPFN" = "1" ] && echo " + tabpfn_eval") (sequential) ==="
 for task_name in "${TASK_NAMES[@]}"; do
   echo
   echo "  ${TARGET}.${task_name}"
@@ -644,15 +647,17 @@ for task_name in "${TASK_NAMES[@]}"; do
       --out "$FT_DIR/finetuned.pt" \
       > "$FT_DIR/finetune.log" 2>&1 || \
         echo "      WARN: finetune_head failed; see $FT_DIR/finetune.log"
-    echo "    seed=$ADOPT_SEED tabpfn"
-    python3 -m tools.tabpfn_eval \
-      --embeddings_dir "$EMB_DIR" \
-      --dataset "$TARGET" --task "$task_name" \
-      --projector "$PROJECTOR" \
-      --seed "$ADOPT_SEED" \
-      --out "$TABPFN_DIR/tabpfn.json" \
-      > "$TABPFN_DIR/tabpfn.log" 2>&1 || \
-        echo "      WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
+    if [ "$RUN_TABPFN" = "1" ]; then
+      echo "    seed=$ADOPT_SEED tabpfn"
+      python3 -m tools.tabpfn_eval \
+        --embeddings_dir "$EMB_DIR" \
+        --dataset "$TARGET" --task "$task_name" \
+        --projector "$PROJECTOR" \
+        --seed "$ADOPT_SEED" \
+        --out "$TABPFN_DIR/tabpfn.json" \
+        > "$TABPFN_DIR/tabpfn.log" 2>&1 || \
+          echo "      WARN: tabpfn_eval failed; see $TABPFN_DIR/tabpfn.log"
+    fi
   done
 done
 

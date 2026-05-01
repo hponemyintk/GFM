@@ -420,6 +420,10 @@ PROJECTOR="${PROJECTOR:-auto}"
 # compute (a few extra GEMMs per epoch on a frozen backbone). Override
 # with FT_HEAD=linear for the legacy ablation.
 FT_HEAD="${FT_HEAD:-mlp2}"
+# RUN_TABPFN=0 skips the TabPFN post-hoc step. Default 1 keeps the
+# prior behavior (also surfaces a "tabpfn not installed" warning if
+# the package is missing rather than silently noop'ing).
+RUN_TABPFN="${RUN_TABPFN:-1}"
 
 # Build the list of (ds, holdout) jobs. Each pair has isolated
 # extract output + precompute paths (cache_dir keyed by dataset and
@@ -550,14 +554,16 @@ for _i in "${!HD_DS[@]}"; do
     > "$FT_DIR/finetune.log" 2>&1 || \
       echo "    WARN: finetune_head failed; see $FT_DIR/finetune.log"
 
-  echo "  [tabpfn] post-hoc with $PROJECTOR projector"
-  if ! python3 -m tools.tabpfn_eval \
-      --embeddings_dir "$EMB_DIR" \
-      --dataset "$ds" --task "$holdout" \
-      --projector "$PROJECTOR" \
-      --out "$TABPFN_DIR/tabpfn.json" \
-      > "$TABPFN_DIR/tabpfn.log" 2>&1; then
-    echo "    WARN: tabpfn_eval failed (likely tabpfn not installed); see $TABPFN_DIR/tabpfn.log"
+  if [ "$RUN_TABPFN" = "1" ]; then
+    echo "  [tabpfn] post-hoc with $PROJECTOR projector"
+    if ! python3 -m tools.tabpfn_eval \
+        --embeddings_dir "$EMB_DIR" \
+        --dataset "$ds" --task "$holdout" \
+        --projector "$PROJECTOR" \
+        --out "$TABPFN_DIR/tabpfn.json" \
+        > "$TABPFN_DIR/tabpfn.log" 2>&1; then
+      echo "    WARN: tabpfn_eval failed (likely tabpfn not installed); see $TABPFN_DIR/tabpfn.log"
+    fi
   fi
 done
 
