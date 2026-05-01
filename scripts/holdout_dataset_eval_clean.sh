@@ -460,6 +460,7 @@ elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
     LR="${LR:-1e-4}" \
     WARMUP="${WARMUP:-1000}" \
     LOSS_BALANCE="${LOSS_BALANCE:-none}" \
+    SEED="$SEED" \
     bash "$REPO_ROOT/scripts/pretrain_p4d.sh" \
     > "$PRETRAIN_LOG" 2>&1
 else

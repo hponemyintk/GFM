@@ -438,6 +438,61 @@ def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
         )
 
 
+def test_holdout_dataset_eval_pretrain_sweep_wraps_inner_launcher():
+    """The pretrain-seed sweep wrapper must (a) exist and pass bash
+    syntax, (b) loop over PRETRAIN_SEEDS, (c) pass each seed via
+    SEED= to the inner launcher, (d) namespace OUT_DIR per pretrain
+    seed so the inner launcher's artifacts don't collide, and (e)
+    aggregate per-task metrics into <out>/aggregate.json."""
+    bash = _bash()
+    p = SCRIPTS / "holdout_dataset_eval_pretrain_sweep.sh"
+    assert p.exists(), f"missing {p}"
+    rc = subprocess.run([bash, "-n", str(p)], check=False)
+    assert rc.returncode == 0
+    src = p.read_text()
+    assert 'PRETRAIN_SEEDS="${PRETRAIN_SEEDS:-0 1 2}"' in src, (
+        "default PRETRAIN_SEEDS must be 0 1 2"
+    )
+    # Inner launcher invocation must forward the pretrain seed via
+    # SEED= and namespace OUT_DIR= per seed.
+    assert "for PSEED in $PRETRAIN_SEEDS" in src
+    assert 'SEED="$PSEED"' in src, (
+        "wrapper must forward each pretrain seed as SEED= to inner"
+    )
+    assert 'OUT_DIR="$PSEED_DIR"' in src, (
+        "wrapper must namespace OUT_DIR per pretrain seed"
+    )
+    # Aggregate output.
+    assert 'AGG="$SWEEP_DIR/aggregate.json"' in src, (
+        "aggregate path must be <sweep>/aggregate.json"
+    )
+
+
+def test_pretrain_p4d_forwards_seed_to_torchrun():
+    """pretrain_p4d.sh must pass --seed to main_node_ddp.py so the
+    backbone-variance sweep actually varies the pretrain RNG."""
+    src = (SCRIPTS / "pretrain_p4d.sh").read_text()
+    assert 'SEED="${SEED:-' in src, (
+        "pretrain_p4d.sh must accept SEED as an env var"
+    )
+    assert '--seed "$SEED"' in src, (
+        "pretrain_p4d.sh must thread SEED into the torchrun --seed flag"
+    )
+
+
+def test_holdout_dataset_eval_forwards_seed_to_pretrain_p4d():
+    """The Phase-5 launcher's p4d branch delegates pretrain to
+    pretrain_p4d.sh via env. SEED must be in that env block,
+    otherwise the backbone always trains with main_node_ddp.py's
+    default seed and the pretrain-sweep wrapper has no effect."""
+    for fn in ("holdout_dataset_eval.sh", "holdout_dataset_eval_clean.sh"):
+        src = (SCRIPTS / fn).read_text()
+        assert 'SEED="$SEED" \\' in src, (
+            f"{fn} must forward SEED into the pretrain_p4d.sh env "
+            "block (not just inline laptop torchrun)"
+        )
+
+
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):
     bash = _bash()
     p = SCRIPTS / "holdout_dataset_eval.sh"

@@ -188,6 +188,11 @@ STEPS_PER_TASK="${STEPS_PER_TASK:-500}"
 WORKERS="${WORKERS:-2}"
 LR="${LR:-1e-4}"
 WARMUP="${WARMUP:-1000}"
+# Pretrain RNG seed -- forwarded to main_node_ddp.py --seed. Default
+# 42 matches main_node_ddp.py's argparse default. Sweep over this
+# (e.g. via scripts/holdout_dataset_eval_pretrain_sweep.sh) to bound
+# backbone variance.
+SEED="${SEED:-42}"
 LOSS_BALANCE="${LOSS_BALANCE:-none}"
 NPROC="${NPROC:-8}"
 OUT_DIR="${OUT_DIR:-results/p4d_pretrain}"
@@ -673,6 +678,7 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --warmup_steps "$WARMUP" \
     --loss_balance "$LOSS_BALANCE" \
     --load_concurrency "$LOAD_CONCURRENCY" \
+    --seed "$SEED" \
     --out_dir "$OUT_DIR" \
     --run_name "$RUN_NAME" $FULL_GRAPH_FLAG \
     > "$LOG" 2>&1 &
