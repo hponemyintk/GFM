@@ -275,14 +275,25 @@ echo
 # scripts/holdout_task_dev.sh to drive a pretrain on the union of
 # all-but-one tasks across multiple datasets without re-implementing
 # the build phases / DDP launch.
+# EXCLUDED_TASKS: comma-separated "ds.task" keys to drop from the
+# auto-enumerate path. Default is the 5 RelBench v2 entity bcls/reg
+# tasks whose supervised single-task GNN baseline (per the v2 paper)
+# sits at-or-below random -- including them in pretrain just adds
+# noise. See docs/holdout_results.md and the rationale in
+# scripts/holdout_dataset_eval_clean.sh. Set EXCLUDED_TASKS="" to
+# include every task; set TASKS_CSV explicitly to bypass this filter.
+EXCLUDED_TASKS="${EXCLUDED_TASKS:-rel-event.event_interest-interested,rel-event.event_interest-not_interested,rel-event.users-birthyear,rel-trial.site-success,rel-amazon.item-ltv}"
+
 if [ -n "${TASKS_CSV:-}" ]; then
     echo "[0/3] Using user-provided TASKS_CSV (skipping relbench enumeration)"
     TASKS_RAW=$(echo "$TASKS_CSV" | tr ',' '\n')
 else
-    echo "[0/3] Enumerating RelBench tasks (binary + regression only)"
+    echo "[0/3] Enumerating RelBench tasks (binary + regression only; excluding: ${EXCLUDED_TASKS:-<none>})"
 
-    # Pass DATASETS_FILTER into Python; emit a list of "ds.task:1.0" strings.
-    TASKS_RAW=$(DATASETS_FILTER="$DATASETS_FILTER" python3 - <<'PY'
+    # Pass DATASETS_FILTER + EXCLUDED_TASKS into Python; emit a list
+    # of "ds.task:1.0" strings.
+    TASKS_RAW=$(DATASETS_FILTER="$DATASETS_FILTER" \
+                EXCLUDED_TASKS="$EXCLUDED_TASKS" python3 - <<'PY'
 import contextlib
 import os
 import sys
@@ -300,6 +311,11 @@ with contextlib.redirect_stdout(sys.stderr):
     ALLOWED = {TaskType.BINARY_CLASSIFICATION, TaskType.REGRESSION}
     filt = os.environ["DATASETS_FILTER"].strip()
     datasets = [d.strip() for d in filt.split(",") if d.strip()]
+    excluded = {
+        x.strip()
+        for x in (os.environ.get("EXCLUDED_TASKS") or "").split(",")
+        if x.strip()
+    }
 
     out = []
     for ds in datasets:
@@ -309,10 +325,14 @@ with contextlib.redirect_stdout(sys.stderr):
             print(f"# WARN: cannot list tasks for {ds}: {e}", file=sys.stderr)
             continue
         for tn in names:
+            key = f"{ds}.{tn}"
+            if key in excluded:
+                print(f"# excluding low-quality task: {key}", file=sys.stderr)
+                continue
             try:
                 t = get_task(ds, tn)
                 if t.task_type in ALLOWED:
-                    out.append(f"{ds}.{tn}:1.0")
+                    out.append(f"{key}:1.0")
             except Exception as e:
                 print(f"# WARN: cannot load {ds}.{tn}: {e}", file=sys.stderr)
 

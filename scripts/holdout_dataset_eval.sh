@@ -193,9 +193,11 @@ DEFAULT_RELEVENT_ALL=(
   "rel-event.user-attendance:1.0"
   "rel-event.user-repeat:1.0"
   "rel-event.user-ignore:1.0"
-  "rel-event.event_interest-interested:1.0"
-  "rel-event.event_interest-not_interested:1.0"
-  "rel-event.users-birthyear:1.0"
+  # Low-quality tasks dropped by default (RelBench v2 baselines at
+  # or below random); uncomment for the all-tasks ablation.
+  # "rel-event.event_interest-interested:1.0"      # paper Table 3 GNN AUC 0.4764 -- below random
+  # "rel-event.event_interest-not_interested:1.0"  # paper Table 3 GNN AUC 0.6040 -- ~random
+  # "rel-event.users-birthyear:1.0"                # paper Table 5 GNN R^2 -0.030 -- negative
 )
 # rel-arxiv: paper-citation (binary) + author-publication (regression).
 # author-category is multiclass and paper-paper-cocitation is link-pred;
@@ -210,7 +212,9 @@ DEFAULT_RELAMAZON_ALL=(
   "rel-amazon.user-churn:1.0"
   "rel-amazon.item-churn:1.0"
   "rel-amazon.user-ltv:1.0"
-  "rel-amazon.item-ltv:1.0"
+  # Low-quality task dropped by default (paper Table 9 GNN R^2 0.032
+  # -- near zero signal). Uncomment for all-tasks ablation.
+  # "rel-amazon.item-ltv:1.0"
 )
 # rel-avito: 5 entity tasks. ad-ctr (reg) + user-* (binary
 # forecasting) + 2 autocomplete binaries (searchstream-click,
@@ -236,7 +240,9 @@ DEFAULT_RELSTACK_ALL=(
 DEFAULT_RELTRIAL_ALL=(
   "rel-trial.study-outcome:1.0"
   "rel-trial.study-adverse:1.0"
-  "rel-trial.site-success:1.0"
+  # Low-quality task dropped by default (paper Table 9 GNN R^2
+  # -0.483 -- strongly negative). Uncomment for all-tasks ablation.
+  # "rel-trial.site-success:1.0"
   "rel-trial.studies-enrollment:1.0"
   "rel-trial.studies-has_dmc:1.0"
   "rel-trial.eligibilities-adult:1.0"

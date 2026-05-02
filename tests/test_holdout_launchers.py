@@ -525,6 +525,61 @@ def test_pretrain_only_seed_sweep_no_adoption():
     assert 'AGG="$SWEEP_DIR/aggregate.json"' in code_only
 
 
+def test_pretrain_p4d_excludes_low_quality_tasks_by_default():
+    """pretrain_p4d.sh's auto-enumerate path must filter the 5 RelBench
+    v2 tasks whose supervised single-task GNN baseline (per the v2
+    paper) is at or below random. EXCLUDED_TASKS="" overrides for the
+    all-tasks ablation."""
+    src = (SCRIPTS / "pretrain_p4d.sh").read_text()
+    DEFAULTS = [
+        "rel-event.event_interest-interested",
+        "rel-event.event_interest-not_interested",
+        "rel-event.users-birthyear",
+        "rel-trial.site-success",
+        "rel-amazon.item-ltv",
+    ]
+    # All five must appear in the EXCLUDED_TASKS default literal.
+    for tn in DEFAULTS:
+        assert tn in src, (
+            f"EXCLUDED_TASKS default must drop {tn!r} (RelBench v2 "
+            "baseline at or below random)"
+        )
+    # And the auto-enumerate heredoc must actually consult
+    # EXCLUDED_TASKS to skip those task keys.
+    assert "EXCLUDED_TASKS" in src
+    assert "low-quality task" in src or "EXCLUDED_TASKS" in src, (
+        "auto-enumerate heredoc must filter against EXCLUDED_TASKS"
+    )
+
+
+def test_holdout_dataset_eval_drops_low_quality_tasks_by_default():
+    """The non-clean Phase-5 launcher should now also drop the 5
+    low-quality tasks by default, mirroring the clean variant. The
+    excluded entries stay as commented-out lines so the rationale is
+    visible inline and the all-tasks ablation is one tweak away."""
+    src = (SCRIPTS / "holdout_dataset_eval.sh").read_text()
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    EXCLUDED = [
+        "rel-event.event_interest-interested",
+        "rel-event.event_interest-not_interested",
+        "rel-event.users-birthyear",
+        "rel-trial.site-success",
+        "rel-amazon.item-ltv",
+    ]
+    for tn in EXCLUDED:
+        assert f'"{tn}:1.0"' not in code_only, (
+            f"holdout_dataset_eval.sh must NOT include {tn!r} as a "
+            "live array entry by default; comment it out (see "
+            "docs/holdout_results.md for rationale)"
+        )
+        assert f'"{tn}:1.0"' in src, (
+            f"{tn!r} should remain as a commented-out line so the "
+            "exclusion rationale stays inline"
+        )
+
+
 def test_pretrain_p4d_supports_shards_subdir_namespace():
     """pretrain_p4d.sh must accept a SHARDS_SUBDIR env knob that
     appends a per-trial subdir under $CACHE/shards[_full]/. Used by

@@ -30,21 +30,36 @@
 # Aggregate:
 #   <OUT>/<src_slug>/aggregate.json  per-task per-metric mean +/- SD
 #
-# Usage example -- 3 trials over rel-f1 + rel-event, full task set
-# (8 tasks: 5 rel-f1 + 3 rel-event "clean" entity binary/regression
-# tasks); skip the rel-event low-quality ones via TASKS_CSV:
+# Auto-enumeration in pretrain_p4d.sh now drops 5 RelBench v2 tasks
+# whose supervised single-task GNN baseline (per the v2 paper) sits
+# at or below random -- they're noise, not signal. The 5 are:
+#   rel-event.event_interest-interested      AUC 0.4764 (below random)
+#   rel-event.event_interest-not_interested  AUC 0.6040 (~random)
+#   rel-event.users-birthyear                R^2 -0.030
+#   rel-trial.site-success                   R^2 -0.483
+#   rel-amazon.item-ltv                      R^2  0.032
+# Defaults to dropping them via EXCLUDED_TASKS in pretrain_p4d.sh.
+# Override EXCLUDED_TASKS="" to include every task; set TASKS_CSV
+# explicitly to bypass the filter entirely.
+#
+# Recommended invocation -- 3 trials over rel-f1 + rel-event,
+# auto-enumerated entity binary/regression tasks (low-quality
+# tasks dropped by default):
 #
 #   NPROC=8 SHARD_WORKERS=10 \
 #     PRETRAIN_SEEDS="0 1 2" \
 #     SOURCE="rel-f1 rel-event" \
-#     TASKS_CSV="rel-f1.driver-position:1.0,rel-f1.driver-dnf:1.0,rel-f1.driver-top3:1.0,rel-f1.results-position:1.0,rel-f1.qualifying-position:1.0,rel-event.user-attendance:1.0,rel-event.user-repeat:1.0,rel-event.user-ignore:1.0" \
 #     EPOCHS=10 STEPS_PER_TASK=500 \
 #     bash scripts/pretrain_only_seed_sweep.sh
 #
-# Or let pretrain_p4d.sh auto-enumerate every entity binary/reg
-# task in SOURCE (omit TASKS_CSV):
+# Resolves to 8 tasks total: 5 rel-f1 (driver-position, driver-dnf,
+# driver-top3, results-position, qualifying-position) + 3 rel-event
+# (user-attendance, user-repeat, user-ignore). The 3 rel-event
+# low-quality entries are excluded automatically.
 #
-#   NPROC=8 SHARD_WORKERS=10 \
+# To override and include every task (the all-tasks ablation):
+#
+#   EXCLUDED_TASKS="" NPROC=8 SHARD_WORKERS=10 \
 #     PRETRAIN_SEEDS="0 1 2" \
 #     SOURCE="rel-f1 rel-event" \
 #     EPOCHS=10 STEPS_PER_TASK=500 \
