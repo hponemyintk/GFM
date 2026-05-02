@@ -78,6 +78,17 @@ SHARD_WORKERS="${SHARD_WORKERS:-10}"
 TASKS_CSV="${TASKS_CSV:-}"
 FULL_GRAPH="${FULL_GRAPH:-1}"
 OUT_DIR_BASE="${OUT_DIR:-results/pretrain_only_seed_sweep}"
+# Force-rebuild the per-trial precomputed shard tree under
+# $CACHE/shards[_full]/pretrain_seed<N>/ before each trial. Default
+# 1 (defensive freshness): pretrain_p4d.sh's .done sentinel would
+# otherwise silently reuse shards from a prior invocation, even if
+# the sampler code (or seed_time / truncation policy) changed
+# between runs. Set FORCE_REBUILD_SHARDS=0 for fast iteration when
+# you're sure the sampler is unchanged.
+FORCE_REBUILD_SHARDS="${FORCE_REBUILD_SHARDS:-1}"
+# Honor an explicit CACHE_DIR override; pretrain_p4d.sh does the
+# same so the wipe target matches whatever Phase 2 will write to.
+CACHE_LOCAL="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 
 # Build slug + comma-separated DATASETS filter for pretrain_p4d.sh.
 SOURCE_LIST=( $SOURCE )
@@ -109,6 +120,20 @@ for PSEED in $PRETRAIN_SEEDS; do
   echo "------------------------------------------------------------------"
   echo "[$(date)] PRETRAIN_SEED=$PSEED  ->  $PSEED_DIR"
   echo "------------------------------------------------------------------"
+
+  # Defensive shard wipe so a prior invocation in this container
+  # cannot silently feed stale neighbor lists into this trial.
+  # Wipes both shards/ and shards_full/ subtrees because either
+  # FULL_GRAPH mode could have produced the leftover sentinel.
+  if [ "$FORCE_REBUILD_SHARDS" = "1" ]; then
+    for _shroot in "$CACHE_LOCAL/shards" "$CACHE_LOCAL/shards_full"; do
+      _shpath="$_shroot/pretrain_seed${PSEED}"
+      if [ -d "$_shpath" ]; then
+        echo "[$(date)] [force-rebuild] wiping $_shpath"
+        rm -rf "$_shpath"
+      fi
+    done
+  fi
 
   # Optional TASKS_CSV. ${TASKS_CSV:+...} expands to the kvp only
   # when TASKS_CSV is non-empty so pretrain_p4d.sh's

@@ -580,6 +580,33 @@ def test_holdout_dataset_eval_drops_low_quality_tasks_by_default():
         )
 
 
+def test_sweep_wrappers_force_rebuild_shards_by_default():
+    """Both pretrain-sweep wrappers must default FORCE_REBUILD_SHARDS=1
+    and wipe the per-trial $CACHE/shards[_full]/pretrain_seed<N>/
+    subtree before each trial. pretrain_p4d.sh's .done sentinel would
+    otherwise silently reuse shards from a prior invocation in the
+    same container, masking sampler-code changes between runs."""
+    for fn in (
+        "pretrain_only_seed_sweep.sh",
+        "holdout_dataset_eval_pretrain_sweep.sh",
+    ):
+        src = (SCRIPTS / fn).read_text()
+        assert 'FORCE_REBUILD_SHARDS="${FORCE_REBUILD_SHARDS:-1}"' in src, (
+            f"{fn} must default FORCE_REBUILD_SHARDS to 1"
+        )
+        # The wipe must target both shards/ and shards_full/ trees
+        # so we don't miss stale state from a different FULL_GRAPH
+        # mode in a previous invocation.
+        assert '"$CACHE_LOCAL/shards" "$CACHE_LOCAL/shards_full"' in src, (
+            f"{fn} must wipe both shards/ and shards_full/ subtrees"
+        )
+        # And the wipe is gated on the trial's SHARDS_SUBDIR.
+        assert 'pretrain_seed${PSEED}' in src
+        # rm -rf must actually be issued under the FORCE_REBUILD_SHARDS guard.
+        assert "rm -rf" in src
+        assert 'if [ "$FORCE_REBUILD_SHARDS" = "1" ]; then' in src
+
+
 def test_pretrain_p4d_supports_shards_subdir_namespace():
     """pretrain_p4d.sh must accept a SHARDS_SUBDIR env knob that
     appends a per-trial subdir under $CACHE/shards[_full]/. Used by

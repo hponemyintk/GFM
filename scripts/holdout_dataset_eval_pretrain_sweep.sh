@@ -101,6 +101,14 @@ RUN_TABPFN="${RUN_TABPFN:-0}"
 FT_HEAD="${FT_HEAD:-mlp2}"
 INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval_pretrain_sweep}"
+# Force-rebuild the per-trial precomputed shard tree under
+# $CACHE/shards[_full]/pretrain_seed<N>/ before each trial. Default
+# 1 (defensive freshness): pretrain_p4d.sh's .done sentinel would
+# otherwise silently reuse shards from a prior invocation, even if
+# the sampler code changed between runs. Set FORCE_REBUILD_SHARDS=0
+# for fast iteration when you know the sampler is unchanged.
+FORCE_REBUILD_SHARDS="${FORCE_REBUILD_SHARDS:-1}"
+CACHE_LOCAL="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 
 if [ ! -x "$REPO_ROOT/$INNER" ] && [ ! -f "$REPO_ROOT/$INNER" ]; then
   echo "ERR: inner launcher '$INNER' not found at $REPO_ROOT/$INNER" >&2
@@ -136,6 +144,18 @@ for PSEED in $PRETRAIN_SEEDS; do
   echo "------------------------------------------------------------------"
   echo "[$(date)] PRETRAIN_SEED=$PSEED  ->  $PSEED_DIR"
   echo "------------------------------------------------------------------"
+
+  # Defensive shard wipe so a prior invocation in this container
+  # cannot silently feed stale neighbor lists into this trial.
+  if [ "$FORCE_REBUILD_SHARDS" = "1" ]; then
+    for _shroot in "$CACHE_LOCAL/shards" "$CACHE_LOCAL/shards_full"; do
+      _shpath="$_shroot/pretrain_seed${PSEED}"
+      if [ -d "$_shpath" ]; then
+        echo "[$(date)] [force-rebuild] wiping $_shpath"
+        rm -rf "$_shpath"
+      fi
+    done
+  fi
 
   # Per-trial seed plumbing -- want every RNG that touches this run
   # to be deterministically derived from PSEED, AND want each trial
