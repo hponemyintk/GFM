@@ -135,14 +135,19 @@ for PSEED in $PRETRAIN_SEEDS; do
     done
   fi
 
-  # Optional TASKS_CSV. ${TASKS_CSV:+...} expands to the kvp only
-  # when TASKS_CSV is non-empty so pretrain_p4d.sh's
-  # auto-enumerate path stays the default.
+  # Always forward TASKS_CSV (even if empty). pretrain_p4d.sh's
+  # task-enumeration block has an explicit empty-string check
+  # (`if [ -n "${TASKS_CSV:-}" ]`) so empty falls through to the
+  # auto-enumerate path. We avoid the ${TASKS_CSV:+...} conditional
+  # because a parameter expansion that yields "KEY=value" is not
+  # re-parsed as an env assignment by bash, leading to the
+  # confusing "NPROC=8: command not found" symptom when other
+  # assignments end up after it on the joined command line.
   PYTHONHASHSEED="$PSEED" \
   SEED="$PSEED" \
   SHARDS_SUBDIR="pretrain_seed${PSEED}" \
   DATASETS="$DATASETS_CSV" \
-  ${TASKS_CSV:+TASKS_CSV="$TASKS_CSV"} \
+  TASKS_CSV="$TASKS_CSV" \
   NPROC="$NPROC" SHARD_WORKERS="$SHARD_WORKERS" \
   EPOCHS="$EPOCHS" STEPS_PER_TASK="$STEPS_PER_TASK" \
   FULL_GRAPH="$FULL_GRAPH" \
