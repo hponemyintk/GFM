@@ -492,6 +492,39 @@ def test_holdout_dataset_eval_pretrain_sweep_wraps_inner_launcher():
     )
 
 
+def test_pretrain_only_seed_sweep_no_adoption():
+    """The pretrain-only seed sweep wrapper must (a) exist and pass
+    bash syntax, (b) loop over PRETRAIN_SEEDS, (c) per-trial set
+    SEED + PYTHONHASHSEED + SHARDS_SUBDIR derived from the trial
+    seed, (d) call pretrain_p4d.sh directly (no adoption launcher
+    -- this is pretrain-only). Aggregate path is
+    <sweep>/aggregate.json."""
+    bash = _bash()
+    p = SCRIPTS / "pretrain_only_seed_sweep.sh"
+    assert p.exists(), f"missing {p}"
+    rc = subprocess.run([bash, "-n", str(p)], check=False)
+    assert rc.returncode == 0
+    src = p.read_text()
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert 'PRETRAIN_SEEDS="${PRETRAIN_SEEDS:-0 1 2}"' in src
+    assert "for PSEED in $PRETRAIN_SEEDS" in code_only
+    assert 'PYTHONHASHSEED="$PSEED"' in code_only
+    assert 'SEED="$PSEED"' in code_only
+    assert 'SHARDS_SUBDIR="pretrain_seed${PSEED}"' in code_only
+    # Must invoke pretrain_p4d.sh directly, not a Phase-5 wrapper --
+    # that's the whole point of "pretrain-only".
+    assert 'bash "$REPO_ROOT/scripts/pretrain_p4d.sh"' in code_only, (
+        "pretrain-only sweep must call pretrain_p4d.sh directly, "
+        "not a Phase-5 adoption launcher"
+    )
+    # No adoption / TARGET / extract_embeddings invocations.
+    assert "extract_embeddings" not in code_only
+    assert "holdout_dataset_eval" not in code_only
+    assert 'AGG="$SWEEP_DIR/aggregate.json"' in code_only
+
+
 def test_pretrain_p4d_supports_shards_subdir_namespace():
     """pretrain_p4d.sh must accept a SHARDS_SUBDIR env knob that
     appends a per-trial subdir under $CACHE/shards[_full]/. Used by
