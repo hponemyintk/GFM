@@ -13,6 +13,30 @@
 # pretrain (hours on p4d). Use sparingly and prefer 3 seeds unless
 # you really need a tighter SD.
 #
+# Per-trial seed isolation -- every RNG that touches the trial is
+# derived from the pretrain seed:
+#   SEED=$PSEED                forwarded to main_node_ddp.py --seed
+#                              (model init, DataLoader shuffle,
+#                              multi-task sampler).
+#   PYTHONHASHSEED=$PSEED      pins CPython's hash() for strings
+#                              and tuples-with-strings, which is
+#                              what gfm_data/sampler.py uses to
+#                              derive the per-row seed_val and to
+#                              order set->list conversions.
+#                              Without this, sampling RNG is
+#                              uncontrolled noise across trials.
+#   SHARDS_SUBDIR=pretrain_seedN
+#                              forces each trial to build its own
+#                              precomputed shards under
+#                              $CACHE/shards[_full]/pretrain_seedN/
+#                              instead of reusing the first trial's
+#                              cache. tf_store + materialization
+#                              (deterministic) stay shared.
+#
+# Net effect: each trial's pretrain sees a different per-row
+# neighbor list AND different model init; the resulting backbone-
+# variance number captures both jointly.
+#
 # Each pretrain seed gets its own RUN_DIR / artifacts. The aggregator
 # at the bottom reads each run's summary.json and rolls per-task
 # test_metrics into mean +/- SD across the N pretrain seeds, written
@@ -113,13 +137,43 @@ for PSEED in $PRETRAIN_SEEDS; do
   echo "[$(date)] PRETRAIN_SEED=$PSEED  ->  $PSEED_DIR"
   echo "------------------------------------------------------------------"
 
-  # Each pretrain seed runs the full inner launcher (pretrain ->
-  # adopt -> aggregate). OUT_DIR namespaces the per-seed artifacts;
-  # the inner launcher writes to <OUT_DIR>/<src_slug>_to_<target>/.
-  # SEED feeds the pretrain RNG; SEEDS controls the adoption sweep
-  # within this single backbone.
+  # Per-trial seed plumbing -- want every RNG that touches this run
+  # to be deterministically derived from PSEED, AND want each trial
+  # to actually rebuild its neighbor list from scratch:
+  #
+  #   SEED=$PSEED            pretrain --seed (model init, train
+  #                          DataLoader shuffle, multi-task sampler).
+  #   SEEDS=$ADOPT_SEEDS     adoption-side seeds (passed straight to
+  #                          extract_embeddings / finetune_head /
+  #                          tabpfn_eval --seed inside the inner
+  #                          launcher's adoption Phase A loop).
+  #   PYTHONHASHSEED=$PSEED  controls hash() of strings + tuples in
+  #                          CPython, which feeds into:
+  #                            (a) the per-row seed_val =
+  #                                hash((seed_node_type, idx, t, K))
+  #                                inside gfm_data/sampler.py and
+  #                                utils.py, and
+  #                            (b) the iteration order of any
+  #                                set->list conversion the sampler
+  #                                does on string-keyed neighbor
+  #                                sets.
+  #                          Without this set, every Python
+  #                          subprocess gets a random PYTHONHASHSEED
+  #                          and the "different seed for sampling"
+  #                          control is uncontrolled noise instead.
+  #   SHARDS_SUBDIR=...      pretrain_p4d.sh namespaces its
+  #                          precomputed shards under
+  #                          $CACHE/shards[_full]/<SHARDS_SUBDIR>/
+  #                          so each trial truly rebuilds the
+  #                          per-row neighbor lists rather than
+  #                          reusing the first-trial cache.
+  #                          tf_store + materialization (which are
+  #                          deterministic from the raw data) stay
+  #                          shared across trials.
+  PYTHONHASHSEED="$PSEED" \
   SEED="$PSEED" \
   SEEDS="$ADOPT_SEEDS" \
+  SHARDS_SUBDIR="pretrain_seed${PSEED}" \
   SOURCE="$SOURCE" TARGET="$TARGET" \
   EPOCHS="$EPOCHS" STEPS_PER_TASK="$STEPS_PER_TASK" \
   NPROC="$NPROC" SHARD_WORKERS="$SHARD_WORKERS" \

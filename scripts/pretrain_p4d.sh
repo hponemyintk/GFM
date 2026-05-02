@@ -164,6 +164,16 @@ else
     SHARDS="$CACHE/shards"
     FULL_GRAPH_FLAG=""
 fi
+# Optional shard-tree namespace. Lets the backbone-variance sweep
+# (scripts/holdout_dataset_eval_pretrain_sweep.sh) put each
+# pretrain seed's shards in its own subdir so every trial rebuilds
+# its own neighbor list rather than reusing the first-build cache.
+# tf_store and the materialization cache stay shared (they're
+# deterministic from raw data; no benefit from per-seed isolation).
+SHARDS_SUBDIR="${SHARDS_SUBDIR:-}"
+if [ -n "$SHARDS_SUBDIR" ]; then
+    SHARDS="$SHARDS/$SHARDS_SUBDIR"
+fi
 K="${K:-300}"
 # Defaults match expts/run-large-base-experiments.sh per-task budget,
 # adjusted for batch=512 (half of expts' 1024) on 8-GPU DDP.

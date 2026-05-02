@@ -472,6 +472,50 @@ def test_holdout_dataset_eval_pretrain_sweep_wraps_inner_launcher():
     assert 'INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"' in src, (
         "default INNER must be holdout_dataset_eval_clean.sh"
     )
+    # Every per-trial RNG must be tied to the pretrain seed:
+    #   SEED  -> pretrain --seed (model init / shuffle / sampler)
+    #   PYTHONHASHSEED -> hash() inside the per-row seed_val
+    #                    derivation, set->list iteration order
+    #   SHARDS_SUBDIR  -> namespaces precomputed shards under
+    #                    $CACHE/shards[_full]/pretrain_seedN/ so
+    #                    each trial rebuilds its neighbor list
+    #                    from scratch (rather than reusing trial 0's)
+    assert 'PYTHONHASHSEED="$PSEED"' in src, (
+        "wrapper must set PYTHONHASHSEED per pretrain seed so the "
+        "per-row seed_val + set->list ordering inside the sampler "
+        "is deterministically tied to the trial seed"
+    )
+    assert 'SHARDS_SUBDIR="pretrain_seed${PSEED}"' in src, (
+        "wrapper must namespace the precomputed shard tree per "
+        "pretrain seed so each trial actually rebuilds neighbor "
+        "lists from scratch"
+    )
+
+
+def test_pretrain_p4d_supports_shards_subdir_namespace():
+    """pretrain_p4d.sh must accept a SHARDS_SUBDIR env knob that
+    appends a per-trial subdir under $CACHE/shards[_full]/. Used by
+    the backbone-variance sweep so each trial's neighbor list is
+    rebuilt from scratch instead of reusing the first trial's cache."""
+    src = (SCRIPTS / "pretrain_p4d.sh").read_text()
+    assert 'SHARDS_SUBDIR="${SHARDS_SUBDIR:-}"' in src
+    assert 'SHARDS="$SHARDS/$SHARDS_SUBDIR"' in src, (
+        "pretrain_p4d.sh must concatenate SHARDS_SUBDIR onto SHARDS "
+        "when the env var is set"
+    )
+
+
+def test_holdout_dataset_eval_forwards_shards_subdir_to_pretrain_p4d():
+    """Both Phase-5 launchers must forward SHARDS_SUBDIR through the
+    env block to pretrain_p4d.sh, otherwise the sweep wrapper's
+    per-trial namespace gets dropped on the way down."""
+    for fn in ("holdout_dataset_eval.sh", "holdout_dataset_eval_clean.sh"):
+        src = (SCRIPTS / fn).read_text()
+        assert 'SHARDS_SUBDIR="${SHARDS_SUBDIR:-}" \\' in src, (
+            f"{fn} must forward SHARDS_SUBDIR to pretrain_p4d.sh "
+            "so the sweep wrapper's per-trial shard namespace is "
+            "actually applied"
+        )
 
 
 def test_pretrain_p4d_forwards_seed_to_torchrun():
