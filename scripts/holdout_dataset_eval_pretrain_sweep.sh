@@ -103,11 +103,12 @@ INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval_pretrain_sweep}"
 # Force-rebuild the per-trial precomputed shard tree under
 # $CACHE/shards[_full]/pretrain_seed<N>/ before each trial. Default
-# 1 (defensive freshness): pretrain_p4d.sh's .done sentinel would
-# otherwise silently reuse shards from a prior invocation, even if
-# the sampler code changed between runs. Set FORCE_REBUILD_SHARDS=0
-# for fast iteration when you know the sampler is unchanged.
-FORCE_REBUILD_SHARDS="${FORCE_REBUILD_SHARDS:-1}"
+# 0 (fast iteration): pretrain_p4d.sh's .done sentinel reuses
+# shards from a prior invocation, which is what you want when only
+# the training code changed. Set FORCE_REBUILD_SHARDS=1 when the
+# sampler / seed_time / truncation policy moved between runs and
+# you need neighbor lists rebuilt to match the new code.
+FORCE_REBUILD_SHARDS="${FORCE_REBUILD_SHARDS:-0}"
 CACHE_LOCAL="${CACHE_DIR:-$HOME/.cache/relbench_examples}"
 
 if [ ! -x "$REPO_ROOT/$INNER" ] && [ ! -f "$REPO_ROOT/$INNER" ]; then
