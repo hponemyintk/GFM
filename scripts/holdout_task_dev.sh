@@ -476,7 +476,7 @@ _acquire_gpu() {
   # its own copy of GPU_POOL. Returns the index in ACQUIRED_GPU.
   while [ ${#GPU_POOL[@]} -eq 0 ]; do
     _reap_finished
-    [ ${#GPU_POOL[@]} -eq 0 ] && sleep 1
+    [ ${#GPU_POOL[@]} -eq 0 ] && sleep 1 || true
   done
   ACQUIRED_GPU="${GPU_POOL[0]}"
   GPU_POOL=("${GPU_POOL[@]:1}")
@@ -485,7 +485,7 @@ _acquire_gpu() {
 _wait_all() {
   while [ ${#PID_GPU[@]} -gt 0 ]; do
     _reap_finished
-    [ ${#PID_GPU[@]} -gt 0 ] && sleep 1
+    [ ${#PID_GPU[@]} -gt 0 ] && sleep 1 || true
   done
 }
 
