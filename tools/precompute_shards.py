@@ -37,6 +37,7 @@ from gfm_data.graph_cache import DatasetGraphCache
 from gfm_data.sampler import sample_local_subgraph
 from gfm_data.shard_io import ShardWriter
 from gfm_data.stypes import filter_to_db_columns, load_or_generate_stypes
+from gfm_data.task_tokens import coerce_string_target_to_numeric
 from utils import GloveTextEmbedding
 
 
@@ -216,6 +217,7 @@ def precompute_split(cache, task, split, K, out_dir, shard_size, workers=1):
     ``(seed_type, node_idx, seed_t, K)``.
     """
     table = task.get_table(split)
+    coerce_string_target_to_numeric(table, task.target_col)
     table_input = get_node_train_table_input(table, task)
     raw_seed_type, seed_idxs = table_input.nodes
     seed_times = getattr(table_input, "time", None)

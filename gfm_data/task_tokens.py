@@ -43,6 +43,33 @@ TASK_TYPE_BINARY = 1
 TASK_TYPE_MULTILABEL = 2
 
 
+# Some RelBench v2 autocomplete tasks (rel-trial eligibilities-child,
+# eligibilities-adult, studies-has_dmc) ship binary targets as 't'/'f' strings.
+# relbench.modeling.graph.get_node_train_table_input unconditionally calls
+# .astype(float) on the target column and crashes on these. Coerce in place
+# before that call. Mutating table.df does NOT persist across processes (the
+# parquet on disk is the source of truth via task.get_table()'s LRU cache),
+# so this must run at every entry point that builds a table_input -- both
+# tools/precompute_shards.py (shard build) and TaskTokens.__init__ (training).
+_STRING_TARGET_MAP = {"t": 1, "f": 0, "yes": 1, "no": 0, "true": 1, "false": 0}
+
+
+def coerce_string_target_to_numeric(table, target_col: str) -> None:
+    col = table.df[target_col]
+    if col.dtype != object:
+        return
+    mapped = col.map(_STRING_TARGET_MAP)
+    unmapped = col.notna() & mapped.isna()
+    if unmapped.any():
+        bad = col[unmapped].unique().tolist()
+        raise ValueError(
+            f"Target column {target_col!r} has unmapped string values: {bad}. "
+            f"Add mappings to _STRING_TARGET_MAP. "
+            f"Known keys: {sorted(_STRING_TARGET_MAP.keys())}"
+        )
+    table.df[target_col] = mapped
+
+
 # OOM mitigation: arithmetic proxies for the (type, local) <-> global
 # mapping. The previous dict-based implementation stored ONE entry per
 # node across all types -- ~100M entries on rel-event * ~110 bytes each
@@ -207,6 +234,7 @@ class TaskTokens(Dataset):
         )
 
         self.table = task.get_table(split=split)
+        coerce_string_target_to_numeric(self.table, task.target_col)
         self.table_input = get_node_train_table_input(self.table, task)
 
         # The seed entity type, in raw (un-prefixed) form. Map to prefixed for
