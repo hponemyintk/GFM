@@ -146,6 +146,31 @@ class DatasetGraphCache:
         for _i, _t in enumerate(self.node_types):
             self._type_str_by_id[_i] = _t
 
+        # Pre-extract per-type time arrays + has_time flags so the sampler's
+        # gather phase doesn't pay PyTorch tensor indexing + .item() per
+        # neighbor. Keys are prefixed type names; the sampler queries via
+        # ``cache.time_by_prefixed[nbr_t][nbr_i]`` and
+        # ``cache.has_time_by_prefixed[nbr_t]``. Values for types without
+        # time are ``None`` / ``False``. We materialize once here so the
+        # cost (~sum(num_nodes_with_time) * 4 bytes) is paid in the parent
+        # process; fork-workers inherit via copy-on-write at zero extra RSS.
+        # Bit-exact: ``np.float32 <= float`` and ``torch.float32 <= float``
+        # produce identical booleans for finite RelBench timestamps; the
+        # rel_days computation is value-identical to ``.item()``.
+        self.time_by_prefixed: Dict[str, Optional[np.ndarray]] = {}
+        self.has_time_by_prefixed: Dict[str, bool] = {}
+        for _raw_t in raw_types:
+            _pt = self._with_prefix(_raw_t)
+            if hasattr(data[_raw_t], "time"):
+                _ta = data[_raw_t].time
+                if isinstance(_ta, torch.Tensor):
+                    _ta = _ta.cpu().numpy()
+                self.time_by_prefixed[_pt] = _ta
+                self.has_time_by_prefixed[_pt] = True
+            else:
+                self.time_by_prefixed[_pt] = None
+                self.has_time_by_prefixed[_pt] = False
+
         # OOM mitigation: ``all_nodes`` used to be eagerly materialized as a
         # ``List[Tuple[str, int]]`` with ONE entry per node across all
         # types -- on rel-event (~100M+ nodes) that's ~8 GiB of Python

@@ -50,8 +50,10 @@ def gather_1_and_2_hop(
     Time filter: a neighbor is included iff ``data[nbr_t].time[nbr_i] <= seed_time``
     when ``data[nbr_t]`` has a ``time`` attribute; otherwise included unconditionally.
     """
-    data = cache.data
-    raw_node_type = cache.prefixed_to_raw[node_type]
+    # Resolve dict-of-arrays once so the inner loops just do scalar
+    # numpy access -- no PyTorch dispatch, no .item() boxing.
+    time_by_prefixed = cache.time_by_prefixed
+    has_time_by_prefixed = cache.has_time_by_prefixed
 
     # ---- 1-hop candidates ----
     n1_full = cache.neighbors_set(node_type, node_idx)
@@ -64,9 +66,8 @@ def gather_1_and_2_hop(
 
     n1: Set[Tuple[str, int]] = set()
     for (nbr_t, nbr_i) in n1_full:
-        raw_nbr_t = cache.prefixed_to_raw[nbr_t]
-        if hasattr(data[raw_nbr_t], "time"):
-            if data[raw_nbr_t].time[nbr_i] <= seed_time:
+        if has_time_by_prefixed[nbr_t]:
+            if time_by_prefixed[nbr_t][nbr_i] <= seed_time:
                 n1.add((nbr_t, nbr_i))
         else:
             n1.add((nbr_t, nbr_i))
@@ -82,9 +83,8 @@ def gather_1_and_2_hop(
         for (nbr2_t, nbr2_i) in nbr2_full:
             if (nbr2_t, nbr2_i) == (node_type, node_idx):
                 continue  # self-loop
-            raw_nbr2_t = cache.prefixed_to_raw[nbr2_t]
-            if hasattr(data[raw_nbr2_t], "time"):
-                if data[raw_nbr2_t].time[nbr2_i] <= seed_time:
+            if has_time_by_prefixed[nbr2_t]:
+                if time_by_prefixed[nbr2_t][nbr2_i] <= seed_time:
                     n2[(nbr2_t, nbr2_i)].add((nbr_t, nbr_i))
             else:
                 n2[(nbr2_t, nbr2_i)].add((nbr_t, nbr_i))
@@ -94,18 +94,16 @@ def gather_1_and_2_hop(
 
     out: List[NbrToken] = []
     for (nbr_t, nbr_i) in n1:
-        raw_nbr_t = cache.prefixed_to_raw[nbr_t]
-        if hasattr(data[raw_nbr_t], "time"):
-            nbr_time = data[raw_nbr_t].time[nbr_i].item()
+        if has_time_by_prefixed[nbr_t]:
+            nbr_time = float(time_by_prefixed[nbr_t][nbr_i])
             rel_days = (seed_time - nbr_time) / (60 * 60 * 24)
         else:
             rel_days = 0
         out.append((nbr_t, nbr_i, 1, rel_days, None))
 
     for (nbr2_t, nbr2_i), connecting_1hops in n2.items():
-        raw_nbr2_t = cache.prefixed_to_raw[nbr2_t]
-        if hasattr(data[raw_nbr2_t], "time"):
-            nbr2_time = data[raw_nbr2_t].time[nbr2_i].item()
+        if has_time_by_prefixed[nbr2_t]:
+            nbr2_time = float(time_by_prefixed[nbr2_t][nbr2_i])
             rel_days = (seed_time - nbr2_time) / (60 * 60 * 24)
         else:
             rel_days = 0
@@ -135,7 +133,8 @@ def sample_local_subgraph(
     Bit-equal to dev-kyaw under the same ``random.seed(seed_val)``.
     """
     random.seed(seed_val)
-    data = cache.data
+    time_by_prefixed = cache.time_by_prefixed
+    has_time_by_prefixed = cache.has_time_by_prefixed
 
     T_hat = gather_1_and_2_hop(
         cache, seed_node_type, seed_node_idx, seed_time
@@ -160,9 +159,8 @@ def sample_local_subgraph(
             fallback = random.choices(cache.all_nodes, k=K_minus_1)
         chosen = []
         for (ft, fi) in fallback:
-            raw_ft = cache.prefixed_to_raw[ft]
-            if hasattr(data[raw_ft], "time"):
-                ft_time = data[raw_ft].time[fi].item()
+            if has_time_by_prefixed[ft]:
+                ft_time = float(time_by_prefixed[ft][fi])
                 rel = (seed_time - ft_time) / (60 * 60 * 24)
             else:
                 rel = 0
