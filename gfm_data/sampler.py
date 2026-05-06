@@ -38,6 +38,7 @@ def gather_1_and_2_hop(
     seed_time: float,
     max_1hop_threshold: int = 5000,
     max_2hop_threshold: int = 1000,
+    out_neighbor_cache: Optional[Dict[Tuple[str, int], Set[Tuple[str, int]]]] = None,
 ) -> List[NbrToken]:
     """Mirror of ``utils.gather_1_and_2_hop_with_seed_time``.
 
@@ -49,6 +50,11 @@ def gather_1_and_2_hop(
 
     Time filter: a neighbor is included iff ``data[nbr_t].time[nbr_i] <= seed_time``
     when ``data[nbr_t]`` has a ``time`` attribute; otherwise included unconditionally.
+
+    ``out_neighbor_cache``: optional dict the caller can pass to capture the
+    neighbor sets fetched during gather (the seed and every kept 1-hop).
+    ``sample_local_subgraph`` reuses this in the edge-construction phase to
+    skip its ~K redundant ``cache.neighbors_set`` calls.
     """
     # Resolve dict-of-arrays once so the inner loops just do scalar
     # numpy access -- no PyTorch dispatch, no .item() boxing.
@@ -56,13 +62,15 @@ def gather_1_and_2_hop(
     has_time_by_prefixed = cache.has_time_by_prefixed
 
     # ---- 1-hop candidates ----
-    n1_full = cache.neighbors_set(node_type, node_idx)
-    if len(n1_full) > max_1hop_threshold:
+    n1_full_set = cache.neighbors_set(node_type, node_idx)
+    if out_neighbor_cache is not None:
+        out_neighbor_cache[(node_type, node_idx)] = n1_full_set
+    if len(n1_full_set) > max_1hop_threshold:
         # NOTE: random.sample(list(set), k) — list ordering is hash-determined
         # (CPython) and matches dev-kyaw for identical-element sets.
-        n1_full = random.sample(list(n1_full), max_1hop_threshold)
+        n1_full = random.sample(list(n1_full_set), max_1hop_threshold)
     else:
-        n1_full = list(n1_full)
+        n1_full = list(n1_full_set)
 
     n1: Set[Tuple[str, int]] = set()
     for (nbr_t, nbr_i) in n1_full:
@@ -75,11 +83,13 @@ def gather_1_and_2_hop(
     # ---- 2-hop candidates ----
     n2: Dict[Tuple[str, int], Set[Tuple[str, int]]] = defaultdict(set)
     for (nbr_t, nbr_i) in n1:
-        nbr2_full = cache.neighbors_set(nbr_t, nbr_i)
-        if len(nbr2_full) > max_2hop_threshold:
-            nbr2_full = random.sample(list(nbr2_full), max_2hop_threshold)
+        nbr2_full_set = cache.neighbors_set(nbr_t, nbr_i)
+        if out_neighbor_cache is not None:
+            out_neighbor_cache[(nbr_t, nbr_i)] = nbr2_full_set
+        if len(nbr2_full_set) > max_2hop_threshold:
+            nbr2_full = random.sample(list(nbr2_full_set), max_2hop_threshold)
         else:
-            nbr2_full = list(nbr2_full)
+            nbr2_full = list(nbr2_full_set)
         for (nbr2_t, nbr2_i) in nbr2_full:
             if (nbr2_t, nbr2_i) == (node_type, node_idx):
                 continue  # self-loop
@@ -136,8 +146,16 @@ def sample_local_subgraph(
     time_by_prefixed = cache.time_by_prefixed
     has_time_by_prefixed = cache.has_time_by_prefixed
 
+    # Per-seed neighbor cache populated during gather. Skips ~K redundant
+    # cache.neighbors_set calls during edge construction below (the seed
+    # and every kept 1-hop already had their neighbor sets fetched in
+    # gather; only 2-hop / fallback tokens fall through to the cache miss
+    # path). Bit-exact: the cached set object is the same Python object
+    # returned by the original call, so iteration order is identical.
+    neighbor_cache: Dict[Tuple[str, int], Set[Tuple[str, int]]] = {}
     T_hat = gather_1_and_2_hop(
-        cache, seed_node_type, seed_node_idx, seed_time
+        cache, seed_node_type, seed_node_idx, seed_time,
+        out_neighbor_cache=neighbor_cache,
     )
     T_hat_list = list(T_hat)
     size_th = len(T_hat_list)
@@ -184,7 +202,13 @@ def sample_local_subgraph(
 
     edges: List[Tuple[int, int]] = []
     for j_src, (t_str, i, _hop, _t_val, _c1) in enumerate(final_tokens):
-        for (nbr_t, nbr_i) in cache.neighbors_set(t_str, i):
+        # The seed and every kept 1-hop had their neighbor set captured
+        # during gather; reuse them here. 2-hop / fallback tokens were
+        # never fetched, so fall through to cache.neighbors_set.
+        nbrs = neighbor_cache.get((t_str, i))
+        if nbrs is None:
+            nbrs = cache.neighbors_set(t_str, i)
+        for (nbr_t, nbr_i) in nbrs:
             if (nbr_t, nbr_i) in local_map:
                 edges.append((j_src, local_map[(nbr_t, nbr_i)]))
 
