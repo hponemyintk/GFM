@@ -554,9 +554,9 @@ done
 # HDF5 caches isolated so concurrent jobs never race.
 GPU_POOL=()
 for ((_g=0; _g<NPROC; _g++)); do GPU_POOL+=("$_g"); done
-declare -A PID_GPU
-declare -A PID_DESC
-declare -A PID_LOG
+declare -A PID_GPU=()
+declare -A PID_DESC=()
+declare -A PID_LOG=()
 
 _reap_finished() {
   local pid
