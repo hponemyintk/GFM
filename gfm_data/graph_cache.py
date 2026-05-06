@@ -134,6 +134,18 @@ class DatasetGraphCache:
         # Per-source-type CSR blocks. Key is the **prefixed** type name.
         self.csr: Dict[str, CSRBlock] = self._build_csr(data, raw_types, undirected)
 
+        # Pre-allocated lookup table for the int16 -> prefixed-type-string
+        # remap that ``neighbors_set`` does on every CSR slice. Stored as a
+        # numpy object array so we can fancy-index it with the int16 type-id
+        # column from the CSR block in a single C-level pass instead of a
+        # Python ``for k in range(end-start): out.add(...)`` loop. The
+        # resulting set has identical elements to the per-element loop, and
+        # CPython hash buckets depend only on the elements (not insertion
+        # order), so ``random.sample(list(set), k)`` downstream is unchanged.
+        self._type_str_by_id = np.empty(len(self.node_types), dtype=object)
+        for _i, _t in enumerate(self.node_types):
+            self._type_str_by_id[_i] = _t
+
         # OOM mitigation: ``all_nodes`` used to be eagerly materialized as a
         # ``List[Tuple[str, int]]`` with ONE entry per node across all
         # types -- on rel-event (~100M+ nodes) that's ~8 GiB of Python
@@ -298,12 +310,15 @@ class DatasetGraphCache:
         end = int(block.indptr[src_idx + 1])
         if end == start:
             return set()
-        nt_ids = block.nbr_type_id[start:end]
-        nidx = block.nbr_idx[start:end]
-        out: Set[Tuple[str, int]] = set()
-        for k in range(end - start):
-            out.add((self.index_to_node_type[int(nt_ids[k])], int(nidx[k])))
-        return out
+        # Vectorized: fancy-index the type-string LUT in one C-level pass,
+        # ndarray.tolist() converts numpy ints to Python ints (so tuple
+        # hashes match the prior per-element ``int(nidx[k])`` flow), and
+        # ``set(zip(...))`` builds the final set in C without the
+        # interpreter loop. Identical-element set => identical CPython
+        # iteration order => bit-equivalent under fixed random.seed.
+        nt_strs = self._type_str_by_id[block.nbr_type_id[start:end]].tolist()
+        nidx_list = block.nbr_idx[start:end].tolist()
+        return set(zip(nt_strs, nidx_list))
 
     # ----------------------------------------------------------- TF lookup
     def tf_view(self, raw_node_type: str, row_idx):
