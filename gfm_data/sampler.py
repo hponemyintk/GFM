@@ -72,16 +72,47 @@ def gather_1_and_2_hop(
     else:
         n1_full = list(n1_full_set)
 
+    # Vectorized 1-hop time filter: bucket indices by type, do a single
+    # numpy ``time_arr[idxs] <= seed_time`` per type, then walk
+    # n1_full in original iteration order to insert survivors into n1.
+    # Bit-exact: n1 ends up with the same elements as the per-element
+    # filter would produce; CPython sets are insertion-order-irrelevant.
     n1: Set[Tuple[str, int]] = set()
-    for (nbr_t, nbr_i) in n1_full:
-        if has_time_by_prefixed[nbr_t]:
-            if time_by_prefixed[nbr_t][nbr_i] <= seed_time:
-                n1.add((nbr_t, nbr_i))
-        else:
-            n1.add((nbr_t, nbr_i))
+    if n1_full:
+        _bucket_idx: Dict[str, List[int]] = {}
+        _bucket_pos: Dict[str, List[int]] = {}
+        for _pos, (_t, _i) in enumerate(n1_full):
+            if _t in _bucket_idx:
+                _bucket_idx[_t].append(_i)
+                _bucket_pos[_t].append(_pos)
+            else:
+                _bucket_idx[_t] = [_i]
+                _bucket_pos[_t] = [_pos]
+        _keep_1hop = [True] * len(n1_full)
+        for _t, _idxs in _bucket_idx.items():
+            if has_time_by_prefixed[_t]:
+                _mask_list = (
+                    time_by_prefixed[_t][np.asarray(_idxs, dtype=np.int64)]
+                    <= seed_time
+                ).tolist()
+                _positions = _bucket_pos[_t]
+                for _j, _ok in enumerate(_mask_list):
+                    if not _ok:
+                        _keep_1hop[_positions[_j]] = False
+        for _ok, _pair in zip(_keep_1hop, n1_full):
+            if _ok:
+                n1.add(_pair)
 
     # ---- 2-hop candidates ----
+    # Same bucketing strategy as 1-hop, but applied per-1-hop on its
+    # up-to-1000-element 2-hop list. The OUTER ``for (nbr_t, nbr_i) in
+    # n1:`` order is preserved, and within each 1-hop the survivor
+    # iteration order matches ``nbr2_full``, so the n2 dict's key
+    # insertion order is identical to the per-element loop's --
+    # critical because n2's key iteration order downstream determines
+    # the order of 2-hop tokens in T_hat / combined / chosen.
     n2: Dict[Tuple[str, int], Set[Tuple[str, int]]] = defaultdict(set)
+    self_loop = (node_type, node_idx)
     for (nbr_t, nbr_i) in n1:
         nbr2_full_set = cache.neighbors_set(nbr_t, nbr_i)
         if out_neighbor_cache is not None:
@@ -90,14 +121,38 @@ def gather_1_and_2_hop(
             nbr2_full = random.sample(list(nbr2_full_set), max_2hop_threshold)
         else:
             nbr2_full = list(nbr2_full_set)
-        for (nbr2_t, nbr2_i) in nbr2_full:
-            if (nbr2_t, nbr2_i) == (node_type, node_idx):
-                continue  # self-loop
-            if has_time_by_prefixed[nbr2_t]:
-                if time_by_prefixed[nbr2_t][nbr2_i] <= seed_time:
-                    n2[(nbr2_t, nbr2_i)].add((nbr_t, nbr_i))
+        n_cand = len(nbr2_full)
+        if n_cand == 0:
+            continue
+
+        _b2_idx: Dict[str, List[int]] = {}
+        _b2_pos: Dict[str, List[int]] = {}
+        for _pos in range(n_cand):
+            _t, _i = nbr2_full[_pos]
+            if _t in _b2_idx:
+                _b2_idx[_t].append(_i)
+                _b2_pos[_t].append(_pos)
             else:
-                n2[(nbr2_t, nbr2_i)].add((nbr_t, nbr_i))
+                _b2_idx[_t] = [_i]
+                _b2_pos[_t] = [_pos]
+        _keep_2hop = [True] * n_cand
+        for _t, _idxs in _b2_idx.items():
+            if has_time_by_prefixed[_t]:
+                _mask_list = (
+                    time_by_prefixed[_t][np.asarray(_idxs, dtype=np.int64)]
+                    <= seed_time
+                ).tolist()
+                _positions = _b2_pos[_t]
+                for _j, _ok in enumerate(_mask_list):
+                    if not _ok:
+                        _keep_2hop[_positions[_j]] = False
+        for _pos in range(n_cand):
+            if not _keep_2hop[_pos]:
+                continue
+            _pair2 = nbr2_full[_pos]
+            if _pair2 == self_loop:
+                continue
+            n2[_pair2].add((nbr_t, nbr_i))
 
     # 2-hop ∩ 1-hop drop.
     n2 = {k: v for k, v in n2.items() if k not in n1}
