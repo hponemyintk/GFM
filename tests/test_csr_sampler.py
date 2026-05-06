@@ -386,3 +386,59 @@ def test_S17_per_regime_equivalence_vs_dev_kyaw():
             dev_adj, dev_all, cache.data, K, st, si, t, seed_val,
         )
         assert _multiset(f_new) == _multiset(f_dev), name
+
+
+# S18 ------------------------------------------------------------------------
+def test_S18_position_strict_equivalence_vs_dev_kyaw():
+    """Bit-exact equivalence vs dev-kyaw, position-by-position +
+    edge_index bytes.
+
+    S16 / S17 check ``_multiset(...)`` equality, which catches set-membership
+    drift but not order-dependent bugs (a future refactor that swaps n1's
+    iteration order would produce the same multiset but different
+    ``list(set)`` -> different ``random.sample`` -> different downstream
+    bytes in the saved shards). S18 is the strict version: every position
+    in ``final_tokens`` matches dev-kyaw on (type, idx, hop) and rel_time,
+    and ``edge_index`` matches dev-kyaw bit-for-bit.
+
+    Coverage: 50 seeds x 4 K values = 200 head-to-head comparisons on the
+    dense synthetic graph, larger than S16's K=12 single-K sweep.
+    """
+    g = make_dense_graph(seed=7)
+    cache = DatasetGraphCache(data=g, undirected=True)
+    dev_adj, dev_all = _dev_kyaw_setup(g)
+
+    n_a = g["A"].num_nodes
+    rng = np.random.default_rng(0)
+    seed_idxs = rng.integers(0, n_a, size=50).tolist()
+    seed_times = rng.uniform(50.0, 100.0, size=50).tolist()
+
+    for K in (8, 12, 16, 24):
+        for s_idx, s_t in zip(seed_idxs, seed_times):
+            seed_val = hash(("A", int(s_idx), float(s_t), K)) & 0xFFFFFFFF
+            f_new, e_new = sample_local_subgraph(
+                cache, K=K, seed_node_type="A",
+                seed_node_idx=int(s_idx), seed_time=float(s_t),
+                seed_val=seed_val,
+            )
+            f_dev, e_dev = _dev_kyaw_process_one_seed(
+                dev_adj, dev_all, cache.data, K, "A",
+                int(s_idx), float(s_t), seed_val,
+            )
+            assert len(f_new) == len(f_dev) == K
+            for j in range(K):
+                tn, in_, hn, rn, _cn = f_new[j]
+                td, id_, hd, rd, _cd = f_dev[j]
+                assert (tn, in_, hn) == (td, id_, hd), (
+                    f"S18 token mismatch at pos {j} K={K} "
+                    f"seed_idx={s_idx} t={s_t}: "
+                    f"new=({tn!r},{in_},{hn}) vs dev=({td!r},{id_},{hd})"
+                )
+                # rel_time uses float arithmetic; allow 1e-6 tolerance.
+                assert abs(float(rn) - float(rd)) < 1e-6, (
+                    f"S18 rel_time mismatch at pos {j} K={K} "
+                    f"seed_idx={s_idx}: {rn} vs {rd}"
+                )
+            assert np.array_equal(e_new, e_dev), (
+                f"S18 edge_index mismatch at K={K} seed_idx={s_idx}"
+            )
