@@ -66,14 +66,17 @@
 #   FT_HEAD         mlp2       2-layer MLP head (override =linear for
 #                              the legacy linear-probe ablation)
 #   OUT_DIR         results/holdout_dataset_eval_pretrain_sweep
-#   INNER           scripts/holdout_dataset_eval_clean.sh
+#   INNER           scripts/holdout_dataset_eval.sh
 #                              The inner launcher to wrap. Defaults
-#                              to the clean variant (35 tasks across
-#                              9 datasets, drops the 5 RelBench v2
-#                              tasks whose supervised GNN baseline
-#                              is at-or-below random per the paper).
-#                              Set INNER=scripts/holdout_dataset_eval.sh
-#                              for the full 40-task setup.
+#                              to the Phase-5 launcher, which itself
+#                              drops the 5 RelBench v2 tasks whose
+#                              supervised GNN baseline is at-or-below
+#                              random per the paper (35 tasks across
+#                              9 datasets). Override EXCLUDED_TASKS=""
+#                              on pretrain_p4d.sh -- and uncomment the
+#                              corresponding lines in the inner
+#                              launcher's per-dataset arrays -- to run
+#                              the unfiltered all-tasks ablation.
 #
 # Recommended invocation (rel-f1 + rel-event -> rel-arxiv, no
 # TabPFN, single adoption seed per pretrain seed):
@@ -99,7 +102,7 @@ NPROC="${NPROC:-8}"
 SHARD_WORKERS="${SHARD_WORKERS:-10}"
 RUN_TABPFN="${RUN_TABPFN:-0}"
 FT_HEAD="${FT_HEAD:-mlp2}"
-INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"
+INNER="${INNER:-scripts/holdout_dataset_eval.sh}"
 OUT_DIR_BASE="${OUT_DIR:-results/holdout_dataset_eval_pretrain_sweep}"
 # Force-rebuild the per-trial precomputed shard tree under
 # $CACHE/shards[_full]/pretrain_seed<N>/ before each trial. Default

@@ -136,20 +136,44 @@ def test_holdout_task_dev_default_paper_safe_subset():
         "FULL_GRAPH must default to 1 so autocomplete tasks "
         "(results-position, qualifying-position) build cleanly"
     )
-    # rel-event default task list -- 3 paper-benchmarked tasks
-    # (user-attendance regression, user-repeat / user-ignore binary)
-    # PLUS 3 autocomplete tasks that need FULL_GRAPH=1
-    # (event_interest-{interested,not_interested} binary,
-    # users-birthyear regression). Confirmed runnable end-to-end on
-    # p4d in commit e6aa7a3 (~8h wall-time for the 11-task pretrain).
+    # rel-event default task list -- 3 paper-benchmarked user-*
+    # tasks only (user-attendance regression, user-repeat /
+    # user-ignore binary). The 3 autocomplete tasks
+    # (event_interest-{interested,not_interested},
+    # users-birthyear) are dropped by default because their
+    # RelBench v2 GNN baselines are at or below random -- same
+    # exclusion set as scripts/holdout_dataset_eval.sh and
+    # pretrain_p4d.sh's EXCLUDED_TASKS default. The dropped task
+    # names must remain in the file as commented-out lines so the
+    # rationale is visible inline and the all-tasks ablation is one
+    # tweak away.
     assert (
-        '[rel-event]="user-attendance user-repeat user-ignore '
-        'event_interest-interested event_interest-not_interested '
-        'users-birthyear"'
+        '[rel-event]="user-attendance user-repeat user-ignore"'
     ) in src, (
-        "rel-event default task list must include all 6 task variants "
-        "(3 paper-safe + 3 autocomplete enabled by FULL_GRAPH=1)"
+        "rel-event default task list must drop the 3 low-quality "
+        "autocomplete tasks (event_interest-*, users-birthyear) by "
+        "default; only the 3 paper-benchmarked user-* tasks should "
+        "be live entries"
     )
+    # The dropped task names must still appear in the file as
+    # commented-out lines so the exclusion rationale is preserved.
+    code_only = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    DROPPED = (
+        "event_interest-interested",
+        "event_interest-not_interested",
+        "users-birthyear",
+    )
+    for tn in DROPPED:
+        assert tn not in code_only.split('[rel-event]="')[1].split('"')[0], (
+            f"low-quality task {tn!r} must not be a live entry in the "
+            "rel-event default list"
+        )
+        assert tn in src, (
+            f"{tn!r} should remain in the file as a commented-out "
+            "line so the exclusion rationale stays inline"
+        )
     # rel-hm task list available for opt-in via DATASETS override.
     # transactions-price is the RelBench v2 autocomplete regression
     # and joins under FULL_GRAPH=1 (default).
@@ -386,42 +410,13 @@ def test_extract_embeddings_supports_precomputed_dir_flag():
     )
 
 
-def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
-    """The 'clean' variant must drop the 5 RelBench v2 tasks whose
-    supervised single-task GNN baseline is at-or-below random per the
-    paper. The exclusions are kept as commented-out lines in the
-    arrays (with baseline rationale) so an ablation is one-line; the
-    test enforces that the lines are commented out, not deleted."""
-    p = SCRIPTS / "holdout_dataset_eval_clean.sh"
-    assert p.exists(), f"missing {p}"
-    src = p.read_text()
-    # Strip lines whose first non-space char is '#' so we only check
-    # the live (uncommented) array entries.
-    code_only = "\n".join(
-        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
-    )
-    EXCLUDED = [
-        "rel-event.event_interest-interested",
-        "rel-event.event_interest-not_interested",
-        "rel-event.users-birthyear",
-        "rel-trial.site-success",
-        "rel-amazon.item-ltv",
-    ]
-    for tn in EXCLUDED:
-        assert f'"{tn}:1.0"' not in code_only, (
-            f"clean variant must NOT include {tn!r} as a live array "
-            "entry -- paper baseline is at or below random. Comment "
-            "the line out (with the paper rationale inline) instead "
-            "of leaving it active."
-        )
-        # And: the line must STILL exist in the file as a comment, so
-        # the rationale stays visible and re-enabling is one tweak.
-        assert f'"{tn}:1.0"' in src, (
-            f"{tn!r} should remain in the file as a commented-out "
-            "line so the exclusion rationale is visible inline"
-        )
-    # Sanity: the kept rel-event tasks (3 user-* forecasting) and
-    # kept rel-trial tasks must still be present.
+def test_holdout_dataset_eval_keeps_high_signal_tasks():
+    """The Phase-5 launcher must keep the high-signal task set in its
+    per-dataset arrays. Paired with
+    test_holdout_dataset_eval_drops_low_quality_tasks_by_default
+    (which checks the 5 dropped tasks) -- together they pin the
+    intended task subset that scripts/holdout_dataset_eval.sh uses."""
+    src = (SCRIPTS / "holdout_dataset_eval.sh").read_text()
     KEPT = [
         "rel-event.user-attendance",
         "rel-event.user-repeat",
@@ -434,7 +429,7 @@ def test_holdout_dataset_eval_clean_excludes_low_quality_tasks():
     ]
     for tn in KEPT:
         assert f'"{tn}:1.0"' in src, (
-            f"clean variant should keep {tn!r}"
+            f"Phase-5 launcher should keep {tn!r}"
         )
 
 
@@ -466,11 +461,12 @@ def test_holdout_dataset_eval_pretrain_sweep_wraps_inner_launcher():
     assert 'AGG="$SWEEP_DIR/aggregate.json"' in src, (
         "aggregate path must be <sweep>/aggregate.json"
     )
-    # Default INNER must point at the "clean" launcher so the sweep
-    # uses the high-signal task subset by default. Override INNER to
-    # the unfiltered launcher for the all-tasks ablation.
-    assert 'INNER="${INNER:-scripts/holdout_dataset_eval_clean.sh}"' in src, (
-        "default INNER must be holdout_dataset_eval_clean.sh"
+    # Default INNER must point at the Phase-5 launcher; that launcher
+    # already drops the 5 low-quality tasks by default (see
+    # test_holdout_dataset_eval_drops_low_quality_tasks_by_default),
+    # so the sweep uses the high-signal task subset out of the box.
+    assert 'INNER="${INNER:-scripts/holdout_dataset_eval.sh}"' in src, (
+        "default INNER must be holdout_dataset_eval.sh"
     )
     # Every per-trial RNG must be tied to the pretrain seed:
     #   SEED  -> pretrain --seed (model init / shuffle / sampler)
@@ -616,16 +612,16 @@ def test_pretrain_p4d_supports_shards_subdir_namespace():
 
 
 def test_holdout_dataset_eval_forwards_shards_subdir_to_pretrain_p4d():
-    """Both Phase-5 launchers must forward SHARDS_SUBDIR through the
+    """The Phase-5 launcher must forward SHARDS_SUBDIR through the
     env block to pretrain_p4d.sh, otherwise the sweep wrapper's
     per-trial namespace gets dropped on the way down."""
-    for fn in ("holdout_dataset_eval.sh", "holdout_dataset_eval_clean.sh"):
-        src = (SCRIPTS / fn).read_text()
-        assert 'SHARDS_SUBDIR="${SHARDS_SUBDIR:-}" \\' in src, (
-            f"{fn} must forward SHARDS_SUBDIR to pretrain_p4d.sh "
-            "so the sweep wrapper's per-trial shard namespace is "
-            "actually applied"
-        )
+    fn = "holdout_dataset_eval.sh"
+    src = (SCRIPTS / fn).read_text()
+    assert 'SHARDS_SUBDIR="${SHARDS_SUBDIR:-}" \\' in src, (
+        f"{fn} must forward SHARDS_SUBDIR to pretrain_p4d.sh "
+        "so the sweep wrapper's per-trial shard namespace is "
+        "actually applied"
+    )
 
 
 def test_pretrain_p4d_forwards_seed_to_torchrun():
@@ -645,12 +641,12 @@ def test_holdout_dataset_eval_forwards_seed_to_pretrain_p4d():
     pretrain_p4d.sh via env. SEED must be in that env block,
     otherwise the backbone always trains with main_node_ddp.py's
     default seed and the pretrain-sweep wrapper has no effect."""
-    for fn in ("holdout_dataset_eval.sh", "holdout_dataset_eval_clean.sh"):
-        src = (SCRIPTS / fn).read_text()
-        assert 'SEED="$SEED" \\' in src, (
-            f"{fn} must forward SEED into the pretrain_p4d.sh env "
-            "block (not just inline laptop torchrun)"
-        )
+    fn = "holdout_dataset_eval.sh"
+    src = (SCRIPTS / fn).read_text()
+    assert 'SEED="$SEED" \\' in src, (
+        f"{fn} must forward SEED into the pretrain_p4d.sh env "
+        "block (not just inline laptop torchrun)"
+    )
 
 
 def test_holdout_dataset_eval_rejects_unknown_source(tmp_path):

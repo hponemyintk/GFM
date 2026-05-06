@@ -279,8 +279,8 @@ echo
 # auto-enumerate path. Default is the 5 RelBench v2 entity bcls/reg
 # tasks whose supervised single-task GNN baseline (per the v2 paper)
 # sits at-or-below random -- including them in pretrain just adds
-# noise. See docs/holdout_results.md and the rationale in
-# scripts/holdout_dataset_eval_clean.sh. Set EXCLUDED_TASKS="" to
+# noise. See docs/holdout_results.md and the per-dataset rationale
+# in scripts/holdout_dataset_eval.sh. Set EXCLUDED_TASKS="" to
 # include every task; set TASKS_CSV explicitly to bypass this filter.
 EXCLUDED_TASKS="${EXCLUDED_TASKS:-rel-event.event_interest-interested,rel-event.event_interest-not_interested,rel-event.users-birthyear,rel-trial.site-success,rel-amazon.item-ltv}"
 

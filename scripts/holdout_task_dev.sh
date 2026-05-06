@@ -13,11 +13,11 @@
 #   DATASETS    "rel-f1 rel-event"
 #   HOLDOUTS    "rel-f1:driver-top3 rel-event:user-attendance"
 #   PRETRAIN    union of all-but-holdout tasks across DATASETS
-#                = 4 rel-f1 + 5 rel-event = 9 tasks
+#                = 4 rel-f1 + 2 rel-event = 6 tasks
 #   FULL_GRAPH  1   -- builds with upto_test_timestamp=False so
 #                       autocomplete-task seeds (results-position,
-#                       qualifying-position, users-birthyear,
-#                       event_interest-*) don't IndexError on val/test.
+#                       qualifying-position) don't IndexError on
+#                       val/test.
 #
 # Holdouts are mixed-metric (one binary + one regression) so the
 # frozen-backbone GFM claim is tested across both head kinds:
@@ -31,16 +31,25 @@
 #   * rel-f1: driver-position (regression), driver-dnf (binary),
 #             results-position (regression, autocomplete),
 #             qualifying-position (regression, autocomplete)
-#   * rel-event: user-repeat (binary), user-ignore (binary),
-#                event_interest-interested (binary, autocomplete),
-#                event_interest-not_interested (binary, autocomplete),
-#                users-birthyear (regression, autocomplete)
-# = 4 regression + 5 binary tasks for pretrain. Mixed-metric pretrain
+#   * rel-event: user-repeat (binary), user-ignore (binary)
+# = 3 regression + 3 binary tasks for pretrain. Mixed-metric pretrain
 # matters: it forces the backbone to embed both classification and
 # regression signal, so the frozen-backbone evaluation on the
 # held-out regression head (rel-event:user-attendance) tests
 # transfer of regression structure -- not just probing a backbone
 # that only ever saw classification labels.
+#
+# Low-quality tasks dropped by default (RelBench v2 paper baselines
+# at-or-below random; same exclusion set as the Phase-5 launcher
+# scripts/holdout_dataset_eval.sh and scripts/pretrain_p4d.sh's
+# EXCLUDED_TASKS default):
+#   * rel-event.event_interest-interested      Table 3 GNN AUC 0.4764 -- below random
+#   * rel-event.event_interest-not_interested  Table 3 GNN AUC 0.6040 -- ~random
+#   * rel-event.users-birthyear                Table 5 GNN R^2 -0.030 -- negative
+# Add them back to DEFAULT_ALL_TASKS[rel-event] for the all-tasks
+# ablation. (rel-trial.site-success and rel-amazon.item-ltv are also
+# in the standard low-quality set; they're not in this launcher's
+# DATASETS today, so no change is needed here.)
 #
 # rel-hm is NOT in defaults but stays available via DATASETS override.
 # Empirical wall-time on p4d.24xlarge for the full 9-task pretrain at
@@ -143,11 +152,14 @@ HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance}"
 # in-bounds; the per-neighbor seed_time filter at sampler.py:69
 # remains the leakage barrier.
 #
-# rel-event sticks to user-attendance / user-repeat / user-ignore.
-# users-birthyear and event_interest-* are blocked by a separate
-# RelBench bug (pd.date_range allocates 49 GiB on test-split
-# materialization), independent of FULL_GRAPH. They cannot be
-# enabled via the launcher today.
+# rel-event keeps the 3 paper-benchmarked user-* tasks
+# (user-attendance / user-repeat / user-ignore). The 3 autocomplete
+# tasks (event_interest-interested, event_interest-not_interested,
+# users-birthyear) are dropped by default because their RelBench v2
+# paper GNN baselines are at or below random -- including them in
+# the pretrain mix just adds noise. To re-enable for an all-tasks
+# ablation, append them back into the rel-event entry below; the
+# commented lines preserve the rationale inline.
 #
 # rel-hm transactions-price is autocomplete (growing transaction
 # seeds); needs FULL_GRAPH=1 if a user opts it in via DATASETS=rel-hm.
@@ -165,7 +177,12 @@ HOLDOUTS="${HOLDOUTS:-rel-f1:driver-top3 rel-event:user-attendance}"
 #              autocomplete regression and joins under FULL_GRAPH=1.
 declare -A DEFAULT_ALL_TASKS=(
   [rel-f1]="driver-position driver-dnf driver-top3 results-position qualifying-position"
-  [rel-event]="user-attendance user-repeat user-ignore event_interest-interested event_interest-not_interested users-birthyear"
+  # rel-event low-quality tasks dropped by default (uncomment to
+  # re-include in the rel-event entry below):
+  #   "event_interest-interested"      # paper Table 3 GNN AUC 0.4764 -- below random
+  #   "event_interest-not_interested"  # paper Table 3 GNN AUC 0.6040 -- ~random
+  #   "users-birthyear"                # paper Table 5 GNN R^2 -0.030 -- negative
+  [rel-event]="user-attendance user-repeat user-ignore"
   [rel-hm]="user-churn item-sales transactions-price"
 )
 
