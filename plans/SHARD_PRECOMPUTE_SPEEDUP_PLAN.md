@@ -257,13 +257,14 @@ Per-process: ~5-8x. Phase 2 wall: 5 days → ~15-24 hours.
 1. `pytest -m slow tests/test_csr_sampler.py -v` — S1-S19 green.
 2. Tier 1 ML sanity: byte-equality of shards on rel-f1 driver-top3 (see
    Verification below).
-3. Tier 2 ML sanity: 1-hour multi-task pretrain shake-out (see
-   Verification below).
+3. Tier 2 ML sanity: rel-f1 driver-top3 × 3 trials lands within
+   `0.7689 ± 0.0219` (dev-kyaw 1× std band).
 
 If 2 fails, optimization leaks something the unit tests miss — STOP and
-investigate. If 3 metrics drift outside seed noise, optimization changes
-the data distribution despite byte-equality (memory layout, alignment,
-edge cases) — STOP and investigate.
+investigate. If 3 falls outside the dev-kyaw band, the optimization is
+silently changing the training data distribution despite byte-equality
+(would only happen if memory layout / alignment / edge cases leak
+through) — STOP and investigate.
 
 ---
 
@@ -320,8 +321,8 @@ empirics demand it.
    must be empty.
 2. **Long-pole wall test:** time rel-event train shard build before
    Phase 2 vs after. Target ≥3x speedup on this single task.
-3. **End-to-end Tier 3 ML sanity:** full LOO holdout smoke (see
-   Verification below).
+3. **End-to-end Tier 2 ML sanity:** rel-f1 driver-top3 × 3 trials must
+   land within the dev-kyaw 1× std band (see Verification below).
 
 ---
 
@@ -370,31 +371,35 @@ diff -r /tmp/shards_pre_phase1 /tmp/shards_after_step
 # Must be empty
 ```
 
-**Tier 2 — multi-task pretrain parity (~1 hour, end of Phase 1):** confirms
-training metrics don't drift.
+**Tier 2 — rel-f1 driver-top3 × 3 trials vs dev-kyaw baseline
+(~30 min, end of Phase 1):** the canonical end-to-end ML check. Reuses
+the existing `scripts/parity_sweep.sh` harness.
 
 ```bash
-NPROC=8 EPOCHS=3 STEPS_PER_TASK=200 PRETRAIN_SEEDS="0" \
-  bash scripts/pretrain_only_seed_sweep.sh
+# 3 seeds on the new pipeline only (dev-kyaw is the historical
+# baseline; KEEP_CACHE=1 skips the wipe so prior dev-kyaw results
+# persist).
+KEEP_CACHE=1 bash scripts/parity_sweep.sh 3 5
+python scripts/aggregate_parity.py
 ```
 
-Compare per-task test metrics in
-`results/pretrain_only_seed_sweep/<slug>/aggregate.json` against the
-baseline in `results/20260506_pretrain-3trial-results.md`. Per-metric
-within seed-noise (1× std). If Tier 1 was clean, this is a tautology, but
-keep it as a paranoid backstop.
+Pass criterion: new-pipeline rel-f1 driver-top3 AUROC mean falls within
+`0.7689 ± 0.0219` (1× std band of the dev-kyaw 5-seed baseline at
+`upto_test_timestamp=True`, recorded in `docs/parity_results.md`). This
+is the "68% CI overlap" rule the PR1+PR2 parity used.
 
-**Tier 3 — full LOO holdout smoke (~1 day, only if Phase 2 lands):**
+Config (laptop, fixed by `parity_sweep.sh`): batch=128, num_neighbors=64,
+channels=128, num_layers=1, num_heads=4, num_centroids=512, epochs=5.
+~30 min wall on a single GPU.
 
-```bash
-NPROC=8 SOURCE="rel-f1 rel-event" TARGET=rel-arxiv \
-  EPOCHS=3 STEPS_PER_TASK=200 RUN_TABPFN=0 \
-  bash scripts/holdout_dataset_eval.sh
-```
+If Tier 1 byte-equality was clean for every Phase-1 step, Tier 2 is a
+tautology — but keep it as a paranoid end-to-end backstop on the actual
+training pipeline (catches any latent drift the unit tests miss).
 
-Compare holdout metrics against
-`results/20260506_holdout-dataset-eval-rel-f1-event-to-arxiv.md` within
-seed noise.
+**Tier 3 (DROPPED).** The full LOO holdout smoke on rel-arxiv was too
+expensive for a refactor-correctness check — replaced by Tier 2 above.
+Phase 2 acceptance now gates on the same Tier 1 (byte-equality with vs
+without partitioning) + Tier 2 trial as Phase 1.
 
 ### Intuition checks (run end of Phase 1)
 
