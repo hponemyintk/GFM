@@ -55,6 +55,11 @@ _STRING_TARGET_MAP = {"t": 1, "f": 0, "yes": 1, "no": 0, "true": 1, "false": 0}
 
 
 def coerce_string_target_to_numeric(table, target_col: str) -> None:
+    # RelBench strips the target column from the test split (so models
+    # can't peek at the held-out labels). The coercion only applies to
+    # train / val tables that still carry the target. No-op on test.
+    if target_col not in table.df.columns:
+        return
     col = table.df[target_col]
     if col.dtype != object:
         return
