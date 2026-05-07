@@ -465,9 +465,15 @@ done
 # via CUDA_VISIBLE_DEVICES; finetune + tabpfn stay sequential below.
 GPU_POOL=()
 for ((_g=0; _g<NPROC; _g++)); do GPU_POOL+=("$_g"); done
-declare -A PID_GPU
-declare -A PID_DESC
-declare -A PID_LOG
+declare -A PID_GPU=()
+declare -A PID_DESC=()
+declare -A PID_LOG=()
+# Counter for extract failures (mirrors holdout_dataset_eval.sh). Phase B
+# tolerates per-holdout misses; the script exits non-zero at the very
+# end so wrapper sweeps don't silently treat a partial Phase A as
+# success.
+EXTRACT_FAILURES=0
+declare -a EXTRACT_FAILURE_DESCS=()
 
 _reap_finished() {
   local pid
@@ -478,6 +484,8 @@ _reap_finished() {
       GPU_POOL+=("${PID_GPU[$pid]}")
       if [ "$rc" -ne 0 ]; then
         echo "  WARN: extract ${PID_DESC[$pid]} (gpu=${PID_GPU[$pid]}) FAILED rc=$rc; see ${PID_LOG[$pid]}" >&2
+        EXTRACT_FAILURES=$(( EXTRACT_FAILURES + 1 ))
+        EXTRACT_FAILURE_DESCS+=("${PID_DESC[$pid]} (log: ${PID_LOG[$pid]})")
       else
         echo "  [extract] ${PID_DESC[$pid]} done (gpu=${PID_GPU[$pid]})"
       fi
@@ -635,3 +643,16 @@ echo "=============================================================="
 echo "Phase-4 multi-dataset holdout-task done."
 echo "  Summary: $SUMMARY"
 echo "=============================================================="
+
+# Surface Phase-A extract failures as a non-zero exit (mirrors the
+# Phase-5 launcher). Partial results are written to summary.json; a
+# loud exit code lets wrapper sweeps detect a fully- or partially-
+# failed Phase A.
+if [ "$EXTRACT_FAILURES" -gt 0 ]; then
+  echo
+  echo "ERR: $EXTRACT_FAILURES extract job(s) failed:" >&2
+  for _desc in "${EXTRACT_FAILURE_DESCS[@]}"; do
+    echo "  - $_desc" >&2
+  done
+  exit 4
+fi

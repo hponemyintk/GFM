@@ -442,6 +442,7 @@ elif [ "$PRETRAIN_BACKEND" = "p4d" ]; then
     LOSS_BALANCE="${LOSS_BALANCE:-none}" \
     SEED="$SEED" \
     SHARDS_SUBDIR="${SHARDS_SUBDIR:-}" \
+    CACHE_DIR="$CACHE" \
     bash "$REPO_ROOT/scripts/pretrain_p4d.sh" \
     > "$PRETRAIN_LOG" 2>&1
 else
@@ -537,6 +538,13 @@ for ((_g=0; _g<NPROC; _g++)); do GPU_POOL+=("$_g"); done
 declare -A PID_GPU=()
 declare -A PID_DESC=()
 declare -A PID_LOG=()
+# Counter for extract failures across all (task, seed) pairs. Phase B
+# tolerates per-seed extract misses (it skips finetune/tabpfn for the
+# missing seed and proceeds). The script exits non-zero at the very end
+# if this is non-zero so wrapper sweeps don't silently treat a partial
+# Phase A as success.
+EXTRACT_FAILURES=0
+declare -a EXTRACT_FAILURE_DESCS=()
 
 _reap_finished() {
   local pid
@@ -547,6 +555,8 @@ _reap_finished() {
       GPU_POOL+=("${PID_GPU[$pid]}")
       if [ "$rc" -ne 0 ]; then
         echo "  WARN: extract ${PID_DESC[$pid]} (gpu=${PID_GPU[$pid]}) FAILED rc=$rc; see ${PID_LOG[$pid]}" >&2
+        EXTRACT_FAILURES=$(( EXTRACT_FAILURES + 1 ))
+        EXTRACT_FAILURE_DESCS+=("${PID_DESC[$pid]} (log: ${PID_LOG[$pid]})")
       else
         echo "  [extract] ${PID_DESC[$pid]} done (gpu=${PID_GPU[$pid]})"
       fi
@@ -763,3 +773,17 @@ echo
 echo "=============================================================="
 echo "Phase-5 cross-dataset done. Summary: $SUMMARY"
 echo "=============================================================="
+
+# Surface Phase-A extract failures as a non-zero exit. Phase B + the
+# aggregator already tolerated missing per-seed extracts (so partial
+# results get written to summary.json), but a wrapper sweep needs a
+# loud signal that some extracts failed -- otherwise a fully-failed
+# Phase A would silently succeed with an empty summary.
+if [ "$EXTRACT_FAILURES" -gt 0 ]; then
+  echo
+  echo "ERR: $EXTRACT_FAILURES extract job(s) failed:" >&2
+  for _desc in "${EXTRACT_FAILURE_DESCS[@]}"; do
+    echo "  - $_desc" >&2
+  done
+  exit 4
+fi
