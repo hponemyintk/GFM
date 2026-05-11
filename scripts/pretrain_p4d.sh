@@ -208,6 +208,19 @@ NPROC="${NPROC:-8}"
 OUT_DIR="${OUT_DIR:-results/p4d_pretrain}"
 RUN_NAME="${RUN_NAME:-p4d_alltasks}"
 SHARD_SIZE="${SHARD_SIZE:-50000}"
+# Resume DDP pretraining from a per-epoch checkpoint under
+# $OUT_DIR/multi_task/. RESUME='auto' picks the newest checkpoint_epoch_*.pt
+# (no error if none -> fresh at epoch 1); RESUME=<path> resumes that exact
+# file; empty (default) = fresh run. On a crash-restart, pair with
+# SKIP_BUILD=1 so the TF/shard build phases are skipped. KEEP_CHECKPOINTS
+# is how many per-epoch checkpoints (+ their RNG sidecars) to retain.
+RESUME="${RESUME:-}"
+KEEP_CHECKPOINTS="${KEEP_CHECKPOINTS:-3}"
+if [ -n "$RESUME" ]; then
+    RESUME_FLAG="--resume $RESUME"
+else
+    RESUME_FLAG=""
+fi
 # Phase 1 (TF memmap) and Phase 2 (shards) have different bottlenecks:
 #   * Phase 1 is GPU-bound (text embedding). Default concurrency
 #     PARALLEL_TF_BUILDS = NPROC, one A100 per dataset.
@@ -710,7 +723,8 @@ torchrun --nproc_per_node "$NPROC" main_node_ddp.py \
     --load_concurrency "$LOAD_CONCURRENCY" \
     --seed "$SEED" \
     --out_dir "$OUT_DIR" \
-    --run_name "$RUN_NAME" $FULL_GRAPH_FLAG \
+    --run_name "$RUN_NAME" \
+    --keep_checkpoints "$KEEP_CHECKPOINTS" $FULL_GRAPH_FLAG $RESUME_FLAG \
     > "$LOG" 2>&1 &
 TORCHRUN_PID=$!
 set +m

@@ -28,7 +28,7 @@ import math
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -632,6 +632,176 @@ def _save_best_checkpoint(model, output_path: str, meta_dict: dict,
     torch.save(schema, os.path.join(output_path, "backbone_schema.pt"))
 
 
+# ----------------------------------------------- resume-from-checkpoint
+# Per-epoch full training-state checkpoints, separate from the best-val
+# artifacts above. ``best_full.pt`` is "best macro so far" (used for
+# adoption / final test eval); ``checkpoint_epoch_{N:04d}.pt`` is "latest
+# training state" (model + optimizer + loss_fn + bookkeeping), used to
+# resume a crashed run from the next epoch. Both coexist in
+# ``<out_dir>/multi_task/``. RNG is split into per-rank sidecars because
+# model dropout draws from the per-rank torch global RNG, which diverges
+# across ranks within an epoch -- a single rank-0 snapshot cannot
+# faithfully restore the others.
+def _resume_checkpoint_path(output_path: str, resume_arg: Optional[str]) -> Optional[str]:
+    """Resolve ``--resume`` to a concrete checkpoint file, or ``None`` for a fresh run.
+
+    * ``None``     -> ``None`` (fresh run)
+    * ``"auto"``   -> newest ``<output_path>/checkpoint_epoch_*.pt`` (zero-padded
+      epoch => lexicographic max == highest epoch), or ``None`` if none exist
+      (no error -- starts fresh)
+    * ``"<path>"`` -> that path; ``FileNotFoundError`` if it doesn't exist
+    """
+    if resume_arg is None:
+        return None
+    if resume_arg == "auto":
+        import glob
+        cands = sorted(glob.glob(os.path.join(output_path, "checkpoint_epoch_*.pt")))
+        return cands[-1] if cands else None
+    if not os.path.exists(resume_arg):
+        raise FileNotFoundError(f"--resume points to a missing file: {resume_arg}")
+    return resume_arg
+
+
+def _rng_state_dict() -> dict:
+    """Snapshot the four global RNG sources ``seed_everything`` touches."""
+    import random as _random
+    return {
+        "python": _random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def _load_rng_state_dict(state: dict) -> None:
+    import random as _random
+    _random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state.get("torch_cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
+def _rng_sidecar_path(output_path: str, epoch: int, rank: int) -> str:
+    return os.path.join(output_path, f"rng_state_epoch{epoch:04d}_rank{rank}.pt")
+
+
+def _save_resume_checkpoint(model, optim, loss_fn, output_path: str, *,
+                            epoch: int, global_step: int,
+                            best_macro: float, best_epoch: int,
+                            best_ckpt_written: bool,
+                            per_epoch_macro: Dict[int, float],
+                            rank: int) -> None:
+    """Write a per-epoch resume checkpoint.
+
+    Every rank writes its own ``rng_state_epoch{E:04d}_rank{R}.pt``. Rank 0
+    additionally writes ``checkpoint_epoch_{E:04d}.pt`` via a temp file +
+    atomic ``os.replace`` so a crash mid-write never leaves a half file.
+
+    Call AFTER the epoch's best-tracking is done and AFTER the post-eval
+    ``dist.barrier()``; the caller must ``dist.barrier()`` once more
+    afterwards so no rank mutates its RNG (next epoch) before the sidecars
+    land.
+
+    ``loss_fn.state_dict()`` is saved in addition to ``optim.state_dict()``
+    because the optimizer state only carries Adam moments keyed by param
+    id, not the ``log_sigma2`` parameter *values* (relevant only in
+    ``aggregation == "uncertainty"``).
+    """
+    os.makedirs(output_path, exist_ok=True)
+    torch.save(_rng_state_dict(), _rng_sidecar_path(output_path, epoch, rank))
+    if rank != 0:
+        return
+    ckpt = {
+        "format_version": 1,
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "model": model.module.state_dict(),
+        "optimizer": optim.state_dict(),
+        "loss_fn": loss_fn.state_dict(),
+        "best_macro": float(best_macro),
+        "best_epoch": int(best_epoch),
+        "best_ckpt_written": bool(best_ckpt_written),
+        "per_epoch_macro": {int(k): float(v) for k, v in per_epoch_macro.items()},
+        "world_size": dist.get_world_size() if dist.is_initialized() else 1,
+    }
+    final = os.path.join(output_path, f"checkpoint_epoch_{epoch:04d}.pt")
+    tmp = os.path.join(output_path, f".checkpoint_epoch_{epoch:04d}.pt.tmp")
+    torch.save(ckpt, tmp)
+    os.replace(tmp, final)
+
+
+def _load_resume_checkpoint(path: str, model, optim, loss_fn, output_path: str,
+                            rank: int) -> dict:
+    """Restore model / optimizer / loss_fn / this-rank RNG in place.
+
+    Every rank calls this with the same ``path`` -- the optimizer's Adam
+    moments are needed on every rank (kept in sync via grad all-reduce
+    during normal training, but a cold resume gives each rank its own
+    copy). RNG is restored from this rank's own
+    ``rng_state_epoch{E:04d}_rank{R}.pt`` sidecar if present; otherwise
+    the rank keeps its current (post-``seed_everything``) RNG.
+
+    Returns ``{epoch, global_step, best_macro, best_epoch,
+    best_ckpt_written, per_epoch_macro}``.
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if ckpt.get("format_version") != 1:
+        raise ValueError(
+            f"unsupported resume checkpoint format_version in {path}: "
+            f"{ckpt.get('format_version')!r}"
+        )
+    model.module.load_state_dict(ckpt["model"])  # strict -> fail-fast on arch mismatch
+    optim.load_state_dict(ckpt["optimizer"])
+    loss_fn.load_state_dict(ckpt["loss_fn"])
+    rng_path = _rng_sidecar_path(output_path, int(ckpt["epoch"]), rank)
+    if os.path.exists(rng_path):
+        _load_rng_state_dict(
+            torch.load(rng_path, map_location="cpu", weights_only=False)
+        )
+    return {
+        "epoch": int(ckpt["epoch"]),
+        "global_step": int(ckpt["global_step"]),
+        "best_macro": float(ckpt["best_macro"]),
+        "best_epoch": int(ckpt["best_epoch"]),
+        "best_ckpt_written": bool(ckpt["best_ckpt_written"]),
+        "per_epoch_macro": {int(k): float(v) for k, v in ckpt["per_epoch_macro"].items()},
+    }
+
+
+def _prune_resume_checkpoints(output_path: str, keep_n: int) -> None:
+    """Keep the newest ``keep_n`` ``checkpoint_epoch_*.pt`` (and their
+    per-rank RNG sidecars); delete older ones. ``keep_n <= 0`` keeps all.
+    Rank-0 only -- the caller gates this.
+    """
+    if keep_n <= 0:
+        return
+    import glob
+    import re
+    cands = sorted(glob.glob(os.path.join(output_path, "checkpoint_epoch_*.pt")))
+    if len(cands) <= keep_n:
+        return
+    keep_epochs = set()
+    for c in cands[-keep_n:]:
+        m = re.search(r"checkpoint_epoch_(\d+)\.pt$", os.path.basename(c))
+        if m:
+            keep_epochs.add(int(m.group(1)))
+    for c in cands[:-keep_n]:
+        try:
+            os.remove(c)
+        except OSError:
+            pass
+    for r in glob.glob(os.path.join(output_path, "rng_state_epoch*_rank*.pt")):
+        m = re.search(r"rng_state_epoch(\d+)_rank\d+\.pt$", os.path.basename(r))
+        if m and int(m.group(1)) not in keep_epochs:
+            try:
+                os.remove(r)
+            except OSError:
+                pass
+
+
 # --------------------------------------------------------- training
 def _gpu_stats(handle, device):
     import pynvml
@@ -927,6 +1097,39 @@ def run(args, local_rank: int, device, gpu_handle):
         return per_task_metrics
 
     if args.train_stage == "finetune":
+        # --- resume-from-checkpoint (multi-task path only) -----------
+        # See _resume_checkpoint_path / _load_resume_checkpoint above.
+        # Data ordering is a pure function of (seed, epoch) -- the
+        # sampler re-seeds in set_epoch -- so resuming at epoch N+1
+        # reproduces the exact batch order of a continuous run; we only
+        # need to restore model/optimizer/loss_fn/RNG + bookkeeping.
+        g_rank = dist.get_rank() if dist.is_initialized() else 0
+        resume_path = _resume_checkpoint_path(output_path, getattr(args, "resume", None))
+        if resume_path is not None and getattr(args, "backbone_init", None):
+            if local_rank == 0:
+                print(f"[multi-task] WARNING: both --resume and --backbone_init "
+                      f"set; resume wins, ignoring --backbone_init={args.backbone_init}")
+        start_epoch = 1
+        _resume_meta: Optional[dict] = None
+        if resume_path is not None:
+            if local_rank == 0:
+                print(f"[multi-task] resuming from {resume_path}")
+            _resume_meta = _load_resume_checkpoint(
+                resume_path, model, optim, loss_fn, output_path, g_rank,
+            )
+            start_epoch = _resume_meta["epoch"] + 1
+            global_step = _resume_meta["global_step"]
+            if local_rank == 0:
+                print(f"[multi-task] resumed: next epoch={start_epoch}, "
+                      f"global_step={global_step}, "
+                      f"best_macro={_resume_meta['best_macro']:.4f} "
+                      f"@ epoch {_resume_meta['best_epoch']}")
+            if dist.is_initialized():
+                dist.barrier()
+        elif getattr(args, "resume", None) == "auto" and local_rank == 0:
+            print("[multi-task] --resume auto: no checkpoint_epoch_*.pt found; "
+                  "starting fresh at epoch 1")
+
         # Best-macro checkpointing. Each epoch we score per-task val
         # metric on a comparable scale (AUROC for binary, 1/(1+MAE) for
         # regression -- both in (0, 1], higher is better) and average.
@@ -934,15 +1137,25 @@ def run(args, local_rank: int, device, gpu_handle):
         # the final test eval. This is the standard single-model
         # multi-task convention (T5 / RT pretraining); per-task fine-
         # tuning would beat it but needs a separate run per task.
-        best_macro = -math.inf
-        best_epoch = 0
-        # Sentinel: True iff a best-val ckpt has been written to disk.
-        # Used post-loop to decide whether to reload (vs run final test
-        # against the last-epoch model state).
-        best_ckpt_written = False
-        per_epoch_macro: Dict[int, float] = {}
+        #
+        # On resume, these are restored from the checkpoint so the final
+        # {seed}.json dump (per_epoch_macro / best_epoch / best_val_macro)
+        # stays complete across the resume boundary.
+        if _resume_meta is not None:
+            best_macro = _resume_meta["best_macro"]
+            best_epoch = _resume_meta["best_epoch"]
+            best_ckpt_written = _resume_meta["best_ckpt_written"]
+            per_epoch_macro: Dict[int, float] = dict(_resume_meta["per_epoch_macro"])
+        else:
+            best_macro = -math.inf
+            best_epoch = 0
+            # Sentinel: True iff a best-val ckpt has been written to disk.
+            # Used post-loop to decide whether to reload (vs run final test
+            # against the last-epoch model state).
+            best_ckpt_written = False
+            per_epoch_macro: Dict[int, float] = {}
 
-        for epoch in range(1, args.epochs + 1):
+        for epoch in range(start_epoch, args.epochs + 1):
             tr_loss = _train_epoch(epoch)
             dist.barrier()
             val_metrics = _eval(loader_val, "val", epoch)
@@ -976,6 +1189,25 @@ def run(args, local_rank: int, device, gpu_handle):
                 else:
                     print(f"  macro={macro:.4f} (best={best_macro:.4f} @ epoch {best_epoch})")
             dist.barrier()
+
+            # --- per-epoch resume checkpoint ------------------------
+            # Every rank writes its RNG sidecar; rank 0 writes the full
+            # training-state checkpoint + prunes old ones. The trailing
+            # barrier guarantees the sidecars land before any rank
+            # mutates its RNG in the next epoch.
+            _save_resume_checkpoint(
+                model, optim, loss_fn, output_path,
+                epoch=epoch, global_step=global_step,
+                best_macro=best_macro, best_epoch=best_epoch,
+                best_ckpt_written=best_ckpt_written,
+                per_epoch_macro=per_epoch_macro, rank=g_rank,
+            )
+            if g_rank == 0:
+                _prune_resume_checkpoints(
+                    output_path, int(getattr(args, "keep_checkpoints", 3)),
+                )
+            if dist.is_initialized():
+                dist.barrier()
 
         # Load best-macro checkpoint from disk on rank 0, broadcast.
         # Replaces the prior in-memory ``best_state`` deepcopy path.

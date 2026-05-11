@@ -96,6 +96,21 @@ parser.add_argument(
          "while shared transformer/centroid/etc. layers transfer. "
          "When unset, the model trains from scratch (current behavior).",
 )
+parser.add_argument(
+    "--resume", type=str, default=None,
+    help="Resume DDP multi-task pretraining from a per-epoch checkpoint. "
+         "'auto' picks the newest <out_dir>/multi_task/checkpoint_epoch_*.pt "
+         "(no error if none exist -> starts fresh at epoch 1). A path resumes "
+         "that exact file (FileNotFoundError if missing). Unset -> fresh run. "
+         "When set, --backbone_init is ignored (resume carries full training "
+         "state). Only the multi-task path (--tasks) consumes this.",
+)
+parser.add_argument(
+    "--keep_checkpoints", type=int, default=3,
+    help="Per-epoch resume checkpoints (and their per-rank RNG sidecars) to "
+         "retain under <out_dir>/multi_task/; older ones are pruned after each "
+         "save. 0 keeps all. Default 3 (~1.5 GB).",
+)
 # PR2 data-layer mode flags. Default keeps dev-kyaw / PR1 behavior intact.
 parser.add_argument(
     "--mode",
@@ -174,11 +189,22 @@ MULTI_TASK = args.tasks is not None
 ############################
 # 2. Initialize DDP and set device
 ############################
-dist.init_process_group(backend="nccl")
+# Single-process runs (WORLD_SIZE==1: smoke tests, CPU-only boxes, or WSL2
+# setups where NCCL single-rank collectives can hang) get nothing from
+# NCCL's multi-GPU fast path -- every collective is a no-op -- so use gloo
+# there. Multi-GPU keeps NCCL. gloo handles CUDA tensors via host staging,
+# which is fine at one rank. (train_multi_task already creates its own gloo
+# subgroup for CPU gathers; redundant when WORLD_SIZE==1, harmless.)
+_world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+_ddp_backend = "nccl" if (_world_size_env > 1 and torch.cuda.is_available()) else "gloo"
+dist.init_process_group(backend=_ddp_backend)
 # local_rank = args.local_rank
-local_rank = int(os.environ["LOCAL_RANK"])
-device = torch.device("cuda", local_rank)
-torch.cuda.set_device(device)
+local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+if torch.cuda.is_available():
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+else:
+    device = torch.device("cpu")
 
 # Only the main process (rank 0) initializes wandb and prints logs.
 if local_rank == 0:
