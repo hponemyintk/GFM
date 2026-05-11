@@ -86,7 +86,11 @@ class LocalModule(nn.Module):
         neighbor_tensor = neighbor_tensor * layer_atten
         neighbor_tensor = torch.sum(neighbor_tensor, dim=1, keepdim=True)
 
-        output = (node_tensor + neighbor_tensor).squeeze()
+        # squeeze(1) only drops the always-size-1 sequence dim. A bare
+        # .squeeze() also collapses the batch dim when batch_size == 1
+        # (last val/test batch on a DDP rank, drop_last=False), yielding a
+        # 1D tensor that breaks torch.cat(..., dim=1) in model.py.
+        output = (node_tensor + neighbor_tensor).squeeze(1)
 
         return output
 
