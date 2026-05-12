@@ -59,6 +59,7 @@ from gfm_data import (
 from gfm_data.task_tokens import (
     TASK_TYPE_BINARY,
     TASK_TYPE_REGRESSION,
+    coerce_string_target_to_numeric,
 )
 from heads.multi_task_head import MultiTaskRelGT
 from losses.multi_task_loss import MultiTaskLoss
@@ -312,7 +313,18 @@ def _build_caches_and_tokens(args, local_rank: int, tasks_spec, device: str):
                     # so a positional pre-warm would miss the cache
                     # and force a redundant parquet re-read inside
                     # TaskTokens.
-                    task_obj.get_table(split=_split)
+                    _tab = task_obj.get_table(split=_split)
+                    # Some rel-trial autocomplete tasks (eligibilities-
+                    # adult/child, studies-has_dmc) ship binary targets
+                    # as 't'/'f' strings. Coerce -> 1/0 in the cached
+                    # DataFrame now so neither shard-build nor eval sees
+                    # string labels. No-op on the test split (RelBench
+                    # masks the target column there). The eval path also
+                    # re-coerces just before ``task.evaluate()`` since
+                    # that pulls a *different* lru_cache entry (positional
+                    # / mask_input_cols=False), so this pre-warm is
+                    # belt-and-suspenders, not the load-bearing fix.
+                    coerce_string_target_to_numeric(_tab, task_obj.target_col)
                 except Exception as e:
                     # Don't let a single split failure blow up startup;
                     # TaskTokens construction below will surface a real
@@ -1090,10 +1102,24 @@ def run(args, local_rank: int, device, gpu_handle):
             local_idxs = np.concatenate(idxs_local) if idxs_local else np.array([])
             full = _gather_preds_cpu(local_idxs, local_preds, len(loader.dataset))
             if local_rank == 0:
-                metrics = task_objs[ti].evaluate(
-                    full, task_objs[ti].get_table(split)
-                ) if split == "val" else task_objs[ti].evaluate(full)
-                per_task_metrics[ti] = metrics
+                # ``task.evaluate`` scores ``full`` against the target
+                # column of the *unmasked* table. For "test", get_table()
+                # masks that column to gate users into the official
+                # evaluator, so we must ask for ``mask_input_cols=False``
+                # explicitly -- this is exactly the table ``evaluate(full)``
+                # would pull internally, just made visible so we can fix
+                # it up first. Then coerce 't'/'f' string targets
+                # (rel-trial autocomplete tasks) -> 1/0 so sklearn's
+                # roc_auc / average_precision don't choke on string labels.
+                eval_table = (
+                    task_objs[ti].get_table("test", mask_input_cols=False)
+                    if split == "test"
+                    else task_objs[ti].get_table(split)
+                )
+                coerce_string_target_to_numeric(
+                    eval_table, task_objs[ti].target_col,
+                )
+                per_task_metrics[ti] = task_objs[ti].evaluate(full, eval_table)
         return per_task_metrics
 
     if args.train_stage == "finetune":

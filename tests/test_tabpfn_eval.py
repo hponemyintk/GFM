@@ -26,6 +26,37 @@ if isinstance(sys.modules.get("torch_geometric"), _MagicMock):
     import torch_geometric  # noqa: F401
 
 
+def _make_fake_task(n_test: int, metrics: dict):
+    """Plain-object stand-in for a RelBench ``EntityTask`` whose
+    *unmasked* test table carries ``'t'``/``'f'`` string targets
+    (rel-trial autocomplete style). ``get_table`` accepts -- and
+    ignores -- ``mask_input_cols``; ``evaluate`` asserts the caller
+    coerced the target column to numeric first (i.e. ``_final_evaluate``
+    ran ``coerce_string_target_to_numeric``) and then returns
+    ``metrics``."""
+    import pandas as _pd
+
+    tbl = type("Tbl", (), {})()
+    tbl.df = _pd.DataFrame(
+        {"y": np.resize(np.array(["t", "f"], dtype=object), n_test)}
+    )
+
+    def _evaluate(preds, target_table=None):
+        col = (target_table if target_table is not None else tbl).df["y"]
+        assert col.dtype != object, (
+            "task.evaluate() got un-coerced 't'/'f' string targets -- "
+            "_final_evaluate must coerce them first"
+        )
+        assert len(preds) == n_test, f"pred length {len(preds)} != {n_test}"
+        return dict(metrics)
+
+    task = type("T", (), {})()
+    task.target_col = "y"
+    task.get_table = lambda split, mask_input_cols=None: tbl
+    task.evaluate = _evaluate
+    return task
+
+
 def test_infer_task_kind_int_labels():
     from tools.tabpfn_eval import _infer_task_kind
     assert _infer_task_kind(np.array([0, 1, 0, 1, 0], dtype=np.int64)) == "binary"
@@ -208,11 +239,7 @@ def test_main_end_to_end_with_mocked_tabpfn(tmp_path):
             # Deterministic positive-class prob in [0, 1].
             return np.column_stack([1 - X[:, 0] > 0, X[:, 0] > 0]).astype(float)
 
-    fake_task = type("T", (), {})()
-    fake_task.get_table = lambda split: type(
-        "Tbl", (), {"__len__": lambda self_: n_test},
-    )()
-    fake_task.evaluate = lambda preds: {"roc_auc": 0.88}
+    fake_task = _make_fake_task(n_test, {"roc_auc": 0.88})
 
     fake_tabpfn_module = type(sys)("tabpfn")
     fake_tabpfn_module.TabPFNClassifier = _StubClassifier

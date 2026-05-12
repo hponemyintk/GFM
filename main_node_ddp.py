@@ -42,7 +42,11 @@ from gfm_data import (
     collate_multi_task,
     collate_single_task,
 )
-from gfm_data.task_tokens import TASK_TYPE_BINARY, TASK_TYPE_REGRESSION
+from gfm_data.task_tokens import (
+    TASK_TYPE_BINARY,
+    TASK_TYPE_REGRESSION,
+    coerce_string_target_to_numeric,
+)
 from heads.multi_task_head import MultiTaskRelGT
 from losses.multi_task_loss import MultiTaskLoss
 
@@ -300,7 +304,15 @@ def _do_load_db_and_graph():
     # separately and a positional pre-warm would miss the cache.
     for _split in ("train", "val", "test"):
         try:
-            task.get_table(split=_split)
+            _tab = task.get_table(split=_split)
+            # rel-trial autocomplete tasks (eligibilities-adult/child,
+            # studies-has_dmc) ship binary targets as 't'/'f' strings.
+            # Coerce -> 1/0 in the cached DataFrame now so neither the
+            # TaskTokens build nor task.evaluate() sees string labels.
+            # No-op on the test split (target column masked). The eval
+            # call sites below re-coerce just before task.evaluate()
+            # since that touches a different lru_cache entry.
+            coerce_string_target_to_numeric(_tab, task.target_col)
         except Exception as e:
             print(
                 f"[single-task] WARN: pre-warm get_table({_split}) "
@@ -713,7 +725,9 @@ if args.train_stage == "finetune":
         # Run evaluation on the validation set.
         val_pred = test(loader_dict["val"], eval_model=eval_model, epoch=epoch, desc="Val")
         if local_rank == 0:
-            val_metrics = task.evaluate(val_pred, task.get_table("val"))
+            val_table = task.get_table("val")
+            coerce_string_target_to_numeric(val_table, task.target_col)
+            val_metrics = task.evaluate(val_pred, val_table)
             print(f"Epoch: {epoch:02d}, Train loss: {train_loss}, Val metrics: {val_metrics}")
             wandb.log({
                 "epoch": epoch,
@@ -742,10 +756,19 @@ if args.train_stage == "finetune":
     final_test_preds = test(loader_dict["test"], eval_model=model.module, epoch=0, desc="Test")
 
     if local_rank == 0:
-        val_metrics = task.evaluate(final_val_preds, task.get_table("val"))
+        val_table = task.get_table("val")
+        coerce_string_target_to_numeric(val_table, task.target_col)
+        val_metrics = task.evaluate(final_val_preds, val_table)
         print(f"Best Val metrics: {val_metrics}")
 
-        test_metrics = task.evaluate(final_test_preds)
+        # task.evaluate(preds) would internally fetch
+        # get_table("test", mask_input_cols=False) -- do it explicitly so
+        # we can coerce 't'/'f' string targets (rel-trial autocomplete
+        # tasks) -> 1/0 before sklearn sees them. get_table("test")
+        # without the flag masks the target column entirely.
+        test_table = task.get_table("test", mask_input_cols=False)
+        coerce_string_target_to_numeric(test_table, task.target_col)
+        test_metrics = task.evaluate(final_test_preds, test_table)
         print(f"Best Test metrics: {test_metrics}")
 
         best_metrics_dict = {

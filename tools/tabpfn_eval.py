@@ -211,16 +211,27 @@ def _final_evaluate(
     task: str,
 ):
     """Scatter predictions to a [num_test_rows] array and call
-    ``task.evaluate(...)``. Same layout as finetune_head's helper."""
+    ``task.evaluate(full, test_table)``. Same layout as finetune_head's
+    helper."""
     from relbench.tasks import get_task
+
+    from gfm_data.task_tokens import coerce_string_target_to_numeric
+
     task_obj = get_task(dataset, task, download=True)
 
-    n = len(task_obj.get_table("test"))
+    # Unmasked test table (get_table("test") strips the target column);
+    # this is the table task.evaluate(preds) would fetch internally.
+    # Coerce 't'/'f' string targets (rel-trial autocomplete tasks) -> 1/0
+    # so sklearn's classification metrics accept them.
+    test_table = task_obj.get_table("test", mask_input_cols=False)
+    coerce_string_target_to_numeric(test_table, task_obj.target_col)
+
+    n = len(test_table.df)
     full = np.full((n,), -100.0)
     for i, idx in enumerate(test_global_idx.tolist()):
         if 0 <= idx < n:
             full[idx] = float(test_pred[i])
-    return task_obj.evaluate(full)
+    return task_obj.evaluate(full, test_table)
 
 
 def main(argv=None):

@@ -25,6 +25,38 @@ if isinstance(sys.modules.get("torch_geometric"), _MagicMock):
     import torch_geometric  # noqa: F401
 
 
+def _make_fake_task(n_test: int, metrics: dict):
+    """Plain-object stand-in for a RelBench ``EntityTask`` whose
+    *unmasked* test table carries ``'t'``/``'f'`` string targets
+    (rel-trial autocomplete style). ``get_table`` accepts -- and
+    ignores -- ``mask_input_cols``; ``evaluate`` asserts the caller
+    coerced the target column to numeric first (i.e. ``_final_evaluate``
+    ran ``coerce_string_target_to_numeric``) and then returns
+    ``metrics``."""
+    import numpy as _np
+    import pandas as _pd
+
+    tbl = type("Tbl", (), {})()
+    tbl.df = _pd.DataFrame(
+        {"y": _np.resize(_np.array(["t", "f"], dtype=object), n_test)}
+    )
+
+    def _evaluate(preds, target_table=None):
+        col = (target_table if target_table is not None else tbl).df["y"]
+        assert col.dtype != object, (
+            "task.evaluate() got un-coerced 't'/'f' string targets -- "
+            "_final_evaluate must coerce them first"
+        )
+        assert len(preds) == n_test, f"pred length {len(preds)} != {n_test}"
+        return dict(metrics)
+
+    task = type("T", (), {})()
+    task.target_col = "y"
+    task.get_table = lambda split, mask_input_cols=None: tbl
+    task.evaluate = _evaluate
+    return task
+
+
 def test_make_head_linear_and_mlp2():
     """Both head kinds produce a module with the right input/output dims."""
     from tools.finetune_head import _make_head
@@ -164,9 +196,7 @@ def test_main_end_to_end_with_synthetic_embeddings(tmp_path):
     out_path = tmp_path / "head.pt"
 
     # Mock RelBench task.evaluate to avoid network/registry calls.
-    fake_task = type("T", (), {})()
-    fake_task.get_table = lambda split: type("Tbl", (), {"__len__": lambda self_: n // 4})()
-    fake_task.evaluate = lambda preds: {"roc_auc": 0.95, "f1": 0.9}
+    fake_task = _make_fake_task(n // 4, {"roc_auc": 0.95, "f1": 0.9})
 
     with patch("relbench.tasks.get_task", return_value=fake_task):
         rc = ft_main([
@@ -189,10 +219,10 @@ def test_main_evaluates_test_even_when_pt_lacks_labels(tmp_path):
     """RelBench masks the target column on get_table('test') by default
     (binary leaderboard tasks like rel-f1.driver-top3), so
     extract_embeddings emits a test.pt without 'labels'. finetune_head
-    must STILL call task.evaluate(predictions) -- RelBench reads the
-    unmasked labels via get_table(test, mask_input_cols=False)
-    internally. Without this, frozen-backbone evaluation is silently
-    skipped and summary.json reports test_metrics=null."""
+    must STILL produce test metrics -- _final_evaluate pulls the
+    unmasked labels itself via get_table(test, mask_input_cols=False).
+    Without this, frozen-backbone evaluation is silently skipped and
+    summary.json reports test_metrics=null."""
     from tools.finetune_head import main as ft_main
 
     channels = 8
@@ -221,9 +251,7 @@ def test_main_evaluates_test_even_when_pt_lacks_labels(tmp_path):
     }, tmp_path / "test.pt")
 
     out_path = tmp_path / "head.pt"
-    fake_task = type("T", (), {})()
-    fake_task.get_table = lambda split: type("Tbl", (), {"__len__": lambda self_: n_test})()
-    fake_task.evaluate = lambda preds: {"roc_auc": 0.88, "f1": 0.7}
+    fake_task = _make_fake_task(n_test, {"roc_auc": 0.88, "f1": 0.7})
 
     with patch("relbench.tasks.get_task", return_value=fake_task):
         rc = ft_main([
@@ -236,6 +264,6 @@ def test_main_evaluates_test_even_when_pt_lacks_labels(tmp_path):
     saved = torch.load(out_path, map_location="cpu", weights_only=False)
     assert saved["test_metrics"] is not None, (
         "test_metrics must be populated even when test.pt lacks labels; "
-        "task.evaluate(predictions) reads the masked labels internally"
+        "_final_evaluate fetches the unmasked test labels itself"
     )
     assert saved["test_metrics"]["roc_auc"] == 0.88

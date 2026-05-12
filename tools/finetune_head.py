@@ -156,12 +156,17 @@ def _final_evaluate(
     device: str,
 ):
     """Run head on test embeddings, post-process per task type, and
-    call ``task.evaluate(predictions)``.
+    call ``task.evaluate(predictions, test_table)``.
 
     Predictions are scattered into a [num_test_rows] array indexed by
     global_idx so RelBench's evaluator can match them to the test
-    table's row order."""
+    table's row order. We pass the unmasked test table explicitly (and
+    coerce any 't'/'f' string targets to 1/0 first) so sklearn's
+    classification metrics don't choke on string labels."""
     from relbench.tasks import get_task
+
+    from gfm_data.task_tokens import coerce_string_target_to_numeric
+
     task_obj = get_task(dataset, task, download=True)
 
     head.eval()
@@ -171,13 +176,22 @@ def _final_evaluate(
     if task_kind == "binary":
         test_pred = torch.sigmoid(test_pred)
 
-    test_table_size = len(task_obj.get_table("test"))
+    # task.evaluate() scores against the target column of the *unmasked*
+    # test table; get_table("test") strips it to gate users into the
+    # official evaluator, so request mask_input_cols=False explicitly
+    # (this is the same table evaluate(preds) pulls internally). Then
+    # coerce 't'/'f' string targets (rel-trial autocomplete tasks) -> 1/0
+    # so sklearn's roc_auc / average_precision accept them.
+    test_table = task_obj.get_table("test", mask_input_cols=False)
+    coerce_string_target_to_numeric(test_table, task_obj.target_col)
+
+    test_table_size = len(test_table.df)
     full_preds = np.full((test_table_size,), -100.0)
     for i, idx in enumerate(test_global_idx.tolist()):
         if 0 <= idx < test_table_size:
             full_preds[idx] = float(test_pred[i].item())
 
-    metrics = task_obj.evaluate(full_preds)
+    metrics = task_obj.evaluate(full_preds, test_table)
     return metrics
 
 
@@ -250,12 +264,12 @@ def main(argv=None):
     )
 
     # _final_evaluate scatters predictions by global_idx and calls
-    # ``task.evaluate(predictions)`` -- RelBench reads the unmasked test
-    # labels via ``get_table("test", mask_input_cols=False)`` internally.
-    # We do NOT need ``test["labels"]`` to be present in the .pt; the
-    # default get_table() output for entity tasks masks the target column
-    # to gate users into the official evaluator. Mirrors what
-    # train_multi_task.py:882 does for in-loop test eval.
+    # ``task.evaluate(predictions, test_table)`` against the unmasked
+    # test table (``get_table("test", mask_input_cols=False)``). We do
+    # NOT need ``test["labels"]`` to be present in the .pt; the default
+    # get_table() output for entity tasks masks the target column to gate
+    # users into the official evaluator. Mirrors the in-loop test eval in
+    # train_multi_task.py's ``_eval``.
     metrics = _final_evaluate(
         head,
         test_emb=test["embeddings"], test_global_idx=test["global_idx"],
